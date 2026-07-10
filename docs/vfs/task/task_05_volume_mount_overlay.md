@@ -55,7 +55,8 @@ pub const MountEntry = struct {
 
 - priority 高者优先。
 - writable pack 默认最高优先级，但本任务可只支持 readonly。
-- 同 priority 冲突 V1 推荐返回 VFS_INVALID_ARGUMENT 或 VFS_UNSUPPORTED_FEATURE，除非实现稳定 mount_order 规则并完整测试。
+- V1 禁止两个 mounted pack 使用相同 priority；mount 时必须返回 VFS_INVALID_ARGUMENT。
+- mount_order 只用于诊断和未来扩展，本任务不得用 mount_order 偷偷解决同 priority 冲突。
 
 ### 4.2 Entry overlay
 
@@ -103,7 +104,7 @@ V1 如不实现 PathTombstone，必须文档明确并测试 EntryTombstone。
 3. path open 先解析 path，再解析 entry overlay。
 4. EntryTombstone 隐藏低优先级 FileEntry。
 5. tombstone 后 open_path 和 open_entry 均返回 not found。
-6. 同 priority 冲突行为稳定且有测试。
+6. 同 priority mount 必须失败并返回 VFS_INVALID_ARGUMENT。
 7. unmount 或 close volume 后 handles 行为明确。
 8. 多 pack 中 PageValue 读取来自正确 pack。
 
@@ -121,4 +122,3 @@ zig build test
 - path overlay 与 entry overlay 分离。
 - tombstone 可隐藏低优先级版本。
 - 没有 mock/moke。
-

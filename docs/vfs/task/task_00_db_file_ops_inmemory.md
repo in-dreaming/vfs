@@ -4,7 +4,7 @@
 
 实现 DB 层 db_context_t.file_ops 的真实支持，并提供 VFS 后续可使用的 InMemoryFileOps 能力。
 
-这是 VFS 的前置任务。当前 README 明确说明 db_context_t.file_ops 已在 ABI 声明，但完整 custom file backend 尚未实现；传入非空 file_ops 会返回 DB_UNSUPPORTED。VFS build/merge 后续需要 InMemoryFileOps，因此必须先补齐这个 DB 特性。
+这是 InMemory merge/staging 与 custom backend 验证的前置任务，不是 VFS Task 01-06 只读最小闭环的前置任务。当前 README 明确说明 db_context_t.file_ops 已在 ABI 声明，但完整 custom file backend 尚未实现；传入非空 file_ops 会返回 DB_UNSUPPORTED。VFS 后续 build/merge/staging 如果选择 InMemoryFileOps 路径，必须先补齐这个 DB 特性。
 
 本任务修改 DB 层，但不得引入任何 VFS 语义。
 
@@ -38,6 +38,14 @@
 
 ## 4. 实现范围
 
+本任务容易膨胀，必须按以下边界执行：
+
+- 必须让 DB 默认 platform backend 的行为完全保持。
+- 必须让 custom backend 覆盖 DB 正常 open/create/get/put/delete/commit/verify 的真实路径。
+- 必须实现一个真实 InMemoryFileOps backend，不能用测试 map 绕过 DB。
+- recover/optimize/checkpoint 如因当前 DB 内部路径尚未全部抽象而无法完整支持，必须返回明确 DB_UNSUPPORTED 或在结果中说明剩余 DB 抽象缺口；不得假成功。
+- 不要求在本任务中改变 DB key 模型。VFS 的 u64 object key 由 VFS 编码为 8-byte raw key bytes 传入 DB。
+
 ### 4.1 完善 db_file_ops_t
 
 当前 include/db.h 中 db_file_ops_t 字段是 void*。需要在 Zig 内部为这些字段定义明确调用签名，并在打开 DB 时验证：
@@ -52,16 +60,18 @@
 ~~~c
 open(user, path, flags, out_file)
 close(file)
-read_at(file, dst, size, offset)
-write_at(file, src, size, offset)
+read_at(file, offset, dst, size, out_read)
+write_at(file, offset, src, size, out_written)
 get_size(file, out_size)
 set_size(file, size)
 sync(file, mode)
-preallocate(file, size)
+preallocate(file, offset, size)
 mmap(file, offset, size, flags, out_mapping)
 msync(mapping, offset, size, mode)
 munmap(mapping)
 ~~~
+
+因为 include/db.h 当前把函数指针字段声明为 void*，本任务必须在 DB Zig 侧集中定义 cast 后的精确 ABI 签名，并补 C header 注释或 typedef，避免调用方按错误签名传入函数。若需要调整 public header，必须保持 struct_size/version 兼容策略。
 
 如果现有 ABI 不能表达所有参数，必须在 task 结果中说明 ABI 差距，并采用兼容扩展方案。不能静默假装支持。
 
@@ -86,6 +96,8 @@ custom backend:
 - mmap/munmap/msync，如果 index 路径需要 mmap。
 
 如果 custom backend 不支持 mmap，则 DB open 应返回 DB_UNSUPPORTED，除非同时实现了非 mmap index fallback。不能 silently degrade 成错误数据结构。
+
+实现时禁止把 default backend 与 custom backend 写成两套 DB 逻辑；只能在 platform file abstraction 层分发，DB 上层 manifest/index/data 逻辑仍走同一套代码。
 
 ### 4.3 InMemoryFileOps 实现
 
@@ -146,6 +158,8 @@ Flush full output atomically
 - 对 DB 当前必须但 backend 不支持的能力返回 DB_UNSUPPORTED。
 - 成功时所有 DB get/put/delete/batch/checkpoint/verify 路径走 custom backend。
 
+如果 recover/optimize 因实现范围暂未完整接入 custom backend，必须有测试覆盖其明确错误返回。不能保留“传入 file_ops 但部分路径偷偷使用默认 OS 文件”的混合行为。
+
 ---
 
 ## 5. 验证要求
@@ -161,7 +175,8 @@ Flush full output atomically
 7. mmap mapping 内容与 read_at 内容一致。
 8. set_size/truncate 后 verify 行为正确。
 9. sync 路径不是 no-op，writeback 模式必须真实落盘。
-10. 不影响 db_get_info、checkpoint、optimize、recover。
+10. 不影响 db_get_info。
+11. checkpoint/optimize/recover 要么真实支持 custom backend，要么返回明确 DB_UNSUPPORTED 并有测试说明。
 
 验证命令：
 
@@ -177,8 +192,8 @@ zig build test -Doptimize=ReleaseSafe
 ## 6. 完成标准
 
 - db_context_t.file_ops 有真实实现。
-- InMemoryFileOps 可用于真实 DB 全路径。
+- InMemoryFileOps 可用于真实 DB 正常读写路径。
 - 默认 DB IO 路径不退化。
 - 没有 VFS 语义进入 DB。
+- 不改变 DB key 模型；VFS u64 object key 仍由 VFS 编码为 raw key bytes。
 - README 中关于 file_ops unsupported 的限制应在后续文档更新任务中修改。
-

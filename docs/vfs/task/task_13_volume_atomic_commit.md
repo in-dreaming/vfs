@@ -83,7 +83,9 @@ if transaction committed but manifest not fully switched:
 
 ### 4.4 InMemory merge
 
-如果 task_00 完成，本任务应支持 staging pack 使用 InMemoryFileOps：
+普通磁盘 staging 是本任务的核心路径，不依赖 task_00。
+
+如果 task_00 完成，本任务应额外支持 staging pack 使用 InMemoryFileOps：
 
 ~~~text
 load staging pack to memory
@@ -92,6 +94,8 @@ verify
 flush staging atomically
 then meta commit
 ~~~
+
+如果 task_00 未完成，不得 mock InMemoryFileOps；InMemory staging 选项必须明确不可用或返回 VFS_UNSUPPORTED_FEATURE，普通磁盘 staging 仍应完成。
 
 ---
 
@@ -107,7 +111,8 @@ then meta commit
 6. staging orphan 可被 recover 清理或继续。
 7. verify-volume 检查 pack_generation 与 VolumeManifest 一致。
 8. resolver 切换是原子视图，不出现半新半旧。
-9. InMemoryFileOps staging 路径真实落盘可读。
+9. 如果 task_00 已完成，InMemoryFileOps staging 路径真实落盘可读。
+10. 如果 task_00 未完成，InMemory staging 明确失败，普通磁盘 staging 不受影响。
 
 验证命令：
 
@@ -122,5 +127,5 @@ zig build test
 - Volume 级跨 pack 原子可见。
 - 崩溃恢复语义明确且有测试。
 - Staging 与 meta manifest 格式可 verify。
+- 普通磁盘 staging 不依赖 InMemoryFileOps。
 - 无 mock/moke。
-

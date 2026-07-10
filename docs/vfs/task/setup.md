@@ -23,7 +23,8 @@ DB 当前能力：
 
 - db_context_t.file_ops 当前在 ABI 中存在，但完整 custom file backend 尚未实现。
 - 传入非空 file_ops 当前会返回 DB_UNSUPPORTED。
-- VFS 需要 InMemoryFileOps，因此必须先实现 DB file_ops 支持，见 task_00_db_file_ops_inmemory.md。
+- VFS 后续 InMemory merge/staging 需要 InMemoryFileOps，因此相关任务必须先实现 DB file_ops 支持，见 task_00_db_file_ops_inmemory.md。
+- Task 01-06 的 VFS 最小只读闭环可以先使用 DB 默认 platform IO；不得因为 task_00 未完成而 mock pack、mock DB 或阻塞 read-only VFS 实现。
 
 ---
 
@@ -84,6 +85,13 @@ typedef uint64_t vfs_file_entry_t;
 - VFS public API 不暴露 128-bit file id。
 - path 只是找到 FileEntry 的一种方式。
 
+V1 任务中的默认规则：
+
+- FileEntry 由调用方、BuildCfg 或工具参数显式提供。
+- 自动从 path/hash 生成 FileEntry 只能作为工具选项，且必须检测重复和 0 值。
+- 不同 virtual path 复用同一个 FileEntry 属于 alias/rename 语义；V1 PackBuilder 默认不隐式支持 alias，除非任务明确要求。
+- 任何任务不得把 FileEntry 偷偷扩展成 128-bit，也不得在 public API 中暴露结构体 key。
+
 ### 3.2 vfs_open 必须支持两种入口
 
 必须实现两条打开路径：
@@ -102,6 +110,14 @@ entry open 不能依赖 path，也不能要求 PathIndex 里存在对应 path。
 
 VFS 面向 DB 时使用 u64 object key。
 
+这里的含义必须精确理解：
+
+- VFS 层的 object key 类型是 u64。
+- 调用当前 DB public ABI 时，VFS 必须把该 u64 以 8-byte little-endian raw key bytes 传入 db_get/db_put/db_delete。
+- VFS 不得把 page/file/manifest 的多字段结构体直接作为 DB key。
+- 当前 DB 内部可能继续把 raw key bytes 映射为内部 Key128；这属于 DB 内部实现细节，VFS 任务不得为了 VFS object key 而顺手重写 DB index/data/journal 格式。
+- 如果未来需要 DB public ABI 原生支持 u64 key，必须新增独立 DB feature task，并保持现有 raw-key ABI 兼容；不能在 VFS task 中临时改 DB 语义。
+
 必须集中实现 object key 派生：
 
 ~~~text
@@ -115,6 +131,14 @@ patch_manifest_key(...)
 ~~~
 
 VFS 不把复杂结构体 key 暴露给上层。page/file/manifest 的 identity 必须写在 value header 中，并在读取时反向校验。
+
+建议集中提供 helper：
+
+~~~zig
+pub const ObjectKey = u64;
+pub fn encodeDbKey(key: ObjectKey) [8]u8; // little-endian
+pub fn decodeDbKey(bytes: *const [8]u8) ObjectKey;
+~~~
 
 ### 3.4 u64 碰撞处理
 
@@ -264,7 +288,7 @@ EntryResolver 是 FileEntry -> visible FileLocation 的 overlay 解析器。
 - priority 高的 pack 覆盖 priority 低的 pack。
 - writable out pack 默认最高优先级。
 - tombstone 隐藏低优先级版本。
-- 同 priority 的处理必须稳定；推荐 V1 直接返回配置错误，避免不同机器解析不同。
+- V1 同 priority 必须直接返回配置错误，避免不同机器解析不同。
 
 ### 6.4 FileManifest
 
@@ -422,10 +446,9 @@ zig build test -Doptimize=ReleaseSafe
 
 ## 10. 任务依赖顺序
 
-推荐顺序：
+推荐主线顺序：
 
 ~~~text
-task_00_db_file_ops_inmemory.md
 task_01_vfs_abi_skeleton.md
 task_02_object_keys_and_formats.md
 task_03_pack_builder_minimal.md
@@ -441,7 +464,19 @@ task_12_task_graph_scheduler.md
 task_13_volume_atomic_commit.md
 ~~~
 
-如果前序任务未完成，当前任务必须停止并报告阻塞，不得用 mock 代替。
+DB/InMemory 支线：
+
+~~~text
+task_00_db_file_ops_inmemory.md
+~~~
+
+依赖规则：
+
+- Task 00 是 InMemoryFileOps、InMemory merge/staging、相关 DB custom backend 验证的前置任务。
+- Task 01-06 不依赖 Task 00，可使用 DB 默认 platform IO 完成最小只读闭环。
+- Task 07 的普通 disk writable pack 不应被 Task 00 阻塞；只有 InMemory 写入模式依赖 Task 00。
+- Task 13 的 InMemory staging 路径依赖 Task 00；普通磁盘 staging 可先实现。
+- 如果当前任务的真实必需前序未完成，必须停止并报告阻塞，不得用 mock 代替。
 
 ---
 
@@ -457,4 +492,3 @@ task_13_volume_atomic_commit.md
 - 错误路径可预测，不 panic、不越界、不泄漏 handle。
 - 验证流程全部通过，或明确说明被真实依赖阻塞。
 - 未实现项清楚标明“不在本 task 范围内”。
-

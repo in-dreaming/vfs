@@ -13,7 +13,7 @@ V1 写入策略是 whole-file rewrite：修改文件时完整重写该文件 pag
 - docs/vfs/task/setup.md
 - task_05_volume_mount_overlay.md
 - task_03_pack_builder_minimal.md
-- task_00_db_file_ops_inmemory.md
+- task_00_db_file_ops_inmemory.md，仅当实现 InMemoryFileOps 写入模式时必读
 
 ---
 
@@ -94,7 +94,9 @@ PathTombstone 可选；如果不实现，必须明确返回 unsupported。
 
 ### 4.5 InMemoryFileOps
 
-如果 task_00 已完成，本任务应支持可选 InMemoryFileOps 写入模式：
+普通 disk writable pack 是本任务必须完成的核心路径，不依赖 task_00。
+
+如果 task_00 已完成，本任务应额外支持可选 InMemoryFileOps 写入模式：
 
 ~~~text
 load writable pack DB to memory
@@ -103,7 +105,12 @@ flush writeback atomically
 reopen/refresh pack
 ~~~
 
-如果 task_00 未完成，不得 mock；必须标记阻塞。
+如果 task_00 未完成：
+
+- 不得 mock InMemoryFileOps。
+- 不得因此阻塞普通 disk writable pack。
+- 必须在最终结果中明确说明“InMemory 写入模式因 task_00 未完成而未启用/阻塞”。
+- 对外暴露的 InMemory 选项必须返回 VFS_UNSUPPORTED_FEATURE 或编译期不可用，不能假成功。
 
 ---
 
@@ -119,7 +126,8 @@ reopen/refresh pack
 6. commit 失败模拟时 resolver 不发布半成品。
 7. key collision 检测触发 VFS_KEY_COLLISION。
 8. 写入后 DB verify 通过。
-9. 使用 InMemoryFileOps 写入并 flush 后默认 backend 可读。
+9. 如果 task_00 已完成，使用 InMemoryFileOps 写入并 flush 后默认 backend 可读。
+10. 如果 task_00 未完成，InMemory 选项明确失败，普通 disk writable pack 测试仍通过。
 
 验证命令：
 
@@ -134,5 +142,5 @@ zig build test
 - writable pack 能真实写入和覆盖。
 - whole-file rewrite 语义正确。
 - tombstone 可隐藏低优先级文件。
-- InMemoryFileOps 路径真实可用或明确因 task_00 阻塞。
-
+- 普通 disk writable pack 不依赖 InMemoryFileOps。
+- InMemoryFileOps 路径真实可用；或仅 InMemory 模式明确因 task_00 阻塞，不能影响核心 writable pack。

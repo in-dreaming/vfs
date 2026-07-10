@@ -56,6 +56,7 @@ pub fn pathIndexKey() u64;
 pub fn directoryManifestKey() u64;
 pub fn fileManifestKey(file_entry: u64) u64;
 pub fn pageKey(file_entry: u64, block_index: u32, page_index: u32) u64;
+pub fn encodeDbKey(key: u64) [8]u8;
 ~~~
 
 要求：
@@ -64,6 +65,9 @@ pub fn pageKey(file_entry: u64, block_index: u32, page_index: u32) u64;
 - reserved key 与派生 key 必须有冲突检测 helper。
 - hash 输入必须带 domain separator，例如 vfs.page.v1。
 - file_entry 为 0 时返回 error.InvalidFileEntry。
+- 调用 DB 时只能使用 encodeDbKey 输出的 8-byte little-endian raw key bytes。
+- 禁止把 FileManifest/PageValue 的多字段 identity struct 直接作为 DB key。
+- 禁止在本任务中修改 DB 内部 Key128/index/journal 格式来“适配 VFS”；如需 DB 原生 u64 ABI，必须另建 DB feature task。
 
 ### 4.2 PackManifest
 
@@ -174,14 +178,15 @@ PathTombstone 可以只定义格式，不要求 overlay 使用。
 1. object key 派生稳定，同输入多次一致。
 2. reserved key 不与常见 file/page key 冲突。
 3. file_entry 0 返回错误。
-4. PackManifest encode/decode roundtrip。
-5. FileManifest encode/decode roundtrip，多 block、多 page。
-6. PathIndex 支持 path_hash 碰撞下 full path 匹配。
-7. PageValue header identity 不匹配时拒绝。
-8. PageValue stored_crc 损坏时拒绝。
-9. 截断 value 时拒绝。
-10. 保留字段非 0 时按格式策略拒绝或清晰忽略，并有测试。
-11. 所有格式 little-endian 编码稳定。
+4. encodeDbKey 对固定 u64 输出固定 little-endian 字节。
+5. PackManifest encode/decode roundtrip。
+6. FileManifest encode/decode roundtrip，多 block、多 page。
+7. PathIndex 支持 path_hash 碰撞下 full path 匹配。
+8. PageValue header identity 不匹配时拒绝。
+9. PageValue stored_crc 损坏时拒绝。
+10. 截断 value 时拒绝。
+11. 保留字段非 0 时按格式策略拒绝或清晰忽略，并有测试。
+12. 所有格式 little-endian 编码稳定。
 
 验证命令：
 
@@ -198,4 +203,3 @@ zig build test -Doptimize=ReleaseSafe
 - 所有读取路径都有校验。
 - 没有 mock/moke。
 - 没有 public callback。
-

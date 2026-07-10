@@ -61,6 +61,13 @@ pub const BuildFileInput = struct {
 pub fn createPack(output_path: []const u8, files: []const BuildFileInput, options: PackBuildOptions) !void;
 ~~~
 
+V1 FileEntry 规则：
+
+- file_entry 必须由调用方显式传入，且必须非 0。
+- 本任务不自动从 virtual_path 生成 FileEntry，除非 CLI 明确提供一个单独选项并完整检测冲突。
+- 同一个 pack 内默认禁止两个 BuildFileInput 使用同一个 file_entry，即使 virtual_path 不同也拒绝。
+- 多 path alias / rename 语义留给后续显式任务，不在最小 PackBuilder 中隐式实现。
+
 ### 4.2 文件处理
 
 每个输入文件：
@@ -78,12 +85,15 @@ pub fn createPack(output_path: []const u8, files: []const BuildFileInput, option
 10. 加入 PackManifest file list 摘要。
 ~~~
 
+所有写入 DB 的 key 必须来自 Task 02 的 ObjectKey helper，并编码为 8-byte little-endian raw key bytes。
+
 ### 4.3 key collision 检测
 
 构建期间必须维护 object key set：
 
 - FileManifestKey 不得重复。
 - PageKey 不得重复。
+- file_entry 不得重复。
 - reserved key 不得被派生 key 覆盖。
 - 如果重复且 identity 不同，构建失败并返回 VFS_KEY_COLLISION。
 
@@ -117,7 +127,7 @@ CLI 必须调用真实 PackBuilder，不得重复实现假逻辑。
 4. 小于 page_size 的文件生成一个 page。
 5. 大于 page_size 的文件生成多个 page。
 6. PathIndex 能通过 virtual_path 找到 FileEntry。
-7. file_entry 重复但 path 不同的策略明确；V1 推荐拒绝。
+7. file_entry 重复但 path 不同必须拒绝，错误明确。
 8. object key collision 被检测。
 9. PageValue payload 与源文件对应 range 一致。
 10. DB verify 通过。
@@ -140,4 +150,3 @@ zig build test
 - pack 中 manifest/path/page 全部真实存在。
 - 生成结果可被后续 reader 读取。
 - 没有 mock/moke。
-
