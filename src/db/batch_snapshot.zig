@@ -11,7 +11,7 @@ fn keyId(key: fmt.Key128) u128 {
 }
 
 const BatchOp = union(enum) {
-    put: struct { key: fmt.Key128, data: []u8, flags: u32 },
+    put: struct { key: fmt.Key128, key_bytes: []u8, data: []u8, flags: u32 },
     delete: fmt.Key128,
 };
 
@@ -27,8 +27,24 @@ pub const Batch = struct {
 
     pub fn put(self: *Batch, key: fmt.Key128, data: []const u8, flags: u32) !void {
         if (self.closed) return error.InvalidArgument;
+        const owned_key = try self.allocator.alloc(u8, 0);
+        errdefer self.allocator.free(owned_key);
         const owned = try self.allocator.dupe(u8, data);
-        try self.ops.append(self.allocator, .{ .put = .{ .key = key, .data = owned, .flags = flags } });
+        try self.ops.append(self.allocator, .{ .put = .{ .key = key, .key_bytes = owned_key, .data = owned, .flags = flags } });
+    }
+
+    pub fn putBytes(self: *Batch, key_bytes: []const u8, data: []const u8, flags: u32) !void {
+        if (self.closed) return error.InvalidArgument;
+        const key = try self.db.keyFromBytes(key_bytes);
+        const owned_key = try self.allocator.dupe(u8, key_bytes);
+        errdefer self.allocator.free(owned_key);
+        const owned = try self.allocator.dupe(u8, data);
+        errdefer self.allocator.free(owned);
+        try self.ops.append(self.allocator, .{ .put = .{ .key = key, .key_bytes = owned_key, .data = owned, .flags = flags } });
+    }
+
+    pub fn deleteBytes(self: *Batch, key_bytes: []const u8) !void {
+        try self.delete(try self.db.keyFromBytes(key_bytes));
     }
 
     pub fn delete(self: *Batch, key: fmt.Key128) !void {
@@ -55,6 +71,7 @@ pub const Batch = struct {
         for (self.ops.items) |op| switch (op) {
             .put => |p| try data_inputs.append(self.allocator, .{
                 .key = p.key,
+                .key_bytes = p.key_bytes,
                 .payload = p.data,
                 .options = .{ .version = self.db.nextVersionNoLock(p.key), .durability = .none, .defer_superblock = true },
             }),
@@ -95,7 +112,10 @@ pub const Batch = struct {
 
     pub fn deinit(self: *Batch) void {
         for (self.ops.items) |op| switch (op) {
-            .put => |p| self.allocator.free(p.data),
+            .put => |p| {
+                self.allocator.free(p.key_bytes);
+                self.allocator.free(p.data);
+            },
             .delete => {},
         };
         self.ops.deinit(self.allocator);
@@ -104,11 +124,12 @@ pub const Batch = struct {
 
 pub const Snapshot = struct {
     allocator: std.mem.Allocator,
+    db: *kv.KvDb,
     values: std.AutoHashMap(u128, []u8),
 
     pub fn begin(db: *kv.KvDb, allocator: std.mem.Allocator) !Snapshot {
         try db.commitPending(null);
-        var snap = Snapshot{ .allocator = allocator, .values = std.AutoHashMap(u128, []u8).init(allocator) };
+        var snap = Snapshot{ .allocator = allocator, .db = db, .values = std.AutoHashMap(u128, []u8).init(allocator) };
         var base = base_mod.open(db.index) catch null;
         if (base) |*b| {
             defer b.close();
@@ -151,6 +172,14 @@ pub const Snapshot = struct {
         return v.len;
     }
 
+    pub fn getSizeBytes(self: *Snapshot, key_bytes: []const u8) !u64 {
+        return self.getSize(try self.db.keyFromBytes(key_bytes));
+    }
+
+    pub fn getIntoBytes(self: *Snapshot, key_bytes: []const u8, dst: []u8) !usize {
+        return self.getInto(try self.db.keyFromBytes(key_bytes), dst);
+    }
+
     pub fn deinit(self: *Snapshot) void {
         var it = self.values.iterator();
         while (it.next()) |entry| self.allocator.free(entry.value_ptr.*);
@@ -158,79 +187,112 @@ pub const Snapshot = struct {
     }
 };
 
-pub export fn db_batch_begin(db: ?*kv.KvDb, out_batch: ?**Batch) c_int {
-    const d = db orelse return @intFromEnum(fmt.DbStatus.invalid_argument);
-    const out = out_batch orelse return @intFromEnum(fmt.DbStatus.invalid_argument);
-    const b = std.heap.smp_allocator.create(Batch) catch return @intFromEnum(fmt.DbStatus.no_space);
+pub export fn db_batch_begin(db_handle: u64) u64 {
+    const d = kv.validateHandle(kv.KvDb, db_handle, .db) catch |err| {
+        _ = kv.setLastError(err);
+        return 0;
+    };
+    const b = std.heap.smp_allocator.create(Batch) catch {
+        _ = kv.setLastStatus(.no_space, "allocation failed");
+        return 0;
+    };
     b.* = Batch.begin(d, std.heap.smp_allocator);
-    out.* = b;
-    return @intFromEnum(fmt.DbStatus.ok);
+    const h = @intFromPtr(b);
+    kv.registerHandle(h, .batch) catch |err| {
+        std.heap.smp_allocator.destroy(b);
+        _ = kv.setLastError(err);
+        return 0;
+    };
+    _ = kv.setOk();
+    return h;
 }
 
-pub export fn db_batch_put(batch: ?*Batch, key: kv.db_key128_t, data: ?*const anyopaque, size: u64, flags: u32) c_int {
-    const b = batch orelse return @intFromEnum(fmt.DbStatus.invalid_argument);
-    const ptr = data orelse return @intFromEnum(fmt.DbStatus.invalid_argument);
-    const len: usize = std.math.cast(usize, size) orelse return @intFromEnum(fmt.DbStatus.invalid_argument);
-    b.put(.{ .hi = key.hi, .lo = key.lo }, @as([*]const u8, @ptrCast(ptr))[0..len], flags) catch |err| return @intFromEnum(fmt.statusFromError(err));
-    return @intFromEnum(fmt.DbStatus.ok);
+pub export fn db_batch_put(batch_handle: u64, key: ?*const anyopaque, key_size: u64, data: ?*const anyopaque, size: u64, flags: u32) c_int {
+    const b = kv.validateHandle(Batch, batch_handle, .batch) catch |err| return kv.setLastError(err);
+    const k = kv.keySlice(key, key_size) catch |err| return kv.setLastError(err);
+    const slice = kv.dataSlice(data, size) catch |err| return kv.setLastError(err);
+    b.putBytes(k, slice, flags) catch |err| return kv.setLastError(err);
+    return kv.setOk();
 }
 
-pub export fn db_batch_delete(batch: ?*Batch, key: kv.db_key128_t) c_int {
-    const b = batch orelse return @intFromEnum(fmt.DbStatus.invalid_argument);
-    b.delete(.{ .hi = key.hi, .lo = key.lo }) catch |err| return @intFromEnum(fmt.statusFromError(err));
-    return @intFromEnum(fmt.DbStatus.ok);
+pub export fn db_batch_delete(batch_handle: u64, key: ?*const anyopaque, key_size: u64) c_int {
+    const b = kv.validateHandle(Batch, batch_handle, .batch) catch |err| return kv.setLastError(err);
+    const k = kv.keySlice(key, key_size) catch |err| return kv.setLastError(err);
+    b.deleteBytes(k) catch |err| return kv.setLastError(err);
+    return kv.setOk();
 }
 
-pub export fn db_batch_commit(batch: ?*Batch, durability: u32) c_int {
-    const b = batch orelse return @intFromEnum(fmt.DbStatus.invalid_argument);
+pub export fn db_batch_commit(batch_handle: u64, durability: u32) c_int {
+    const b = kv.validateHandle(Batch, batch_handle, .batch) catch |err| return kv.setLastError(err);
     const d: fmt.Durability = switch (durability) { 0 => .none, 1 => .async, 2 => .sync, else => .sync };
-    b.commit(d) catch |err| return @intFromEnum(fmt.statusFromError(err));
+    kv.unregisterHandle(batch_handle);
+    b.commit(d) catch |err| {
+        b.deinit();
+        std.heap.smp_allocator.destroy(b);
+        return kv.setLastError(err);
+    };
     b.deinit();
     std.heap.smp_allocator.destroy(b);
-    return @intFromEnum(fmt.DbStatus.ok);
+    return kv.setOk();
 }
 
-pub export fn db_batch_rollback(batch: ?*Batch) c_int {
-    const b = batch orelse return @intFromEnum(fmt.DbStatus.invalid_argument);
+pub export fn db_batch_rollback(batch_handle: u64) c_int {
+    const b = kv.validateHandle(Batch, batch_handle, .batch) catch |err| return kv.setLastError(err);
+    kv.unregisterHandle(batch_handle);
     b.rollback();
     b.deinit();
     std.heap.smp_allocator.destroy(b);
-    return @intFromEnum(fmt.DbStatus.ok);
+    return kv.setOk();
 }
 
-pub export fn db_snapshot_begin(db: ?*kv.KvDb, out_snapshot: ?**Snapshot) c_int {
-    const d = db orelse return @intFromEnum(fmt.DbStatus.invalid_argument);
-    const out = out_snapshot orelse return @intFromEnum(fmt.DbStatus.invalid_argument);
-    const s = std.heap.smp_allocator.create(Snapshot) catch return @intFromEnum(fmt.DbStatus.no_space);
+pub export fn db_snapshot_begin(db_handle: u64) u64 {
+    const d = kv.validateHandle(kv.KvDb, db_handle, .db) catch |err| {
+        _ = kv.setLastError(err);
+        return 0;
+    };
+    const s = std.heap.smp_allocator.create(Snapshot) catch {
+        _ = kv.setLastStatus(.no_space, "allocation failed");
+        return 0;
+    };
     s.* = Snapshot.begin(d, std.heap.smp_allocator) catch |err| {
         std.heap.smp_allocator.destroy(s);
-        return @intFromEnum(fmt.statusFromError(err));
+        _ = kv.setLastError(err);
+        return 0;
     };
-    out.* = s;
-    return @intFromEnum(fmt.DbStatus.ok);
+    const h = @intFromPtr(s);
+    kv.registerHandle(h, .snapshot) catch |err| {
+        s.deinit();
+        std.heap.smp_allocator.destroy(s);
+        _ = kv.setLastError(err);
+        return 0;
+    };
+    _ = kv.setOk();
+    return h;
 }
 
-pub export fn db_snapshot_get_size(snapshot: ?*Snapshot, key: kv.db_key128_t, out_size: ?*u64) c_int {
-    const s = snapshot orelse return @intFromEnum(fmt.DbStatus.invalid_argument);
-    const out = out_size orelse return @intFromEnum(fmt.DbStatus.invalid_argument);
-    out.* = s.getSize(.{ .hi = key.hi, .lo = key.lo }) catch |err| return @intFromEnum(fmt.statusFromError(err));
-    return @intFromEnum(fmt.DbStatus.ok);
+pub export fn db_snapshot_get_size(snapshot_handle: u64, key: ?*const anyopaque, key_size: u64, out_size: ?*u64) c_int {
+    const s = kv.validateHandle(Snapshot, snapshot_handle, .snapshot) catch |err| return kv.setLastError(err);
+    const out = out_size orelse return kv.setLastStatus(.invalid_argument, "out_size is null");
+    const k = kv.keySlice(key, key_size) catch |err| return kv.setLastError(err);
+    out.* = s.getSizeBytes(k) catch |err| return kv.setLastError(err);
+    return kv.setOk();
 }
 
-pub export fn db_snapshot_get_into(snapshot: ?*Snapshot, key: kv.db_key128_t, dst: ?*anyopaque, dst_size: u64, out_written: ?*u64) c_int {
-    const s = snapshot orelse return @intFromEnum(fmt.DbStatus.invalid_argument);
-    const ptr = dst orelse return @intFromEnum(fmt.DbStatus.invalid_argument);
-    const out = out_written orelse return @intFromEnum(fmt.DbStatus.invalid_argument);
-    const len: usize = std.math.cast(usize, dst_size) orelse return @intFromEnum(fmt.DbStatus.invalid_argument);
-    out.* = s.getInto(.{ .hi = key.hi, .lo = key.lo }, @as([*]u8, @ptrCast(ptr))[0..len]) catch |err| return @intFromEnum(fmt.statusFromError(err));
-    return @intFromEnum(fmt.DbStatus.ok);
+pub export fn db_snapshot_get_into(snapshot_handle: u64, key: ?*const anyopaque, key_size: u64, dst: ?*anyopaque, dst_size: u64, out_written: ?*u64) c_int {
+    const s = kv.validateHandle(Snapshot, snapshot_handle, .snapshot) catch |err| return kv.setLastError(err);
+    const out = out_written orelse return kv.setLastStatus(.invalid_argument, "out_written is null");
+    const k = kv.keySlice(key, key_size) catch |err| return kv.setLastError(err);
+    const slice = kv.mutSlice(dst, dst_size) catch |err| return kv.setLastError(err);
+    out.* = s.getIntoBytes(k, slice) catch |err| return kv.setLastError(err);
+    return kv.setOk();
 }
 
-pub export fn db_snapshot_end(snapshot: ?*Snapshot) c_int {
-    const s = snapshot orelse return @intFromEnum(fmt.DbStatus.invalid_argument);
+pub export fn db_snapshot_end(snapshot_handle: u64) c_int {
+    const s = kv.validateHandle(Snapshot, snapshot_handle, .snapshot) catch |err| return kv.setLastError(err);
+    kv.unregisterHandle(snapshot_handle);
     s.deinit();
     std.heap.smp_allocator.destroy(s);
-    return @intFromEnum(fmt.DbStatus.ok);
+    return kv.setOk();
 }
 
 test "batch atomic visibility and snapshot stable reads" {

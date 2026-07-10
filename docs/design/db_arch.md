@@ -1020,7 +1020,7 @@ C ABI 必须稳定、少暴露内部结构。
 - 所有输入 slice 使用 pointer + length。
 - 不跨 ABI 抛 Zig error。
 - C ABI 默认使用 caller-provided buffer，不返回内部 mmap 指针。
-- 若未来增加 owned-buffer API，必须配套 `db_*_free`；当前 V1 不提供 owned-buffer get。
+- 若未来增加 owned-buffer API，必须配套 `db_*_free`；当前 ABI v2 不提供 owned-buffer get。
 - DB 是独立库，建议产物为 `libdb`。
 - DB 库导出符号统一使用 `db_*` 前缀。
 - 未来 VFS 是另一个独立库，建议产物为 `libvfs`，其导出符号使用 `vfs_*` 前缀。
@@ -1032,12 +1032,22 @@ C ABI 必须稳定、少暴露内部结构。
 ### 10.2 示例 API
 
 ~~~c
-typedef struct db db_t;
+typedef uint64_t db_handle_t; /* 0 is invalid */
 
-typedef struct db_key128 {
-    uint64_t hi;
-    uint64_t lo;
-} db_key128_t;
+typedef int (*db_hash_fn)(
+    void* user_data,
+    const void* key,
+    uint64_t key_size,
+    uint64_t* out_hi,
+    uint64_t* out_lo);
+
+typedef struct db_context {
+    uint32_t struct_size;
+    uint32_t version;
+    void* user_data;
+    db_hash_fn hash_fn;              /* NULL => default stable hash128 */
+    const db_file_ops_t* file_ops;   /* NULL => default platform IO */
+} db_context_t;
 
 typedef struct db_open_options {
     uint32_t struct_size;
@@ -1048,18 +1058,24 @@ typedef struct db_open_options {
     uint64_t data_file_target_size;
 } db_open_options_t;
 
-int db_open(const char* path, const db_open_options_t* options, db_t** out_db);
-int db_close(db_t* db);
+db_handle_t db_create(const char* path, const db_open_options_t* options, const db_context_t* context);
+db_handle_t db_open(const char* path, const db_open_options_t* options, const db_context_t* context);
+int db_close(db_handle_t db);
 
-int db_get_size(db_t* db, db_key128_t key, uint64_t* out_size);
-int db_get_into(db_t* db, db_key128_t key, void* dst, uint64_t dst_size, uint64_t* out_written);
+int db_last_status(void);
+const char* db_last_error_message(void);
 
-int db_put(db_t* db, db_key128_t key, const void* data, uint64_t size, uint32_t flags);
-int db_delete(db_t* db, db_key128_t key);
+int db_get_size(db_handle_t db, const void* key, uint64_t key_size, uint64_t* out_size);
+int db_get_into(db_handle_t db, const void* key, uint64_t key_size, void* dst, uint64_t dst_size, uint64_t* out_written);
 
-int db_checkpoint(db_t* db, uint32_t flags);
-int db_verify(db_t* db, uint32_t flags);
-int db_optimize(db_t* db, uint32_t flags);
+int db_put(db_handle_t db, const void* key, uint64_t key_size, const void* data, uint64_t size, uint32_t flags);
+int db_delete(db_handle_t db, const void* key, uint64_t key_size);
+
+int db_get_info(db_handle_t db, db_info_t* out_info);
+int db_checkpoint(db_handle_t db, uint32_t flags);
+int db_verify(db_handle_t db, uint32_t flags);
+int db_recover(const char* path, uint32_t flags, const db_context_t* context);
+int db_optimize(db_handle_t db, uint32_t flags);
 ~~~
 
 大 value 不使用 callback streaming。若 `get_into` 不适合，后续只能增加显式 reader handle API，例如 `db_reader_open/db_reader_read/db_reader_close`，由 caller 主动拉取数据。
@@ -1067,13 +1083,11 @@ int db_optimize(db_t* db, uint32_t flags);
 Batch API：
 
 ~~~c
-typedef struct db_batch db_batch_t;
-
-int db_batch_begin(db_t* db, db_batch_t** out_batch);
-int db_batch_put(db_batch_t* batch, db_key128_t key, const void* data, uint64_t size, uint32_t flags);
-int db_batch_delete(db_batch_t* batch, db_key128_t key);
-int db_batch_commit(db_batch_t* batch, uint32_t durability);
-int db_batch_rollback(db_batch_t* batch);
+db_handle_t db_batch_begin(db_handle_t db);
+int db_batch_put(db_handle_t batch, const void* key, uint64_t key_size, const void* data, uint64_t size, uint32_t flags);
+int db_batch_delete(db_handle_t batch, const void* key, uint64_t key_size);
+int db_batch_commit(db_handle_t batch, uint32_t durability);
+int db_batch_rollback(db_handle_t batch);
 ~~~
 
 ---

@@ -56,12 +56,22 @@ pub const KvDb = struct {
 实现 C ABI：
 
 ~~~c
-typedef struct db db_t;
+typedef uint64_t db_handle_t;
 
-typedef struct db_key128 {
-    uint64_t hi;
-    uint64_t lo;
-} db_key128_t;
+typedef int (*db_hash_fn)(
+    void* user_data,
+    const void* key,
+    uint64_t key_size,
+    uint64_t* out_hi,
+    uint64_t* out_lo);
+
+typedef struct db_context {
+    uint32_t struct_size;
+    uint32_t version;
+    void* user_data;
+    db_hash_fn hash_fn;
+    const db_file_ops_t* file_ops;
+} db_context_t;
 
 typedef struct db_open_options {
     uint32_t struct_size;
@@ -72,14 +82,19 @@ typedef struct db_open_options {
     uint64_t data_file_target_size;
 } db_open_options_t;
 
-int db_open(const char* path, const db_open_options_t* options, db_t** out_db);
-int db_close(db_t* db);
+db_handle_t db_create(const char* path, const db_open_options_t* options, const db_context_t* context);
+db_handle_t db_open(const char* path, const db_open_options_t* options, const db_context_t* context);
+int db_close(db_handle_t db);
 
-int db_get_size(db_t* db, db_key128_t key, uint64_t* out_size);
-int db_get_into(db_t* db, db_key128_t key, void* dst, uint64_t dst_size, uint64_t* out_written);
+int db_last_status(void);
+const char* db_last_error_message(void);
 
-int db_put(db_t* db, db_key128_t key, const void* data, uint64_t size, uint32_t flags);
-int db_delete(db_t* db, db_key128_t key);
+int db_get_size(db_handle_t db, const void* key, uint64_t key_size, uint64_t* out_size);
+int db_get_into(db_handle_t db, const void* key, uint64_t key_size, void* dst, uint64_t dst_size, uint64_t* out_written);
+
+int db_put(db_handle_t db, const void* key, uint64_t key_size, const void* data, uint64_t size, uint32_t flags);
+int db_delete(db_handle_t db, const void* key, uint64_t key_size);
+int db_get_info(db_handle_t db, db_info_t* out_info);
 ~~~
 
 不要实现 `db_get_stream(callback)`。

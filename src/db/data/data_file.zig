@@ -48,12 +48,14 @@ pub const AppendResult = struct {
 
 pub const BatchAppendInput = struct {
     key: fmt.Key128,
+    key_bytes: []const u8 = &.{},
     payload: []const u8,
     options: AppendOptions,
 };
 
 pub const RecordMeta = struct {
     key: fmt.Key128,
+    key_size: u32,
     offset: u64,
     header_size: u32,
     stored_size: u32,
@@ -110,9 +112,10 @@ pub const RecordHeader = extern struct {
     version: u64,
     header_size: u32,
     stored_size: u32,
-    raw_size: u32,
     header_crc: u32,
+    raw_size: u32,
     payload_crc: u32,
+    key_size: u32,
     txn_id: u64,
 };
 
@@ -137,12 +140,20 @@ pub const DataFile = struct {
         return dataAppend(self, key, payload, options);
     }
 
+    pub fn appendRawKey(self: *DataFile, key: fmt.Key128, key_bytes: []const u8, payload: []const u8, options: AppendOptions) !AppendResult {
+        return dataAppendRawKey(self, key, key_bytes, payload, options);
+    }
+
     pub fn readMeta(self: *DataFile, offset: u64) !RecordMeta {
         return dataReadMeta(self, offset);
     }
 
     pub fn readPayload(self: *DataFile, offset: u64, key: fmt.Key128, dst: []u8) !usize {
         return dataReadPayload(self, offset, key, dst);
+    }
+
+    pub fn readPayloadRawKey(self: *DataFile, offset: u64, key: fmt.Key128, key_bytes: []const u8, dst: []u8) !usize {
+        return dataReadPayloadRawKey(self, offset, key, key_bytes, dst);
     }
 
     pub fn verifyRecord(self: *DataFile, offset: u64) !RecordMeta {
@@ -192,7 +203,7 @@ fn initializeNew(file: pf.FileHandle, options: CreateOptions) !void {
     try pf.preallocate(file, 0, RECORD_AREA_OFFSET);
     const header = DataFileHeader{
         .magic = DATA_FILE_MAGIC,
-        .major_version = 1,
+        .major_version = 2,
         .minor_version = 0,
         .endian = ENDIAN_LE,
         .flags = 0,
@@ -207,7 +218,7 @@ fn initializeNew(file: pf.FileHandle, options: CreateOptions) !void {
     try writeHeader(file, header);
     const sb = DataSuperBlock{
         .magic = DATA_SUPER_MAGIC,
-        .version = 1,
+        .version = 2,
         .epoch = 1,
         .file_size = RECORD_AREA_OFFSET,
         .logical_tail = RECORD_AREA_OFFSET,
@@ -236,7 +247,7 @@ fn initializeNew(file: pf.FileHandle, options: CreateOptions) !void {
 
 fn loadAndMaybeRepair(file: pf.FileHandle, options: OpenOptions) !DataSuperBlock {
     const header = try readHeader(file);
-    if (header.magic != DATA_FILE_MAGIC or header.major_version != 1 or header.endian != ENDIAN_LE) return error.Corruption;
+    if (header.magic != DATA_FILE_MAGIC or header.major_version != 2 or header.endian != ENDIAN_LE) return error.Corruption;
     if (header.header_size != DATA_HEADER_SIZE or header.record_area_offset != RECORD_AREA_OFFSET or header.alignment != RECORD_ALIGNMENT) return error.Corruption;
 
     const a = readSuper(file, DATA_SUPERBLOCK_A_OFFSET) catch null;
@@ -272,7 +283,8 @@ pub fn appendBatch(file: *DataFile, allocator: std.mem.Allocator, records: []con
     var publish_superblock = false;
     for (records) |rec| {
         if (rec.payload.len > std.math.maxInt(u32)) return error.InvalidArgument;
-        const total = @as(u64, RECORD_HEADER_SIZE) + rec.payload.len + RECORD_FOOTER_SIZE;
+        if (rec.key_bytes.len > std.math.maxInt(u32)) return error.InvalidArgument;
+        const total = @as(u64, RECORD_HEADER_SIZE) + rec.key_bytes.len + rec.payload.len + RECORD_FOOTER_SIZE;
         total_bytes += try fmt.alignUp(total, RECORD_ALIGNMENT);
         if (@intFromEnum(rec.options.durability) > @intFromEnum(max_durability)) max_durability = rec.options.durability;
         if (!rec.options.defer_superblock) publish_superblock = true;
@@ -290,7 +302,7 @@ pub fn appendBatch(file: *DataFile, allocator: std.mem.Allocator, records: []con
         const payload_crc = fmt.crc32c(rec.payload);
         var header_buf = encodeRecordHeader(.{
             .magic = RECORD_MAGIC,
-            .header_version = 1,
+            .header_version = 2,
             .flags = rec.options.flags,
             .key_hi = rec.key.hi,
             .key_lo = rec.key.lo,
@@ -300,19 +312,22 @@ pub fn appendBatch(file: *DataFile, allocator: std.mem.Allocator, records: []con
             .raw_size = @intCast(rec.payload.len),
             .header_crc = 0,
             .payload_crc = payload_crc,
+            .key_size = @intCast(rec.key_bytes.len),
             .txn_id = rec.options.txn_id,
         });
         const header_crc = fmt.crc32c(&header_buf);
         fmt.writeU32Le(header_buf[40..44], header_crc);
-        const record_crc = crcRecord(&header_buf, rec.payload);
+        const record_crc = crcRecord(&header_buf, rec.key_bytes, rec.payload);
         var footer_buf = encodeRecordFooter(.{ .magic_commit = RECORD_FOOTER_MAGIC, .record_crc = record_crc });
-        const total = @as(u64, RECORD_HEADER_SIZE) + rec.payload.len + RECORD_FOOTER_SIZE;
+        const total = @as(u64, RECORD_HEADER_SIZE) + rec.key_bytes.len + rec.payload.len + RECORD_FOOTER_SIZE;
         const aligned = try fmt.alignUp(total, RECORD_ALIGNMENT);
         const pad_len: usize = @intCast(aligned - total);
 
         const record_start = cursor;
         @memcpy(buf[cursor..][0..RECORD_HEADER_SIZE], &header_buf);
         cursor += RECORD_HEADER_SIZE;
+        @memcpy(buf[cursor..][0..rec.key_bytes.len], rec.key_bytes);
+        cursor += rec.key_bytes.len;
         @memcpy(buf[cursor..][0..rec.payload.len], rec.payload);
         cursor += rec.payload.len;
         @memcpy(buf[cursor..][0..RECORD_FOOTER_SIZE], &footer_buf);
@@ -338,7 +353,16 @@ pub fn appendBatch(file: *DataFile, allocator: std.mem.Allocator, records: []con
 }
 
 fn dataAppend(file: *DataFile, key: fmt.Key128, payload: []const u8, options: AppendOptions) !AppendResult {
+    return dataAppendRawKey(file, key, &.{}, payload, options);
+}
+
+pub fn appendRawKey(file: *DataFile, key: fmt.Key128, key_bytes: []const u8, payload: []const u8, options: AppendOptions) !AppendResult {
+    return dataAppendRawKey(file, key, key_bytes, payload, options);
+}
+
+fn dataAppendRawKey(file: *DataFile, key: fmt.Key128, key_bytes: []const u8, payload: []const u8, options: AppendOptions) !AppendResult {
     if (payload.len > std.math.maxInt(u32)) return error.InvalidArgument;
+    if (key_bytes.len > std.math.maxInt(u32)) return error.InvalidArgument;
     while (!file.append_mutex.tryLock()) std.atomic.spinLoopHint();
     defer file.append_mutex.unlock();
 
@@ -346,7 +370,7 @@ fn dataAppend(file: *DataFile, key: fmt.Key128, payload: []const u8, options: Ap
     const payload_crc = fmt.crc32c(payload);
     var header_buf = encodeRecordHeader(.{
         .magic = RECORD_MAGIC,
-        .header_version = 1,
+        .header_version = 2,
         .flags = options.flags,
         .key_hi = key.hi,
         .key_lo = key.lo,
@@ -356,20 +380,22 @@ fn dataAppend(file: *DataFile, key: fmt.Key128, payload: []const u8, options: Ap
         .raw_size = @intCast(payload.len),
         .header_crc = 0,
         .payload_crc = payload_crc,
+        .key_size = @intCast(key_bytes.len),
         .txn_id = options.txn_id,
     });
     const header_crc = fmt.crc32c(&header_buf);
     fmt.writeU32Le(header_buf[40..44], header_crc);
 
-    const record_crc = crcRecord(&header_buf, payload);
+    const record_crc = crcRecord(&header_buf, key_bytes, payload);
     var footer_buf = encodeRecordFooter(.{ .magic_commit = RECORD_FOOTER_MAGIC, .record_crc = record_crc });
-    const total = @as(u64, RECORD_HEADER_SIZE) + payload.len + RECORD_FOOTER_SIZE;
+    const total = @as(u64, RECORD_HEADER_SIZE) + key_bytes.len + payload.len + RECORD_FOOTER_SIZE;
     const aligned = try fmt.alignUp(total, RECORD_ALIGNMENT);
     const pad_len: usize = @intCast(aligned - total);
     var pad = [_]u8{0} ** RECORD_ALIGNMENT;
 
     try pf.pwritevAll(file.file, offset, &.{
         .{ .data = &header_buf },
+        .{ .data = key_bytes },
         .{ .data = payload },
         .{ .data = &footer_buf },
         .{ .data = pad[0..pad_len] },
@@ -399,7 +425,7 @@ pub fn publishSuper(file: *DataFile, durability: fmt.Durability) !void {
 pub fn publishSuperWithAllocator(file: *DataFile, durability: fmt.Durability, alloc: AllocatorSuper) !void {
     const sb = DataSuperBlock{
         .magic = DATA_SUPER_MAGIC,
-        .version = 1,
+        .version = 2,
         .epoch = file.epoch,
         .file_size = @max(try pf.len(file.file), file.logical_tail),
         .logical_tail = file.logical_tail,
@@ -447,10 +473,29 @@ pub fn readPayload(file: *DataFile, offset: u64, key: fmt.Key128, dst: []u8) !us
 }
 
 fn dataReadPayload(file: *DataFile, offset: u64, key: fmt.Key128, dst: []u8) !usize {
+    return dataReadPayloadRawKeyMaybe(file, offset, key, null, dst);
+}
+
+pub fn readPayloadRawKey(file: *DataFile, offset: u64, key: fmt.Key128, key_bytes: []const u8, dst: []u8) !usize {
+    return dataReadPayloadRawKey(file, offset, key, key_bytes, dst);
+}
+
+fn dataReadPayloadRawKey(file: *DataFile, offset: u64, key: fmt.Key128, key_bytes: []const u8, dst: []u8) !usize {
+    return dataReadPayloadRawKeyMaybe(file, offset, key, key_bytes, dst);
+}
+
+fn dataReadPayloadRawKeyMaybe(file: *DataFile, offset: u64, key: fmt.Key128, maybe_key_bytes: ?[]const u8, dst: []u8) !usize {
     const parsed = try readAndValidateHeader(file.file, offset);
     if (parsed.meta.key.hi != key.hi or parsed.meta.key.lo != key.lo) return error.NotFound;
+    if (maybe_key_bytes) |key_bytes| {
+        if (key_bytes.len != parsed.meta.key_size) return error.NotFound;
+        const stored_key = try std.heap.smp_allocator.alloc(u8, parsed.meta.key_size);
+        defer std.heap.smp_allocator.free(stored_key);
+        try readExact(file.file, offset + RECORD_HEADER_SIZE, stored_key);
+        if (!std.mem.eql(u8, stored_key, key_bytes)) return error.NotFound;
+    }
     if (dst.len < parsed.meta.raw_size) return error.BufferTooSmall;
-    try readExact(file.file, offset + RECORD_HEADER_SIZE, dst[0..parsed.meta.stored_size]);
+    try readExact(file.file, offset + RECORD_HEADER_SIZE + parsed.meta.key_size, dst[0..parsed.meta.stored_size]);
     try verifyPayloadAndFooter(file.file, offset, parsed.header_buf, dst[0..parsed.meta.stored_size], parsed.meta);
     return parsed.meta.raw_size;
 }
@@ -464,7 +509,7 @@ fn dataVerifyRecord(file: *DataFile, offset: u64) !RecordMeta {
     const allocator = std.heap.smp_allocator;
     const payload = try allocator.alloc(u8, parsed.meta.stored_size);
     defer allocator.free(payload);
-    try readExact(file.file, offset + RECORD_HEADER_SIZE, payload);
+    try readExact(file.file, offset + RECORD_HEADER_SIZE + parsed.meta.key_size, payload);
     try verifyPayloadAndFooter(file.file, offset, parsed.header_buf, payload, parsed.meta);
     return parsed.meta;
 }
@@ -478,7 +523,7 @@ fn scanTail(file: pf.FileHandle, start_tail: u64) !u64 {
         const parsed = readAndValidateHeaderHandle(file, offset) catch break;
         const payload = try std.heap.smp_allocator.alloc(u8, parsed.meta.stored_size);
         defer std.heap.smp_allocator.free(payload);
-        readExact(file, offset + RECORD_HEADER_SIZE, payload) catch break;
+        readExact(file, offset + RECORD_HEADER_SIZE + parsed.meta.key_size, payload) catch break;
         verifyPayloadAndFooter(file, offset, parsed.header_buf, payload, parsed.meta) catch break;
         last_good = offset + parsed.meta.aligned_size;
         offset = last_good;
@@ -509,19 +554,21 @@ fn readAndValidateHeaderHandle(file: pf.FileHandle, offset: u64) !ParsedHeader {
     const header_crc = fmt.readU32Le(buf[40..44]);
     const raw_size = fmt.readU32Le(buf[44..48]);
     const payload_crc = fmt.readU32Le(buf[48..52]);
-    const codec = fmt.readU16Le(buf[52..54]);
+    const key_size = fmt.readU32Le(buf[52..56]);
+    const codec: u16 = 0;
     const txn_id = fmt.readU64Le(buf[56..64]);
-    if (magic != RECORD_MAGIC or header_version != 1 or header_size != RECORD_HEADER_SIZE) return error.Corruption;
+    if (magic != RECORD_MAGIC or header_version != 2 or header_size != RECORD_HEADER_SIZE) return error.Corruption;
     if (stored_size != raw_size) return error.Corruption;
     var crc_buf = buf;
     fmt.writeU32Le(crc_buf[40..44], 0);
     if (fmt.crc32c(&crc_buf) != header_crc) return error.Corruption;
-    const total = @as(u64, RECORD_HEADER_SIZE) + stored_size + RECORD_FOOTER_SIZE;
+    const total = @as(u64, RECORD_HEADER_SIZE) + key_size + stored_size + RECORD_FOOTER_SIZE;
     const aligned = try fmt.alignUp(total, RECORD_ALIGNMENT);
     return .{
         .header_buf = buf,
         .meta = .{
             .key = .{ .hi = key_hi, .lo = key_lo },
+            .key_size = key_size,
             .offset = offset,
             .header_size = header_size,
             .stored_size = stored_size,
@@ -540,17 +587,21 @@ fn readAndValidateHeaderHandle(file: pf.FileHandle, offset: u64) !ParsedHeader {
 
 fn verifyPayloadAndFooter(file: pf.FileHandle, offset: u64, header_buf: [RECORD_HEADER_SIZE]u8, payload: []const u8, meta_in: RecordMeta) !void {
     if (fmt.crc32c(payload) != meta_in.payload_crc) return error.ChecksumMismatch;
+    const key_bytes = try std.heap.smp_allocator.alloc(u8, meta_in.key_size);
+    defer std.heap.smp_allocator.free(key_bytes);
+    try readExact(file, offset + RECORD_HEADER_SIZE, key_bytes);
     var footer_buf: [RECORD_FOOTER_SIZE]u8 = undefined;
-    try readExact(file, offset + RECORD_HEADER_SIZE + meta_in.stored_size, &footer_buf);
+    try readExact(file, offset + RECORD_HEADER_SIZE + meta_in.key_size + meta_in.stored_size, &footer_buf);
     const footer = decodeRecordFooter(&footer_buf);
     if (footer.magic_commit != RECORD_FOOTER_MAGIC) return error.Corruption;
-    if (crcRecord(&header_buf, payload) != footer.record_crc) return error.ChecksumMismatch;
+    if (crcRecord(&header_buf, key_bytes, payload) != footer.record_crc) return error.ChecksumMismatch;
 }
 
-fn crcRecord(header: *const [RECORD_HEADER_SIZE]u8, payload: []const u8) u32 {
+fn crcRecord(header: *const [RECORD_HEADER_SIZE]u8, key_bytes: []const u8, payload: []const u8) u32 {
     var crc = fmt.crc32c(header);
     var footer_magic: [4]u8 = undefined;
     fmt.writeU32Le(&footer_magic, RECORD_FOOTER_MAGIC);
+    crc = crc32cContinue(crc, key_bytes);
     crc = crc32cContinue(crc, payload);
     crc = crc32cContinue(crc, &footer_magic);
     return crc;
@@ -587,7 +638,7 @@ fn encodeRecordHeader(h: RecordHeader) [RECORD_HEADER_SIZE]u8 {
     fmt.writeU32Le(buf[40..44], h.header_crc);
     fmt.writeU32Le(buf[44..48], h.raw_size);
     fmt.writeU32Le(buf[48..52], h.payload_crc);
-    fmt.writeU16Le(buf[52..54], h.flags); // V1 stores codec-compatible flags field; codec returned from append result.
+    fmt.writeU32Le(buf[52..56], h.key_size);
     fmt.writeU64Le(buf[56..64], h.txn_id);
     return buf;
 }
@@ -696,7 +747,7 @@ fn readSuper(file: pf.FileHandle, offset: u64) !DataSuperBlock {
         .flags = fmt.readU32Le(buf[92..96]),
         .crc = stored_crc,
     };
-    if (sb.magic != DATA_SUPER_MAGIC or sb.version != 1 or sb.logical_tail < RECORD_AREA_OFFSET) return error.Corruption;
+    if (sb.magic != DATA_SUPER_MAGIC or sb.version != 2 or sb.logical_tail < RECORD_AREA_OFFSET) return error.Corruption;
     return sb;
 }
 

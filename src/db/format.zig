@@ -1,6 +1,7 @@
 const std = @import("std");
 
-pub const FORMAT_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 2;
 pub const MANIFEST_MAGIC: u64 = magic("DBMANV1!");
 pub const INDEX_MAGIC: u64 = magic("DBIDXV1!");
 pub const DATA_MAGIC: u64 = magic("DBDATV1!");
@@ -39,6 +40,7 @@ pub const DbStatus = enum(c_int) {
     busy = 7,
     no_space = 8,
     permission_denied = 9,
+    unsupported = 10,
     internal_error = 100,
 };
 
@@ -52,6 +54,7 @@ pub const Error = error{
     Busy,
     NoSpace,
     PermissionDenied,
+    Unsupported,
     Overflow,
 };
 
@@ -62,6 +65,7 @@ pub fn statusFromError(err: anyerror) DbStatus {
         error.Corruption => .corruption,
         error.ChecksumMismatch => .checksum_mismatch,
         error.UnsupportedVersion => .unsupported_version,
+        error.Unsupported => .unsupported,
         error.Busy, error.DeviceBusy, error.FileBusy, error.WouldBlock => .busy,
         error.NoSpace, error.NoSpaceLeft => .no_space,
         error.PermissionDenied, error.AccessDenied => .permission_denied,
@@ -162,6 +166,14 @@ fn mix64(x: u64) u64 {
 /// or platform-specific state can affect the result.
 pub fn mixHash128To64(key: Key128) u64 {
     return mix64(key.hi ^ std.math.rotl(u64, key.lo, 32) ^ 0x9e3779b97f4a7c15);
+}
+
+pub fn hashBytes128(bytes: []const u8) Key128 {
+    var hi_hasher = std.hash.Wyhash.init(0x44424b4559324849);
+    hi_hasher.update(bytes);
+    var lo_hasher = std.hash.Wyhash.init(0x44424b4559324c4f);
+    lo_hasher.update(bytes);
+    return .{ .hi = hi_hasher.final(), .lo = lo_hasher.final() };
 }
 
 comptime {

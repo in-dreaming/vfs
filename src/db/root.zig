@@ -24,48 +24,61 @@ pub const platform = struct {
     pub const file = @import("platform/file.zig");
 };
 
-pub export fn db_checkpoint(db: ?*kv_db.KvDb, flags: u32) c_int {
-    _ = flags;
-    const d = db orelse return @intFromEnum(format.DbStatus.invalid_argument);
-    d.checkpoint() catch |err| return @intFromEnum(format.statusFromError(err));
-    return @intFromEnum(format.DbStatus.ok);
+comptime {
+    _ = batch_snapshot.db_batch_begin;
+    _ = batch_snapshot.db_batch_put;
+    _ = batch_snapshot.db_batch_delete;
+    _ = batch_snapshot.db_batch_commit;
+    _ = batch_snapshot.db_batch_rollback;
+    _ = batch_snapshot.db_snapshot_begin;
+    _ = batch_snapshot.db_snapshot_get_size;
+    _ = batch_snapshot.db_snapshot_get_into;
+    _ = batch_snapshot.db_snapshot_end;
 }
 
-pub export fn db_commit(db: ?*kv_db.KvDb, durability: u32) c_int {
-    const d = db orelse return @intFromEnum(format.DbStatus.invalid_argument);
+pub export fn db_checkpoint(handle: u64, flags: u32) c_int {
+    _ = flags;
+    const d = kv_db.validateHandle(kv_db.KvDb, handle, .db) catch |err| return kv_db.setLastError(err);
+    d.checkpoint() catch |err| return kv_db.setLastError(err);
+    return kv_db.setOk();
+}
+
+pub export fn db_commit(handle: u64, durability: u32) c_int {
+    const d = kv_db.validateHandle(kv_db.KvDb, handle, .db) catch |err| return kv_db.setLastError(err);
     const dur: format.Durability = switch (durability) {
         0 => .none,
         1 => .async,
         2 => .sync,
         else => .sync,
     };
-    d.commitPending(dur) catch |err| return @intFromEnum(format.statusFromError(err));
-    return @intFromEnum(format.DbStatus.ok);
+    d.commitPending(dur) catch |err| return kv_db.setLastError(err);
+    return kv_db.setOk();
 }
 
-pub export fn db_verify(db: ?*kv_db.KvDb, flags: u32) c_int {
+pub export fn db_verify(handle: u64, flags: u32) c_int {
     _ = flags;
-    const d = db orelse return @intFromEnum(format.DbStatus.invalid_argument);
-    d.commitPending(null) catch |err| return @intFromEnum(format.statusFromError(err));
-    var report = recovery_verify.verifyAt(d.dir, std.heap.smp_allocator) catch |err| return @intFromEnum(format.statusFromError(err));
+    const d = kv_db.validateHandle(kv_db.KvDb, handle, .db) catch |err| return kv_db.setLastError(err);
+    d.commitPending(null) catch |err| return kv_db.setLastError(err);
+    var report = recovery_verify.verifyAt(d.dir, std.heap.smp_allocator) catch |err| return kv_db.setLastError(err);
     defer report.deinit();
-    return if (report.ok()) @intFromEnum(format.DbStatus.ok) else @intFromEnum(format.DbStatus.corruption);
+    return if (report.ok()) kv_db.setOk() else kv_db.setLastStatus(.corruption, "verify failed");
 }
 
-pub export fn db_recover(path: [*:0]const u8, flags: u32) c_int {
+pub export fn db_recover(path: [*:0]const u8, flags: u32, context: ?*const kv_db.db_context_t) c_int {
     _ = flags;
+    if (context) |ctx| if (ctx.file_ops != null) return kv_db.setLastStatus(.unsupported, "custom file_ops are not supported by recover yet");
     const io = std.Io.Threaded.global_single_threaded.io();
-    var dir = std.Io.Dir.openDir(std.Io.Dir.cwd(), io, std.mem.span(path), .{}) catch |err| return @intFromEnum(format.statusFromError(err));
+    var dir = std.Io.Dir.openDir(std.Io.Dir.cwd(), io, std.mem.span(path), .{}) catch |err| return kv_db.setLastError(err);
     defer dir.close(io);
-    recovery_verify.recoverAt(dir) catch |err| return @intFromEnum(format.statusFromError(err));
-    return @intFromEnum(format.DbStatus.ok);
+    recovery_verify.recoverAt(dir) catch |err| return kv_db.setLastError(err);
+    return kv_db.setOk();
 }
 
-pub export fn db_optimize(db: ?*kv_db.KvDb, flags: u32) c_int {
+pub export fn db_optimize(handle: u64, flags: u32) c_int {
     _ = flags;
-    const d = db orelse return @intFromEnum(format.DbStatus.invalid_argument);
-    d.optimize() catch |err| return @intFromEnum(format.statusFromError(err));
-    return @intFromEnum(format.DbStatus.ok);
+    const d = kv_db.validateHandle(kv_db.KvDb, handle, .db) catch |err| return kv_db.setLastError(err);
+    d.optimize() catch |err| return kv_db.setLastError(err);
+    return kv_db.setOk();
 }
 
 test {
