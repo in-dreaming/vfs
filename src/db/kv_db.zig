@@ -1,4 +1,5 @@
 const std = @import("std");
+const db_build_options = @import("db_build_options");
 const fmt = @import("format.zig");
 const manifest_mod = @import("manifest.zig");
 const data_mod = @import("data/data_file.zig");
@@ -9,6 +10,7 @@ const journal_mod = @import("index/delta_journal.zig");
 const checkpoint_mod = @import("index/checkpoint.zig");
 const alloc_mod = @import("data/allocator.zig");
 const pf = @import("platform/file.zig");
+const inmemory_file_ops = @import("platform/inmemory_file_ops.zig");
 const KEY_LOCK_COUNT: usize = 256;
 
 pub const OpenOptions = struct {
@@ -18,6 +20,7 @@ pub const OpenOptions = struct {
     create_if_missing: bool = true,
     hash_fn: ?DbHashFn = null,
     hash_user_data: ?*anyopaque = null,
+    file_ops: ?pf.CustomFileOps = null,
 };
 
 pub const AccessMode = enum(u32) {
@@ -43,8 +46,9 @@ const PendingOp = union(enum) {
 pub const DbHashFn = *const fn (?*anyopaque, ?*const anyopaque, u64, *u64, *u64) callconv(.c) c_int;
 
 pub const KvDb = struct {
-    dir: std.Io.Dir,
+    dir: pf.Directory,
     owns_dir: bool = false,
+    owned_root: []u8 = &.{},
     manifest: manifest_mod.Manifest,
     data: data_mod.DataFile,
     index: *index_mod.IndexFile,
@@ -60,20 +64,24 @@ pub const KvDb = struct {
     hash_user_data: ?*anyopaque = null,
 
     pub fn openAt(dir: std.Io.Dir, options: OpenOptions) !KvDb {
-        var man = manifest_mod.openAt(dir, "manifest.db") catch |err| switch (err) {
-            error.FileNotFound => if (options.mode == .read_only or !options.create_if_missing) return err else try manifest_mod.createAt(dir, "manifest.db", .{ .initial_data_files = 1 }),
+        return openIn(.fromOs(dir), options);
+    }
+
+    pub fn openIn(dir: pf.Directory, options: OpenOptions) !KvDb {
+        var man = manifest_mod.openIn(dir, "manifest.db") catch |err| switch (err) {
+            error.FileNotFound => if (options.mode == .read_only or !options.create_if_missing) return err else try manifest_mod.createIn(dir, "manifest.db", .{ .initial_data_files = 1 }),
             else => |e| return e,
         };
         errdefer man.close() catch {};
-        var data = data_mod.openAt(dir, "data_000.db", .{}) catch |err| switch (err) {
-            error.FileNotFound => if (options.mode == .read_only or !options.create_if_missing) return err else try data_mod.createAt(dir, "data_000.db", .{ .durability = options.durability }),
+        var data = data_mod.openIn(dir, "data_000.db", .{}) catch |err| switch (err) {
+            error.FileNotFound => if (options.mode == .read_only or !options.create_if_missing) return err else try data_mod.createIn(dir, "data_000.db", .{ .durability = options.durability }),
             else => |e| return e,
         };
         errdefer data.close() catch {};
         const index_ptr = try std.heap.smp_allocator.create(index_mod.IndexFile);
         errdefer std.heap.smp_allocator.destroy(index_ptr);
-        index_ptr.* = index_mod.openAt(dir, "index.db") catch |err| switch (err) {
-            error.FileNotFound => if (options.mode == .read_only or !options.create_if_missing) return err else try index_mod.createAt(dir, "index.db", [_]u8{0} ** 16),
+        index_ptr.* = index_mod.openIn(dir, "index.db") catch |err| switch (err) {
+            error.FileNotFound => if (options.mode == .read_only or !options.create_if_missing) return err else try index_mod.createIn(dir, "index.db", [_]u8{0} ** 16),
             else => |e| return e,
         };
         errdefer index_ptr.close() catch {};
@@ -96,8 +104,16 @@ pub const KvDb = struct {
         const io = std.Io.Threaded.global_single_threaded.io();
         if (options.create_if_missing) _ = std.Io.Dir.cwd().createDirPath(io, path) catch {};
         const dir = try std.Io.Dir.openDir(std.Io.Dir.cwd(), io, path, .{});
-        var db = try openAt(dir, options);
+        var db = try openIn(.fromOs(dir), options);
         db.owns_dir = true;
+        return db;
+    }
+
+    pub fn openCustom(path: []const u8, ops: pf.CustomFileOps, options: OpenOptions) !KvDb {
+        const root = try std.heap.smp_allocator.dupe(u8, path);
+        errdefer std.heap.smp_allocator.free(root);
+        var db = try openIn(.fromCustom(root, ops), options);
+        db.owned_root = root;
         return db;
     }
 
@@ -110,7 +126,18 @@ pub const KvDb = struct {
         try self.manifest.close();
         self.freePending();
         self.pending.deinit(std.heap.smp_allocator);
-        if (self.owns_dir) self.dir.close(std.Io.Threaded.global_single_threaded.io());
+        if (self.owns_dir) if (self.dir.os) |dir| dir.close(std.Io.Threaded.global_single_threaded.io());
+        if (self.owned_root.len != 0) {
+            std.heap.smp_allocator.free(self.owned_root);
+            self.owned_root = &.{};
+        }
+    }
+
+    pub fn discardPending(self: *KvDb) void {
+        lockMutex(&self.pending_lock);
+        defer self.pending_lock.unlock();
+        self.freePending();
+        self.pending.clearRetainingCapacity();
     }
 
     pub fn getSize(self: *KvDb, key: fmt.Key128) !u64 {
@@ -719,13 +746,29 @@ fn fieldFits(comptime T: type, comptime field: []const u8, len: usize) bool {
 }
 
 fn optionsFromC(options: ?*const db_open_options_t, context: ?*const db_context_t, create_if_missing: bool) !OpenOptions {
+    var custom_file_ops: ?pf.CustomFileOps = null;
+    var hash_fn: ?DbHashFn = null;
+    var hash_user_data: ?*anyopaque = null;
     if (context) |ctx| {
-        if (ctx.file_ops != null) return error.Unsupported;
-        const o = options orelse return .{ .create_if_missing = create_if_missing, .hash_fn = ctx.hash_fn, .hash_user_data = ctx.user_data };
-        return .{ .durability = switch (o.durability) { 0 => .none, 1 => .async, 2 => .sync, else => .sync }, .max_delta_entries = if (o.max_delta_entries == 0) 1024 else o.max_delta_entries, .mode = switch (o.flags & 0x3) { 1 => .read_only, 2 => .write_only, else => .read_write }, .create_if_missing = create_if_missing, .hash_fn = ctx.hash_fn, .hash_user_data = ctx.user_data };
+        if (ctx.struct_size < @offsetOf(db_context_t, "file_ops") + @sizeOf(?*const db_file_ops_t)) return error.InvalidArgument;
+        if (ctx.version != 1) return error.UnsupportedVersion;
+        hash_fn = ctx.hash_fn;
+        hash_user_data = ctx.user_data;
+        if (ctx.file_ops) |ops| {
+            custom_file_ops = try pf.customOpsFromRaw(@ptrCast(ops));
+        }
     }
-    const o = options orelse return .{ .create_if_missing = create_if_missing };
-    return .{ .durability = switch (o.durability) { 0 => .none, 1 => .async, 2 => .sync, else => .sync }, .max_delta_entries = if (o.max_delta_entries == 0) 1024 else o.max_delta_entries, .mode = switch (o.flags & 0x3) { 1 => .read_only, 2 => .write_only, else => .read_write }, .create_if_missing = create_if_missing };
+    const o = options orelse return .{ .create_if_missing = create_if_missing, .hash_fn = hash_fn, .hash_user_data = hash_user_data, .file_ops = custom_file_ops };
+    return .{ .durability = switch (o.durability) {
+        0 => .none,
+        1 => .async,
+        2 => .sync,
+        else => .sync,
+    }, .max_delta_entries = if (o.max_delta_entries == 0) 1024 else o.max_delta_entries, .mode = switch (o.flags & 0x3) {
+        1 => .read_only,
+        2 => .write_only,
+        else => .read_write,
+    }, .create_if_missing = create_if_missing, .hash_fn = hash_fn, .hash_user_data = hash_user_data, .file_ops = custom_file_ops };
 }
 
 fn openImpl(path: [*:0]const u8, options: ?*const db_open_options_t, context: ?*const db_context_t, create_if_missing: bool) u64 {
@@ -738,11 +781,18 @@ fn openImpl(path: [*:0]const u8, options: ?*const db_open_options_t, context: ?*
         _ = setLastStatus(.no_space, "allocation failed");
         return 0;
     };
-    db.* = KvDb.open(p, opts) catch |err| {
-        std.heap.smp_allocator.destroy(db);
-        _ = setLastError(err);
-        return 0;
-    };
+    db.* = if (opts.file_ops) |ops|
+        KvDb.openCustom(p, ops, opts) catch |err| {
+            std.heap.smp_allocator.destroy(db);
+            _ = setLastError(err);
+            return 0;
+        }
+    else
+        KvDb.open(p, opts) catch |err| {
+            std.heap.smp_allocator.destroy(db);
+            _ = setLastError(err);
+            return 0;
+        };
     const h = @intFromPtr(db);
     registerHandle(h, .db) catch |err| {
         db.close() catch {};
@@ -754,15 +804,15 @@ fn openImpl(path: [*:0]const u8, options: ?*const db_open_options_t, context: ?*
     return h;
 }
 
-pub export fn db_create(path: [*:0]const u8, options: ?*const db_open_options_t, context: ?*const db_context_t) u64 {
+pub fn db_create(path: [*:0]const u8, options: ?*const db_open_options_t, context: ?*const db_context_t) callconv(.c) u64 {
     return openImpl(path, options, context, true);
 }
 
-pub export fn db_open(path: [*:0]const u8, options: ?*const db_open_options_t, context: ?*const db_context_t) u64 {
+pub fn db_open(path: [*:0]const u8, options: ?*const db_open_options_t, context: ?*const db_context_t) callconv(.c) u64 {
     return openImpl(path, options, context, false);
 }
 
-pub export fn db_close(handle: u64) c_int {
+pub fn db_close(handle: u64) callconv(.c) c_int {
     const d = validateHandle(KvDb, handle, .db) catch |err| return setLastError(err);
     unregisterHandle(handle);
     d.close() catch |err| {
@@ -773,15 +823,15 @@ pub export fn db_close(handle: u64) c_int {
     return setOk();
 }
 
-pub export fn db_last_status() c_int {
+pub fn db_last_status() callconv(.c) c_int {
     return last_status;
 }
 
-pub export fn db_last_error_message() [*:0]const u8 {
+pub fn db_last_error_message() callconv(.c) [*:0]const u8 {
     return @ptrCast(&last_error);
 }
 
-pub export fn db_get_info(handle: u64, out_info: ?*db_info_t) c_int {
+pub fn db_get_info(handle: u64, out_info: ?*db_info_t) callconv(.c) c_int {
     const d = validateHandle(KvDb, handle, .db) catch |err| return setLastError(err);
     const out = out_info orelse return setLastStatus(.invalid_argument, "out_info is null");
     const got = d.getInfo(std.heap.smp_allocator) catch |err| return setLastError(err);
@@ -806,7 +856,7 @@ pub export fn db_get_info(handle: u64, out_info: ?*db_info_t) c_int {
     return setOk();
 }
 
-pub export fn db_get_size(handle: u64, key: ?*const anyopaque, key_size: u64, out_size: ?*u64) c_int {
+pub fn db_get_size(handle: u64, key: ?*const anyopaque, key_size: u64, out_size: ?*u64) callconv(.c) c_int {
     const d = validateHandle(KvDb, handle, .db) catch |err| return setLastError(err);
     const out = out_size orelse return setLastStatus(.invalid_argument, "out_size is null");
     const k = keySlice(key, key_size) catch |err| return setLastError(err);
@@ -814,7 +864,7 @@ pub export fn db_get_size(handle: u64, key: ?*const anyopaque, key_size: u64, ou
     return setOk();
 }
 
-pub export fn db_get_into(handle: u64, key: ?*const anyopaque, key_size: u64, dst: ?*anyopaque, dst_size: u64, out_written: ?*u64) c_int {
+pub fn db_get_into(handle: u64, key: ?*const anyopaque, key_size: u64, dst: ?*anyopaque, dst_size: u64, out_written: ?*u64) callconv(.c) c_int {
     const d = validateHandle(KvDb, handle, .db) catch |err| return setLastError(err);
     const out = out_written orelse return setLastStatus(.invalid_argument, "out_written is null");
     const k = keySlice(key, key_size) catch |err| return setLastError(err);
@@ -823,7 +873,7 @@ pub export fn db_get_into(handle: u64, key: ?*const anyopaque, key_size: u64, ds
     return setOk();
 }
 
-pub export fn db_put(handle: u64, key: ?*const anyopaque, key_size: u64, data: ?*const anyopaque, size: u64, flags: u32) c_int {
+pub fn db_put(handle: u64, key: ?*const anyopaque, key_size: u64, data: ?*const anyopaque, size: u64, flags: u32) callconv(.c) c_int {
     const d = validateHandle(KvDb, handle, .db) catch |err| return setLastError(err);
     const k = keySlice(key, key_size) catch |err| return setLastError(err);
     const slice = dataSlice(data, size) catch |err| return setLastError(err);
@@ -831,11 +881,26 @@ pub export fn db_put(handle: u64, key: ?*const anyopaque, key_size: u64, data: ?
     return setOk();
 }
 
-pub export fn db_delete(handle: u64, key: ?*const anyopaque, key_size: u64) c_int {
+pub fn db_delete(handle: u64, key: ?*const anyopaque, key_size: u64) callconv(.c) c_int {
     const d = validateHandle(KvDb, handle, .db) catch |err| return setLastError(err);
     const k = keySlice(key, key_size) catch |err| return setLastError(err);
     d.deleteBytes(k, .{}) catch |err| return setLastError(err);
     return setOk();
+}
+
+comptime {
+    if (db_build_options.enable_abi_exports) {
+        @export(&db_create, .{ .name = "db_create" });
+        @export(&db_open, .{ .name = "db_open" });
+        @export(&db_close, .{ .name = "db_close" });
+        @export(&db_last_status, .{ .name = "db_last_status" });
+        @export(&db_last_error_message, .{ .name = "db_last_error_message" });
+        @export(&db_get_info, .{ .name = "db_get_info" });
+        @export(&db_get_size, .{ .name = "db_get_size" });
+        @export(&db_get_into, .{ .name = "db_get_into" });
+        @export(&db_put, .{ .name = "db_put" });
+        @export(&db_delete, .{ .name = "db_delete" });
+    }
 }
 
 test "kv db internal and c abi put get overwrite delete reopen" {
@@ -924,9 +989,9 @@ test "c abi v2 handle raw key custom hash collision get info and unsupported fil
     try testing.expectEqual(@as(c_int, @intFromEnum(fmt.DbStatus.ok)), db_close(cdb));
 
     var ops = db_file_ops_t{ .struct_size = @sizeOf(db_file_ops_t), .version = 1, .user_data = null, .open = null, .close = null, .read_at = null, .write_at = null, .get_size = null, .set_size = null, .sync = null, .preallocate = null, .mmap = null, .msync = null, .munmap = null };
-    const unsupported_ctx = db_context_t{ .struct_size = @sizeOf(db_context_t), .version = 1, .user_data = null, .hash_fn = null, .file_ops = &ops };
-    try testing.expectEqual(@as(u64, 0), db_create("zig-cache/db_abi_v2_unsupported", null, &unsupported_ctx));
-    try testing.expectEqual(@as(c_int, @intFromEnum(fmt.DbStatus.unsupported)), db_last_status());
+    const invalid_ctx = db_context_t{ .struct_size = @sizeOf(db_context_t), .version = 1, .user_data = null, .hash_fn = null, .file_ops = &ops };
+    try testing.expectEqual(@as(u64, 0), db_create("zig-cache/db_abi_v2_invalid_file_ops", null, &invalid_ctx));
+    try testing.expectEqual(@as(c_int, @intFromEnum(fmt.DbStatus.invalid_argument)), db_last_status());
 }
 
 test "kv db pending writes auto commit on read and explicit commit" {
@@ -951,6 +1016,67 @@ test "kv db pending writes auto commit on read and explicit commit" {
     try db.commitPending(.sync);
     try testing.expectEqual(@as(usize, 0), db.pending.items.len);
     try testing.expectEqual(@as(u64, 4), try db.getSize(key));
+}
+
+test "c abi custom InMemoryFileOps writeback and mmap capability" {
+    const testing = std.testing;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const path1: [:0]const u8 = "zig-cache/db_inmemory_file_ops_new";
+    _ = std.Io.Dir.cwd().deleteTree(io, path1) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, path1) catch {};
+
+    var fs1 = inmemory_file_ops.FileSystem.init(std.heap.smp_allocator, true);
+    defer fs1.deinit();
+    var raw1 = fs1.rawOps();
+    const ctx1 = db_context_t{ .struct_size = @sizeOf(db_context_t), .version = 1, .user_data = null, .hash_fn = null, .file_ops = @ptrCast(&raw1) };
+    const mem_db = db_create(path1.ptr, null, &ctx1);
+    try testing.expect(mem_db != 0);
+    try testing.expectEqual(@as(c_int, @intFromEnum(fmt.DbStatus.ok)), db_put(mem_db, "key", 3, "memory-value", 12, 0));
+    try testing.expectEqual(@as(c_int, @intFromEnum(fmt.DbStatus.ok)), db_close(mem_db));
+
+    const disk_db = db_open(path1.ptr, null, null);
+    try testing.expect(disk_db != 0);
+    var buf: [32]u8 = undefined;
+    var written: u64 = 0;
+    try testing.expectEqual(@as(c_int, @intFromEnum(fmt.DbStatus.ok)), db_get_into(disk_db, "key", 3, &buf, buf.len, &written));
+    try testing.expectEqual(@as(u64, 12), written);
+    try testing.expectEqualStrings("memory-value", buf[0..12]);
+    try testing.expectEqual(@as(c_int, @intFromEnum(fmt.DbStatus.ok)), db_close(disk_db));
+
+    const path2: [:0]const u8 = "zig-cache/db_inmemory_file_ops_modify";
+    _ = std.Io.Dir.cwd().deleteTree(io, path2) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, path2) catch {};
+    const base_db = db_create(path2.ptr, null, null);
+    try testing.expect(base_db != 0);
+    try testing.expectEqual(@as(c_int, @intFromEnum(fmt.DbStatus.ok)), db_put(base_db, "key", 3, "base", 4, 0));
+    try testing.expectEqual(@as(c_int, @intFromEnum(fmt.DbStatus.ok)), db_close(base_db));
+
+    var fs2 = inmemory_file_ops.FileSystem.init(std.heap.smp_allocator, true);
+    defer fs2.deinit();
+    var raw2 = fs2.rawOps();
+    const ctx2 = db_context_t{ .struct_size = @sizeOf(db_context_t), .version = 1, .user_data = null, .hash_fn = null, .file_ops = @ptrCast(&raw2) };
+    const edit_db = db_open(path2.ptr, null, &ctx2);
+    try testing.expect(edit_db != 0);
+    try testing.expectEqual(@as(c_int, @intFromEnum(fmt.DbStatus.ok)), db_put(edit_db, "key", 3, "edited", 6, 0));
+    try testing.expectEqual(@as(c_int, @intFromEnum(fmt.DbStatus.ok)), db_close(edit_db));
+
+    const check_db = db_open(path2.ptr, null, null);
+    try testing.expect(check_db != 0);
+    try testing.expectEqual(@as(c_int, @intFromEnum(fmt.DbStatus.ok)), db_get_into(check_db, "key", 3, &buf, buf.len, &written));
+    try testing.expectEqualStrings("edited", buf[0..6]);
+    try testing.expectEqual(@as(c_int, @intFromEnum(fmt.DbStatus.ok)), db_close(check_db));
+
+    const path3: [:0]const u8 = "zig-cache/db_inmemory_file_ops_missing_mmap";
+    _ = std.Io.Dir.cwd().deleteTree(io, path3) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, path3) catch {};
+    var fs3 = inmemory_file_ops.FileSystem.init(std.heap.smp_allocator, false);
+    defer fs3.deinit();
+    var raw3 = fs3.rawOps();
+    raw3.mmap = null;
+    const ctx3 = db_context_t{ .struct_size = @sizeOf(db_context_t), .version = 1, .user_data = null, .hash_fn = null, .file_ops = @ptrCast(&raw3) };
+    try testing.expectEqual(@as(u64, 0), db_create(path3.ptr, null, &ctx3));
+    try testing.expectEqual(@as(c_int, @intFromEnum(fmt.DbStatus.unsupported)), db_last_status());
 }
 
 test "kv db open modes enforce read write API access" {

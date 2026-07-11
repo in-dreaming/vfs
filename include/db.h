@@ -26,10 +26,45 @@ typedef int (*db_hash_fn)(
     uint64_t* out_hi,
     uint64_t* out_lo);
 
+typedef int (*db_file_open_fn)(
+    void* user_data,
+    const void* path,
+    uint64_t path_size,
+    uint32_t flags,
+    void** out_file);
+typedef int (*db_file_close_fn)(void* file);
+typedef int (*db_file_read_at_fn)(void* file, uint64_t offset, void* dst, uint64_t size, uint64_t* out_read);
+typedef int (*db_file_write_at_fn)(void* file, uint64_t offset, const void* src, uint64_t size, uint64_t* out_written);
+typedef int (*db_file_get_size_fn)(void* file, uint64_t* out_size);
+typedef int (*db_file_set_size_fn)(void* file, uint64_t size);
+typedef int (*db_file_sync_fn)(void* file, uint32_t mode);
+typedef int (*db_file_preallocate_fn)(void* file, uint64_t offset, uint64_t size);
+typedef int (*db_file_mmap_fn)(
+    void* file,
+    uint64_t offset,
+    uint64_t size,
+    uint32_t flags,
+    void** out_mapping,
+    void** out_data,
+    uint64_t* out_size);
+typedef int (*db_file_msync_fn)(void* mapping, uint64_t offset, uint64_t size, uint32_t mode);
+typedef int (*db_file_munmap_fn)(void* mapping);
+
+enum {
+    DB_FILE_OPEN_CREATE = 1u << 0,
+    DB_FILE_OPEN_READ_ONLY = 1u << 1,
+    DB_FILE_OPEN_READ_WRITE = 1u << 2,
+    DB_FILE_MMAP_WRITE = 1u << 0,
+    DB_FILE_SYNC_DATA = 0,
+    DB_FILE_SYNC_METADATA = 1,
+};
+
 typedef struct db_file_ops {
     uint32_t struct_size;
     uint32_t version;
     void* user_data;
+    /* Cast these fields to the db_file_*_fn typedef with the same name.
+       They remain void* for ABI compatibility with the original v1 struct. */
     void* open;
     void* close;
     void* read_at;

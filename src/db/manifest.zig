@@ -62,7 +62,7 @@ pub const Manifest = struct {
     super: ManifestSuperBlock,
 
     pub fn close(self: *Manifest) !void {
-        if (self.file.native == null) return;
+        if (!self.file.isOpen()) return;
         try pf.flushMetadata(self.file);
         pf.close(&self.file);
     }
@@ -108,7 +108,11 @@ pub fn create(path: []const u8, options: CreateOptions) !Manifest {
 }
 
 pub fn createAt(dir: std.Io.Dir, path: []const u8, options: CreateOptions) !Manifest {
-    var file = try pf.openAt(dir, path, .{ .mode = .create_read_write });
+    return createIn(.fromOs(dir), path, options);
+}
+
+pub fn createIn(dir: pf.Directory, path: []const u8, options: CreateOptions) !Manifest {
+    var file = try pf.openIn(dir, path, .{ .mode = .create_read_write });
     errdefer pf.close(&file);
     return initialize(file, options);
 }
@@ -120,7 +124,11 @@ pub fn open(path: []const u8) !Manifest {
 }
 
 pub fn openAt(dir: std.Io.Dir, path: []const u8) !Manifest {
-    var file = try pf.openAt(dir, path, .{ .mode = .read_write });
+    return openIn(.fromOs(dir), path);
+}
+
+pub fn openIn(dir: pf.Directory, path: []const u8) !Manifest {
+    var file = try pf.openIn(dir, path, .{ .mode = .read_write });
     errdefer pf.close(&file);
     return load(file);
 }

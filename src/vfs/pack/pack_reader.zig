@@ -1,0 +1,111 @@
+const std = @import("std");
+const db_internal = @import("db_internal");
+const kv = db_internal.kv_db;
+const object_key = @import("../object_key.zig");
+const path_mod = @import("../path.zig");
+const pack_manifest_fmt = @import("../format/pack_manifest.zig");
+const path_index_fmt = @import("../format/path_index.zig");
+const file_manifest_fmt = @import("../format/file_manifest.zig");
+const page_value_fmt = @import("../format/page_value.zig");
+const tombstone_fmt = @import("../format/tombstone.zig");
+
+pub const Stat = struct {
+    file_entry: u64,
+    size: u64,
+    page_size: u64,
+};
+
+pub const PackReader = struct {
+    db: kv.KvDb,
+    manifest: pack_manifest_fmt.PackManifest,
+    path_index: []u8,
+
+    pub fn open(allocator: std.mem.Allocator, pack_path: []const u8) !PackReader {
+        var db = try kv.KvDb.open(pack_path, .{ .mode = .read_only, .create_if_missing = false });
+        errdefer db.close() catch {};
+        const manifest_bytes = try readObjectFromDb(&db, allocator, object_key.packManifestKey());
+        defer allocator.free(manifest_bytes);
+        const manifest = try pack_manifest_fmt.decodePackManifest(manifest_bytes);
+        const path_index = try readObjectFromDb(&db, allocator, manifest.path_index_key);
+        errdefer allocator.free(path_index);
+        _ = try path_index_fmt.verify(path_index);
+        return .{ .db = db, .manifest = manifest, .path_index = path_index };
+    }
+
+    pub fn close(self: *PackReader, allocator: std.mem.Allocator) void {
+        allocator.free(self.path_index);
+        self.path_index = &.{};
+        self.db.close() catch {};
+    }
+
+    pub fn resolvePath(self: *PackReader, allocator: std.mem.Allocator, virtual_path: []const u8) !u64 {
+        const normalized = try path_mod.normalizeVirtualPath(allocator, virtual_path);
+        defer allocator.free(normalized);
+        const found = try path_index_fmt.lookup(self.path_index, normalized);
+        return if (found) |entry| entry.file_entry else error.NotFound;
+    }
+
+    pub fn readFileManifest(self: *PackReader, allocator: std.mem.Allocator, file_entry: u64) !file_manifest_fmt.DecodedFileManifest {
+        if (file_entry == 0) return error.InvalidArgument;
+        const bytes = try self.readObjectAlloc(allocator, try object_key.fileManifestKey(file_entry));
+        defer allocator.free(bytes);
+        return file_manifest_fmt.decodeFileManifest(allocator, bytes, file_entry);
+    }
+
+    pub fn hasEntryTombstone(self: *PackReader, allocator: std.mem.Allocator, file_entry: u64) !bool {
+        if (file_entry == 0) return error.InvalidArgument;
+        const bytes = self.readObjectAlloc(allocator, try object_key.entryTombstoneKey(file_entry)) catch |e| switch (e) {
+            error.NotFound => return false,
+            else => |err| return err,
+        };
+        defer allocator.free(bytes);
+        _ = try tombstone_fmt.decodeEntryTombstone(bytes, file_entry);
+        return true;
+    }
+
+    pub fn statEntry(self: *PackReader, allocator: std.mem.Allocator, file_entry: u64) !Stat {
+        var decoded = try self.readFileManifest(allocator, file_entry);
+        defer decoded.deinit(allocator);
+        const page_size: u64 = if (decoded.blocks.len == 0) 0 else decoded.blocks[0].page_size;
+        return .{ .file_entry = file_entry, .size = decoded.header.file_size, .page_size = page_size };
+    }
+
+    pub fn readPageAlloc(self: *PackReader, allocator: std.mem.Allocator, file_entry: u64, block_index: u32, page_index: u32) ![]u8 {
+        return self.readObjectAlloc(allocator, try object_key.pageKey(file_entry, block_index, page_index));
+    }
+
+    pub fn readObjectAlloc(self: *PackReader, allocator: std.mem.Allocator, key: u64) ![]u8 {
+        return readObjectFromDb(&self.db, allocator, key);
+    }
+};
+
+fn readObjectFromDb(db: *kv.KvDb, allocator: std.mem.Allocator, key: u64) ![]u8 {
+    var key_bytes = object_key.encodeDbKey(key);
+    const size = try db.getSizeBytes(&key_bytes);
+    const buf = try allocator.alloc(u8, size);
+    errdefer allocator.free(buf);
+    _ = try db.getIntoBytes(&key_bytes, buf);
+    return buf;
+}
+
+test "pack reader resolves path and entry from builder output" {
+    const builder = @import("../build/pack_builder.zig");
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const pack_path = "zig-cache-vfs-pack-reader-test";
+    const source_path = "zig-cache-vfs-pack-reader-source.bin";
+    _ = std.Io.Dir.cwd().deleteTree(io, pack_path) catch {};
+    _ = std.Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, pack_path) catch {};
+    defer _ = std.Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    try builder.writeSourceFileForTest(source_path, "reader-data");
+    const input = builder.BuildFileInput{ .source_path = source_path, .virtual_path = "/reader.bin", .file_entry = 501, .page_size = 4 };
+    try builder.createPack(pack_path, &.{input}, .{});
+
+    var reader = try PackReader.open(allocator, pack_path);
+    defer reader.close(allocator);
+    try std.testing.expectEqual(@as(u64, 501), try reader.resolvePath(allocator, "/reader.bin"));
+    var manifest = try reader.readFileManifest(allocator, 501);
+    defer manifest.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 11), manifest.header.file_size);
+}

@@ -84,7 +84,7 @@ pub const IndexFile = struct {
     super: IndexSuperBlock,
 
     pub fn close(self: *IndexFile) !void {
-        if (self.file.native == null) return;
+        if (!self.file.isOpen()) return;
         try pf.flushMetadata(self.file);
         pf.close(&self.file);
     }
@@ -107,7 +107,11 @@ pub const IndexFile = struct {
 };
 
 pub fn createAt(dir: std.Io.Dir, path: []const u8, uuid: [16]u8) !IndexFile {
-    var file = try pf.openAt(dir, path, .{ .mode = .create_read_write });
+    return createIn(.fromOs(dir), path, uuid);
+}
+
+pub fn createIn(dir: pf.Directory, path: []const u8, uuid: [16]u8) !IndexFile {
+    var file = try pf.openIn(dir, path, .{ .mode = .create_read_write });
     errdefer pf.close(&file);
     try pf.setLen(file, 0);
     try pf.preallocate(file, 0, REGION_AREA_OFFSET);
@@ -164,7 +168,11 @@ pub fn createAt(dir: std.Io.Dir, path: []const u8, uuid: [16]u8) !IndexFile {
 }
 
 pub fn openAt(dir: std.Io.Dir, path: []const u8) !IndexFile {
-    var file = try pf.openAt(dir, path, .{ .mode = .read_write });
+    return openIn(.fromOs(dir), path);
+}
+
+pub fn openIn(dir: pf.Directory, path: []const u8) !IndexFile {
+    var file = try pf.openIn(dir, path, .{ .mode = .read_write });
     errdefer pf.close(&file);
     const header = try readHeader(file);
     if (header.magic != INDEX_MAGIC or header.major_version != 1 or header.endian != ENDIAN_LE) return error.Corruption;

@@ -51,14 +51,22 @@ pub const VerifyReport = struct {
 };
 
 pub fn recoverAt(dir: std.Io.Dir) !void {
-    var db = try kv.KvDb.openAt(dir, .{});
+    return recoverIn(.fromOs(dir));
+}
+
+pub fn recoverIn(dir: pf.Directory) !void {
+    var db = try kv.KvDb.openIn(dir, .{});
     try delta_mod.recover(&db.delta);
     try db.close();
 }
 
 pub fn verifyAt(dir: std.Io.Dir, allocator: std.mem.Allocator) !VerifyReport {
+    return verifyIn(.fromOs(dir), allocator);
+}
+
+pub fn verifyIn(dir: pf.Directory, allocator: std.mem.Allocator) !VerifyReport {
     var report = VerifyReport.init(allocator);
-    var db = kv.KvDb.openAt(dir, .{}) catch |err| {
+    var db = kv.KvDb.openIn(dir, .{}) catch |err| {
         try report.add(.{ .kind = if (err == error.Corruption) .corruption else .invalid_superblock, .file_id = 0, .offset = 0, .key = null, .message_code = 1 });
         return report;
     };

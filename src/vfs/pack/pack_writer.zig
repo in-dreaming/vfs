@@ -1,0 +1,102 @@
+const std = @import("std");
+const kv = @import("db_internal").kv_db;
+const object_key = @import("../object_key.zig");
+
+pub const ObjectIdentity = struct {
+    kind: Kind,
+    file_entry: u64 = 0,
+    block_index: u32 = 0,
+    page_index: u32 = 0,
+
+    pub const Kind = enum(u8) {
+        pack_manifest = 1,
+        path_index = 2,
+        directory_manifest = 3,
+        file_manifest = 4,
+        page = 5,
+        entry_tombstone = 6,
+    };
+};
+
+pub const PackWriter = struct {
+    db: kv.KvDb,
+    keys: std.AutoHashMap(u64, ObjectIdentity),
+
+    pub fn create(allocator: std.mem.Allocator, output_path: []const u8) !PackWriter {
+        const db = try kv.KvDb.open(output_path, .{ .durability = .sync, .create_if_missing = true, .mode = .read_write });
+        return .{ .db = db, .keys = std.AutoHashMap(u64, ObjectIdentity).init(allocator) };
+    }
+
+    pub fn close(self: *PackWriter) !void {
+        try self.db.commitPending(.sync);
+        try self.db.close();
+        self.keys.deinit();
+    }
+
+    pub fn abort(self: *PackWriter) void {
+        self.db.discardPending();
+        self.db.close() catch {};
+        self.keys.deinit();
+    }
+
+    pub fn putObject(self: *PackWriter, key: u64, identity: ObjectIdentity, data: []const u8) !void {
+        if (object_key.isReservedKey(key) and !isReservedIdentity(identity)) return error.KeyCollision;
+        if (self.keys.get(key)) |existing| {
+            if (!identityEqual(existing, identity)) return error.KeyCollision;
+        } else {
+            try self.keys.put(key, identity);
+        }
+
+        var key_bytes = object_key.encodeDbKey(key);
+        try self.db.putBytes(&key_bytes, data, .{ .durability = .sync });
+    }
+
+    pub fn putPackManifest(self: *PackWriter, data: []const u8) !void {
+        try self.putObject(object_key.packManifestKey(), .{ .kind = .pack_manifest }, data);
+    }
+
+    pub fn putPathIndex(self: *PackWriter, data: []const u8) !void {
+        try self.putObject(object_key.pathIndexKey(), .{ .kind = .path_index }, data);
+    }
+
+    pub fn putFileManifest(self: *PackWriter, file_entry: u64, data: []const u8) !void {
+        try self.putObject(try object_key.fileManifestKey(file_entry), .{ .kind = .file_manifest, .file_entry = file_entry }, data);
+    }
+
+    pub fn putPage(self: *PackWriter, file_entry: u64, block_index: u32, page_index: u32, data: []const u8) !void {
+        try self.putObject(try object_key.pageKey(file_entry, block_index, page_index), .{ .kind = .page, .file_entry = file_entry, .block_index = block_index, .page_index = page_index }, data);
+    }
+
+    pub fn putEntryTombstone(self: *PackWriter, file_entry: u64, data: []const u8) !void {
+        try self.putObject(try object_key.entryTombstoneKey(file_entry), .{ .kind = .entry_tombstone, .file_entry = file_entry }, data);
+    }
+};
+
+fn isReservedIdentity(identity: ObjectIdentity) bool {
+    return switch (identity.kind) {
+        .pack_manifest, .path_index, .directory_manifest => true,
+        else => false,
+    };
+}
+
+fn identityEqual(a: ObjectIdentity, b: ObjectIdentity) bool {
+    return a.kind == b.kind and
+        a.file_entry == b.file_entry and
+        a.block_index == b.block_index and
+        a.page_index == b.page_index;
+}
+
+test "pack writer detects object identity collision before DB write" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = "zig-cache-vfs-writer-collision-test";
+    const io = std.Io.Threaded.global_single_threaded.io();
+    _ = std.Io.Dir.cwd().deleteTree(io, path) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, path) catch {};
+
+    var writer = try PackWriter.create(allocator, path);
+    defer writer.close() catch {};
+    try writer.putObject(0xabcdef, .{ .kind = .file_manifest, .file_entry = 1 }, "one");
+    try std.testing.expectError(error.KeyCollision, writer.putObject(0xabcdef, .{ .kind = .file_manifest, .file_entry = 2 }, "two"));
+}

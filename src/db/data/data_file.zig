@@ -131,7 +131,7 @@ pub const DataFile = struct {
     append_mutex: std.atomic.Mutex = .unlocked,
 
     pub fn close(self: *DataFile) !void {
-        if (self.file.native == null) return;
+        if (!self.file.isOpen()) return;
         try pf.flushMetadata(self.file);
         pf.close(&self.file);
     }
@@ -178,7 +178,11 @@ pub fn create(path: []const u8, options: CreateOptions) !DataFile {
 }
 
 pub fn createAt(dir: std.Io.Dir, path: []const u8, options: CreateOptions) !DataFile {
-    var file = try pf.openAt(dir, path, .{ .mode = .create_read_write });
+    return createIn(.fromOs(dir), path, options);
+}
+
+pub fn createIn(dir: pf.Directory, path: []const u8, options: CreateOptions) !DataFile {
+    var file = try pf.openIn(dir, path, .{ .mode = .create_read_write });
     errdefer pf.close(&file);
     try initializeNew(file, options);
     return .{ .file = file, .logical_tail = RECORD_AREA_OFFSET, .epoch = 1 };
@@ -192,7 +196,11 @@ pub fn open(path: []const u8, options: OpenOptions) !DataFile {
 }
 
 pub fn openAt(dir: std.Io.Dir, path: []const u8, options: OpenOptions) !DataFile {
-    var file = try pf.openAt(dir, path, .{ .mode = .read_write });
+    return openIn(.fromOs(dir), path, options);
+}
+
+pub fn openIn(dir: pf.Directory, path: []const u8, options: OpenOptions) !DataFile {
+    var file = try pf.openIn(dir, path, .{ .mode = .read_write });
     errdefer pf.close(&file);
     const sb = try loadAndMaybeRepair(file, options);
     return .{ .file = file, .logical_tail = sb.logical_tail, .epoch = sb.epoch };
