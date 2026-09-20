@@ -62,6 +62,10 @@ pub const KvDb = struct {
     mode: AccessMode = .read_write,
     hash_fn: ?DbHashFn = null,
     hash_user_data: ?*anyopaque = null,
+    reopen_path: []u8 = &.{},
+    reopen_options: OpenOptions = .{},
+    parked: bool = false,
+    park_lock: std.atomic.Mutex = .unlocked,
 
     pub fn openAt(dir: std.Io.Dir, options: OpenOptions) !KvDb {
         return openIn(.fromOs(dir), options);
@@ -105,7 +109,10 @@ pub const KvDb = struct {
         if (options.create_if_missing) _ = std.Io.Dir.cwd().createDirPath(io, path) catch {};
         const dir = try std.Io.Dir.openDir(std.Io.Dir.cwd(), io, path, .{});
         var db = try openIn(.fromOs(dir), options);
+        errdefer db.close() catch {};
         db.owns_dir = true;
+        db.reopen_path = try std.heap.smp_allocator.dupe(u8, path);
+        db.reopen_options = options;
         return db;
     }
 
@@ -118,19 +125,73 @@ pub const KvDb = struct {
     }
 
     pub fn close(self: *KvDb) !void {
-        if (self.canWrite()) try self.commitPending(null);
-        try self.delta.close();
-        try self.index.close();
-        std.heap.smp_allocator.destroy(self.index);
-        try self.data.close();
-        try self.manifest.close();
+        if (!self.parked) {
+            if (self.canWrite()) try self.commitPending(null);
+            try self.closeFiles();
+        }
         self.freePending();
         self.pending.deinit(std.heap.smp_allocator);
-        if (self.owns_dir) if (self.dir.os) |dir| dir.close(std.Io.Threaded.global_single_threaded.io());
         if (self.owned_root.len != 0) {
             std.heap.smp_allocator.free(self.owned_root);
             self.owned_root = &.{};
         }
+        if (self.reopen_path.len != 0) {
+            std.heap.smp_allocator.free(self.reopen_path);
+            self.reopen_path = &.{};
+        }
+        self.parked = false;
+    }
+
+    pub fn isParked(self: *const KvDb) bool {
+        return self.parked;
+    }
+
+    pub fn park(self: *KvDb) !void {
+        lockMutex(&self.park_lock);
+        defer self.park_lock.unlock();
+        if (self.parked) return;
+        if (self.mode != .read_only) return error.PermissionDenied;
+        if (self.reopen_path.len == 0) return error.InvalidArgument;
+        try self.closeFiles();
+        self.parked = true;
+    }
+
+    pub fn ensureReady(self: *KvDb) !void {
+        lockMutex(&self.park_lock);
+        defer self.park_lock.unlock();
+        if (!self.parked) return;
+        try self.reopenFiles();
+        self.parked = false;
+    }
+
+    fn closeFiles(self: *KvDb) !void {
+        try self.delta.close();
+        try self.index.close();
+        std.heap.smp_allocator.destroy(self.index);
+        self.index = undefined;
+        try self.data.close();
+        try self.manifest.close();
+        if (self.owns_dir) if (self.dir.os) |dir| dir.close(std.Io.Threaded.global_single_threaded.io());
+        self.owns_dir = false;
+        self.dir = .{};
+    }
+
+    fn reopenFiles(self: *KvDb) !void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const dir = try std.Io.Dir.openDir(std.Io.Dir.cwd(), io, self.reopen_path, .{});
+        const fresh = openIn(.fromOs(dir), self.reopen_options) catch |err| {
+            dir.close(io);
+            return err;
+        };
+        self.dir = fresh.dir;
+        self.owns_dir = true;
+        self.manifest = fresh.manifest;
+        self.data = fresh.data;
+        self.index = fresh.index;
+        self.delta = fresh.delta;
+        self.mode = fresh.mode;
+        self.hash_fn = fresh.hash_fn;
+        self.hash_user_data = fresh.hash_user_data;
     }
 
     pub fn discardPending(self: *KvDb) void {
@@ -444,6 +505,7 @@ pub const KvDb = struct {
     }
 
     fn requireRead(self: *const KvDb) !void {
+        if (self.parked) return error.Busy;
         if (!self.canRead()) return error.PermissionDenied;
     }
 
@@ -1313,4 +1375,37 @@ test "kv db concurrent readers writers overwrite delete and maintenance" {
             try testing.expectEqual(@as(usize, value_size), try reopened.getInto(k, &buf));
         }
     }
+}
+
+test "kv db read-only park releases files and ensureReady rereads" {
+    const testing = std.testing;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const pack_path = "zig-cache-kv-park-db";
+    _ = std.Io.Dir.cwd().deleteTree(io, pack_path) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, pack_path) catch {};
+
+    const key = fmt.Key128{ .hi = 9, .lo = 8 };
+    {
+        var db = try KvDb.open(pack_path, .{ .durability = .sync });
+        defer db.close() catch unreachable;
+        try db.put(key, "park-value", .{ .durability = .sync });
+        try db.commitPending(.sync);
+    }
+
+    var db = try KvDb.open(pack_path, .{ .mode = .read_only, .create_if_missing = false });
+    defer db.close() catch unreachable;
+    var buf: [16]u8 = undefined;
+    try testing.expectEqual(@as(usize, 10), try db.getInto(key, &buf));
+    try testing.expectEqualStrings("park-value", buf[0..10]);
+    try db.park();
+    try testing.expect(db.isParked());
+    try testing.expectError(error.Busy, db.getInto(key, &buf));
+    try db.ensureReady();
+    try testing.expect(!db.isParked());
+    try testing.expectEqual(@as(usize, 10), try db.getInto(key, &buf));
+    try testing.expectEqualStrings("park-value", buf[0..10]);
+
+    var writable = try KvDb.open(pack_path, .{ .create_if_missing = false });
+    defer writable.close() catch {};
+    try testing.expectError(error.PermissionDenied, writable.park());
 }

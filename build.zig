@@ -107,11 +107,67 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(vfs_exe);
 
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("tests/vfs_concurrent_read_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "vfs", .module = vfs_mod }},
+    });
+    const bench_exe = b.addExecutable(.{
+        .name = "vfs_concurrent_read_bench",
+        .root_module = bench_mod,
+    });
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench-read", "Benchmark sequential vs concurrent VFS reads");
+    bench_step.dependOn(&run_bench.step);
+
+    const vfs_pack_roundtrip = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/vfs_pack_roundtrip.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "vfs", .module = vfs_mod }},
+        }),
+    });
+
+    const vfs_cabi_smoke = b.addExecutable(.{
+        .name = "vfs_cabi_smoke",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    vfs_cabi_smoke.root_module.addCSourceFile(.{
+        .file = b.path("tests/vfs_cabi_smoke.c"),
+        .flags = &.{},
+    });
+    vfs_cabi_smoke.root_module.addIncludePath(b.path("include"));
+    vfs_cabi_smoke.root_module.linkLibrary(vfs_static_lib);
+
+    const smoke_assets = b.addWriteFiles();
+    const smoke_payload = smoke_assets.add("a.bin", "hello-vfs-cabi");
+    const smoke_pack_dir = ".zig-cache/vfs_cabi_smoke_pack";
+
+    const prepare_pack = b.addRunArtifact(vfs_exe);
+    prepare_pack.addArg("put-file");
+    prepare_pack.addArg(smoke_pack_dir);
+    prepare_pack.addArg("/textures/a.bin");
+    prepare_pack.addArg("1001");
+    prepare_pack.addFileArg(smoke_payload);
+
+    const run_vfs_cabi_smoke = b.addRunArtifact(vfs_cabi_smoke);
+    run_vfs_cabi_smoke.addArg(smoke_pack_dir);
+    run_vfs_cabi_smoke.step.dependOn(&prepare_pack.step);
+
     const run_tests = b.addRunArtifact(tests);
     const run_vfs_tests = b.addRunArtifact(vfs_tests);
+    const run_vfs_pack_roundtrip = b.addRunArtifact(vfs_pack_roundtrip);
     const test_step = b.step("test", "Run DB unit and integration tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_vfs_tests.step);
+    test_step.dependOn(&run_vfs_pack_roundtrip.step);
+    test_step.dependOn(&run_vfs_cabi_smoke.step);
     test_step.dependOn(&exe.step);
     test_step.dependOn(&vfs_exe.step);
     test_step.dependOn(&static_lib.step);

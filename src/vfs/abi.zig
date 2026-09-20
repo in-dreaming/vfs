@@ -8,6 +8,8 @@ pub const vfs_open_options_t = extern struct {
     struct_size: u32,
     flags: u32,
     reserved0: u64,
+    max_open_stores: u32 = 0,
+    reserved1: u32 = 0,
 };
 
 pub const vfs_stat_t = extern struct {
@@ -48,7 +50,11 @@ fn spanZ(ptr: ?[*:0]const u8) ![]const u8 {
 fn optionsFromC(options: ?*const vfs_open_options_t) !volume_mod.OpenOptions {
     const opts = options orelse return .{};
     if (opts.struct_size < @offsetOf(vfs_open_options_t, "flags") + @sizeOf(u32)) return error.InvalidArgument;
-    return .{ .flags = opts.flags };
+    var out = volume_mod.OpenOptions{ .flags = opts.flags };
+    if (opts.struct_size >= @offsetOf(vfs_open_options_t, "max_open_stores") + @sizeOf(u32) and opts.max_open_stores != 0) {
+        out.max_open_stores = opts.max_open_stores;
+    }
+    return out;
 }
 
 pub export fn vfs_last_status() c_int {
@@ -81,7 +87,7 @@ pub export fn vfs_open_volume(path: ?[*:0]const u8, options: ?*const vfs_open_op
 
 pub export fn vfs_close_volume(volume: u64) c_int {
     const v = registry.validate(volume_mod.Volume, volume, .volume) catch |e| return setError(e);
-    if (v.open_file_count != 0) return setError(error.Busy);
+    if (v.open_file_count.load(.seq_cst) != 0) return setError(error.Busy);
     registry.unregister(volume);
     v.close();
     std.heap.smp_allocator.destroy(v);
@@ -541,4 +547,64 @@ fn mountPackForTest(volume: u64, pack_path: []const u8, priority: u32) !c_int {
     const z_pack_path = try std.testing.allocator.dupeZ(u8, pack_path);
     defer std.testing.allocator.free(z_pack_path);
     return vfs_mount_pack(volume, z_pack_path.ptr, priority, 0);
+}
+
+test "vfs abi concurrent read_at on one volume" {
+    const builder = @import("build/pack_builder.zig");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const pack_path = "zig-cache-vfs-abi-concurrent-pack";
+    const source_path = "zig-cache-vfs-abi-concurrent-source.bin";
+    _ = std.Io.Dir.cwd().deleteTree(io, pack_path) catch {};
+    _ = std.Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, pack_path) catch {};
+    defer _ = std.Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    const payload = "abi-threads";
+    try builder.writeSourceFileForTest(source_path, payload);
+    try builder.createPack(pack_path, &.{.{ .source_path = source_path, .virtual_path = "/t.bin", .file_entry = 8101, .page_size = 8 }}, .{});
+
+    var opts = vfs_open_options_t{
+        .struct_size = @sizeOf(vfs_open_options_t),
+        .flags = 0,
+        .reserved0 = 0,
+        .max_open_stores = 2,
+        .reserved1 = 0,
+    };
+    var volume: u64 = 0;
+    try std.testing.expectEqual(err.code(.ok), vfs_open_volume("root", &opts, &volume));
+    defer _ = vfs_close_volume(volume);
+    try std.testing.expectEqual(err.code(.ok), try mountPackForTest(volume, pack_path, 1));
+
+    const Ctx = struct {
+        volume: u64,
+        errors: *[4]u32,
+
+        fn reader(ctx: *@This(), id: usize) void {
+            var file: u64 = 0;
+            if (vfs_open_path(ctx.volume, "/t.bin", 0, &file) != err.code(.ok)) {
+                ctx.errors[id] = 1;
+                return;
+            }
+            defer _ = vfs_close_file(file);
+            var round: usize = 0;
+            while (round < 24) : (round += 1) {
+                var buf: [16]u8 = undefined;
+                var n: u64 = 0;
+                if (vfs_read_at(file, 0, &buf, buf.len, &n) != err.code(.ok) or n != 11) {
+                    ctx.errors[id] = 2;
+                    return;
+                }
+                if (!std.mem.eql(u8, buf[0..11], "abi-threads")) {
+                    ctx.errors[id] = 3;
+                    return;
+                }
+            }
+        }
+    };
+
+    var errors = [_]u32{0} ** 4;
+    var ctx = Ctx{ .volume = volume, .errors = &errors };
+    var threads: [4]std.Thread = undefined;
+    for (&threads, 0..) |*thread, i| thread.* = try std.Thread.spawn(.{}, Ctx.reader, .{ &ctx, i });
+    for (&threads) |*thread| thread.join();
+    for (errors) |e| try std.testing.expectEqual(@as(u32, 0), e);
 }

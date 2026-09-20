@@ -38,6 +38,18 @@ pub const PackReader = struct {
         self.db.close() catch {};
     }
 
+    pub fn isReady(self: *const PackReader) bool {
+        return !self.db.isParked();
+    }
+
+    pub fn park(self: *PackReader) !void {
+        try self.db.park();
+    }
+
+    pub fn ensureReady(self: *PackReader) !void {
+        try self.db.ensureReady();
+    }
+
     pub fn resolvePath(self: *PackReader, allocator: std.mem.Allocator, virtual_path: []const u8) !u64 {
         const normalized = try path_mod.normalizeVirtualPath(allocator, virtual_path);
         defer allocator.free(normalized);
@@ -75,6 +87,7 @@ pub const PackReader = struct {
     }
 
     pub fn readObjectAlloc(self: *PackReader, allocator: std.mem.Allocator, key: u64) ![]u8 {
+        if (self.db.isParked()) return error.Busy;
         return readObjectFromDb(&self.db, allocator, key);
     }
 };

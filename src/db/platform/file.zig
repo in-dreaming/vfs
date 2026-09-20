@@ -233,6 +233,9 @@ pub fn close(file: *FileHandle) void {
 }
 
 pub fn pread(file: FileHandle, offset: u64, dst: []u8) !usize {
+    // Positional reads do not move a shared file offset, so concurrent threads
+    // may pread the same OS handle. The Io implementation is used only as the
+    // syscall adapter; fileReadPositional ignores the single-threaded scheduler.
     if (file.custom) |custom| {
         const ops = file.custom_ops orelse return error.InvalidArgument;
         var got: u64 = 0;
@@ -470,4 +473,48 @@ test "platform offset IO, vectored write, truncate, mmap, advice, durable reopen
     var durable: [7]u8 = undefined;
     try testing.expectEqual(@as(usize, durable.len), try preadAll(reopened, 16384, &durable));
     try testing.expectEqualStrings("durable", &durable);
+}
+
+test "platform concurrent pread shares one file handle" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fh = try openAt(tmp.dir, "concurrent.bin", .{ .mode = .create_read_write });
+    defer close(&fh);
+    try pwriteAll(fh, 0, "AAAAAAAA");
+    try pwriteAll(fh, 4096, "BBBBBBBB");
+    try flushMetadata(fh);
+
+    const Ctx = struct {
+        fh: FileHandle,
+        errors: *[4]u32,
+
+        fn reader(ctx: *@This(), id: usize) void {
+            var i: usize = 0;
+            while (i < 64) : (i += 1) {
+                var buf: [8]u8 = undefined;
+                const off: u64 = if (id % 2 == 0) 0 else 4096;
+                const n = preadAll(ctx.fh, off, &buf) catch {
+                    ctx.errors[id] = 1;
+                    return;
+                };
+                if (n != 8) {
+                    ctx.errors[id] = 2;
+                    return;
+                }
+                const expect: []const u8 = if (id % 2 == 0) "AAAAAAAA" else "BBBBBBBB";
+                if (!std.mem.eql(u8, &buf, expect)) {
+                    ctx.errors[id] = 3;
+                    return;
+                }
+            }
+        }
+    };
+
+    var errors = [_]u32{0} ** 4;
+    var ctx = Ctx{ .fh = fh, .errors = &errors };
+    var threads: [4]std.Thread = undefined;
+    for (&threads, 0..) |*thread, i| thread.* = try std.Thread.spawn(.{}, Ctx.reader, .{ &ctx, i });
+    for (&threads) |*thread| thread.join();
+    for (errors) |err| try testing.expectEqual(@as(u32, 0), err);
 }

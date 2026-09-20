@@ -162,14 +162,14 @@ Volume 是 VFS 的运行时入口。
 Volume
   allocator
   root path
-  mounted packs
+  logical mounts (PackManifest + PathIndex)
+  pack store session pool
   mount table
   overlay resolver
-  path index
-  entry resolver
   page cache
   handle registry
   writable pack
+  max_open_stores
 ~~~
 
 Volume 负责：
@@ -178,11 +178,27 @@ Volume 负责：
 1. 打开/关闭整个 VFS。
 2. 加载 meta pack 或 volume manifest。
 3. 挂载 readonly pack、patch pack、mod pack、writable out pack。
-4. 维护 PathIndex 与 EntryResolver。
+4. 维护 PathIndex 与 EntryResolver（逻辑 mount 常驻内存）。
 5. 提供 open/stat/list/read/write/delete API。
 6. 控制 overlay 优先级。
 7. 处理 pack verify、checkpoint、recover、optimize。
+8. 按预算 park/reopen 只读 pack 的物理 KvDb（OS fd + mmap）。
 ~~~
+
+逻辑 mount 与物理 store 分离：
+
+~~~text
+LogicalMount（常驻）:
+  path / priority / pack_id / PackManifest / PathIndex
+
+PackStore（可 GC）:
+  KvDb + OS files + index mmap
+  pin during open/stat/read IO
+  idle readonly stores park when ready count exceeds max_open_stores
+  writable pack never parks
+~~~
+
+vfs_file_t 持有 FileManifest 快照和 pack_id，不长期持有物理 store。read_at 时 pin store，IO 结束 unpin。overlay 的 path 解析只读内存 PathIndex，不必唤醒全部 pack。
 
 ### 2.2 Pack
 
@@ -542,14 +558,14 @@ Path normalize 规则必须稳定：
 ~~~text
 vfs_open_entry(volume, file_entry):
   1. file_entry == 0 则返回 VFS_INVALID_ARGUMENT。
-  2. EntryResolver 按 mount 优先级查找 visible FileLocation。
+  2. 按 mount 优先级扫描 LogicalMount。
   3. 若最高优先级记录是 EntryTombstone，返回 VFS_NOT_FOUND。
-  4. 根据 FileLocation 打开对应 pack。
+  4. pin 对应 PackStore（已 mount 的 pack；必要时 ensureReady / LRU park 其他 idle store）。
   5. 使用 FileManifestKey 读取 FileManifest。
   6. 校验 FileManifest.header.file_entry == file_entry。
   7. 校验 manifest_crc / schema / feature flags。
-  8. 创建 VfsFile handle。
-  9. 记录 manifest snapshot、pack generation、file size、flags。
+  8. 创建 VfsFile handle（manifest 快照 + pack_id，不长期持有 DB fd）。
+  9. unpin PackStore。
   10. 返回 handle。
 ~~~
 
@@ -564,16 +580,18 @@ vfs_read_at(file, offset, size, dst):
   3. clamp read range 到 file_size。
   4. 根据 FileManifest 找到涉及的 block/page。
   5. 对每个 page：
-     a. 查询 page cache。
-     b. miss 时构造 PageKey。
-     c. 从对应 pack DB 读取 PageValue。
-     d. 校验 PageValueHeader。
-     e. 解压 payload。
-     f. 校验 raw_crc。
-     g. 放入 page cache。
-  6. 从 raw page 拷贝用户请求范围。
-  7. 返回实际读取字节数。
+     a. pin 对应 PackStore。
+     b. 查询 page cache（持锁拷贝，不把内部指针漏出）。
+     c. miss 时构造 PageKey。
+     d. 从已 pin 的 pack DB 读取 PageValue（共享单 fd + pread）。
+     e. 校验 PageValueHeader。
+     f. 解压 payload。
+     g. 放入 page cache 并拷贝到 caller buffer。
+     h. unpin PackStore。
+  6. 返回实际读取字节数。
 ~~~
+
+同一 volume 的只读 open/stat/read_at 可多线程并发。mount、writable 写和 refresh 与读互斥。page cache 与 PackStore pin 保护共享可变状态。
 
 Page cache key：
 
@@ -654,10 +672,9 @@ vfs_mount_pack(volume, pack_path, options):
   1. 打开 pack DB。
   2. 读取 PackManifest。
   3. 校验 pack_id、schema、feature flags。
-  4. 读取 PathIndex / DirectoryManifest 摘要。
+  4. 读取 PathIndex 进内存 LogicalMount。
   5. 插入 MountTable。
-  6. 重建或增量更新 EntryResolver。
-  7. 重建或增量更新 PathIndex overlay view。
+  6. 若只读 ready store 超过 max_open_stores，LRU park idle PackStore。
 ~~~
 
 mount priority 必须显式：

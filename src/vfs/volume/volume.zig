@@ -15,8 +15,11 @@ const object_key = @import("../object_key.zig");
 const registry = @import("../compress/registry.zig");
 const fmt = @import("../format/common.zig");
 
+pub const DEFAULT_MAX_OPEN_STORES: u32 = 16;
+
 pub const OpenOptions = struct {
     flags: u32 = 0,
+    max_open_stores: u32 = DEFAULT_MAX_OPEN_STORES,
 };
 
 pub const Volume = struct {
@@ -25,6 +28,8 @@ pub const Volume = struct {
         reader: *pack_reader.PackReader,
         path: []u8,
         writable: bool = false,
+        pin_count: u32 = 0,
+        last_used: u64 = 0,
     };
 
     root_path: []u8,
@@ -32,13 +37,17 @@ pub const Volume = struct {
     mounts: std.ArrayList(MountedPack) = .empty,
     page_cache: page_cache_mod.PageCache = .{},
     next_mount_order: u64 = 1,
-    open_file_count: usize = 0,
+    open_file_count: std.atomic.Value(usize) = .init(0),
     writable_path: []u8 = &.{},
+    lock: std.atomic.Mutex = .unlocked,
+    store_clock: u64 = 1,
 
     pub fn open(path: []const u8, options: OpenOptions) !Volume {
         if (path.len == 0) return error.InvalidArgument;
         const owned = try std.heap.smp_allocator.dupe(u8, path);
-        return .{ .root_path = owned, .options = options };
+        var opts = options;
+        if (opts.max_open_stores == 0) opts.max_open_stores = DEFAULT_MAX_OPEN_STORES;
+        return .{ .root_path = owned, .options = opts };
     }
 
     pub fn close(self: *Volume) void {
@@ -61,6 +70,13 @@ pub const Volume = struct {
     }
 
     pub fn mountPackWithPriority(self: *Volume, pack_path: []const u8, priority: u32, flags: u32) !void {
+        lockMutex(&self.lock);
+        defer self.lock.unlock();
+        try self.mountPackWithPriorityLocked(pack_path, priority, flags);
+        try self.evictReadonlyLocked();
+    }
+
+    fn mountPackWithPriorityLocked(self: *Volume, pack_path: []const u8, priority: u32, flags: u32) !void {
         if (pack_path.len == 0) return error.InvalidArgument;
         for (self.mounts.items) |mounted| if (mounted.meta.priority == priority) return error.InvalidArgument;
         const reader = try std.heap.smp_allocator.create(pack_reader.PackReader);
@@ -69,10 +85,12 @@ pub const Volume = struct {
         errdefer reader.close(std.heap.smp_allocator);
         const owned_path = try std.heap.smp_allocator.dupe(u8, pack_path);
         errdefer std.heap.smp_allocator.free(owned_path);
+        self.store_clock += 1;
         try self.mounts.append(std.heap.smp_allocator, .{
             .meta = .{ .pack_id = @intCast(reader.manifest.pack_id), .priority = priority, .mount_order = self.next_mount_order, .pack_version = reader.manifest.pack_version, .flags = flags },
             .reader = reader,
             .path = owned_path,
+            .last_used = self.store_clock,
         });
         self.next_mount_order += 1;
         std.mem.sort(MountedPack, self.mounts.items, {}, mountedHigherPriority);
@@ -83,6 +101,8 @@ pub const Volume = struct {
     };
 
     pub fn setWritablePack(self: *Volume, pack_path: []const u8) !void {
+        lockMutex(&self.lock);
+        defer self.lock.unlock();
         if (self.writable_path.len != 0) return error.InvalidArgument;
         var existing = pack_reader.PackReader.open(std.heap.smp_allocator, pack_path) catch |e| switch (e) {
             error.NotFound, error.FileNotFound => null,
@@ -94,7 +114,7 @@ pub const Volume = struct {
             try createEmptyPack(pack_path);
         }
         const priority = std.math.maxInt(u32);
-        try self.mountPackWithPriority(pack_path, priority, 1);
+        try self.mountPackWithPriorityLocked(pack_path, priority, 1);
         for (self.mounts.items) |*mounted| {
             if (mounted.meta.priority == priority) {
                 mounted.writable = true;
@@ -120,14 +140,20 @@ pub const Volume = struct {
     }
 
     pub fn writeFileByEntry(self: *Volume, file_entry: u64, data: []const u8, options: WriteOptions) !void {
+        lockMutex(&self.lock);
+        defer self.lock.unlock();
         try self.writeFileInternal(null, file_entry, data, options);
     }
 
     pub fn writeFileByPath(self: *Volume, virtual_path: []const u8, file_entry: u64, data: []const u8, options: WriteOptions) !void {
+        lockMutex(&self.lock);
+        defer self.lock.unlock();
         try self.writeFileInternal(virtual_path, file_entry, data, options);
     }
 
     pub fn deleteEntry(self: *Volume, file_entry: u64) !void {
+        lockMutex(&self.lock);
+        defer self.lock.unlock();
         if (file_entry == 0) return error.InvalidArgument;
         const mounted = self.writableMount() orelse return error.PermissionDenied;
         var writer = try pack_writer.PackWriter.create(std.heap.smp_allocator, mounted.path);
@@ -140,6 +166,7 @@ pub const Volume = struct {
         try writer.close();
         closed = true;
         try self.refreshWritableMount();
+        try self.evictReadonlyLocked();
     }
 
     fn writeFileInternal(self: *Volume, virtual_path: ?[]const u8, file_entry: u64, data: []const u8, options: WriteOptions) !void {
@@ -212,6 +239,7 @@ pub const Volume = struct {
         try writer.close();
         closed = true;
         try self.refreshWritableMount();
+        try self.evictReadonlyLocked();
     }
 
     const ResolvedFile = struct {
@@ -235,6 +263,7 @@ pub const Volume = struct {
     fn resolveVisibleFile(self: *Volume, file_entry: u64) !ResolvedFile {
         if (file_entry == 0) return error.InvalidArgument;
         for (self.mounts.items) |*mounted| {
+            try mounted.reader.ensureReady();
             if (try mounted.reader.hasEntryTombstone(std.heap.smp_allocator, file_entry)) return error.NotFound;
             const manifest = mounted.reader.readFileManifest(std.heap.smp_allocator, file_entry) catch |e| switch (e) {
                 error.NotFound => continue,
@@ -291,6 +320,7 @@ pub const Volume = struct {
             };
         };
         const mounted = self.findMountedPackContainingGeneration(page_ref.pack_id, page_ref.pack_generation) orelse return error.NotFound;
+        try mounted.reader.ensureReady();
         const page_bytes = try mounted.reader.readObjectAlloc(std.heap.smp_allocator, page_ref.page_key);
         defer std.heap.smp_allocator.free(page_bytes);
         const page = try page_value_fmt.decodePageValue(page_bytes, .{ .file_entry = page_ref.file_entry, .block_index = page_ref.block_index, .page_index = page_ref.page_index });
@@ -314,6 +344,75 @@ pub const Volume = struct {
         return null;
     }
 
+    pub fn pinStore(self: *Volume, pack_id: u32, pack_generation: u64) !*pack_reader.PackReader {
+        lockMutex(&self.lock);
+        defer self.lock.unlock();
+        const mounted = self.findMountedPackContainingGeneration(pack_id, pack_generation) orelse self.findMountedPackById(pack_id) orelse return error.NotFound;
+        try self.pinMountedLocked(mounted);
+        return mounted.reader;
+    }
+
+    pub fn unpinStore(self: *Volume, pack_id: u32, pack_generation: u64) void {
+        lockMutex(&self.lock);
+        defer self.lock.unlock();
+        const mounted = self.findMountedPackContainingGeneration(pack_id, pack_generation) orelse self.findMountedPackById(pack_id) orelse return;
+        if (mounted.pin_count > 0) mounted.pin_count -= 1;
+    }
+
+    pub fn readonlyReadyCount(self: *Volume) usize {
+        lockMutex(&self.lock);
+        defer self.lock.unlock();
+        return self.readonlyReadyCountLocked();
+    }
+
+    fn findMountedPackById(self: *Volume, pack_id: u32) ?*MountedPack {
+        for (self.mounts.items) |*mounted| {
+            if (mounted.meta.pack_id == pack_id) return mounted;
+        }
+        return null;
+    }
+
+    fn pinMountedLocked(self: *Volume, mounted: *MountedPack) !void {
+        if (!mounted.writable and !mounted.reader.isReady()) {
+            while (self.readonlyReadyCountLocked() >= self.options.max_open_stores) {
+                const victim = self.lruIdleReadonlyLocked() orelse return error.Busy;
+                try victim.reader.park();
+            }
+        }
+        try mounted.reader.ensureReady();
+        mounted.pin_count += 1;
+        self.store_clock += 1;
+        mounted.last_used = self.store_clock;
+    }
+
+    fn readonlyReadyCountLocked(self: *const Volume) usize {
+        var n: usize = 0;
+        for (self.mounts.items) |mounted| {
+            if (!mounted.writable and mounted.reader.isReady()) n += 1;
+        }
+        return n;
+    }
+
+    fn lruIdleReadonlyLocked(self: *Volume) ?*MountedPack {
+        var victim: ?*MountedPack = null;
+        var oldest: u64 = std.math.maxInt(u64);
+        for (self.mounts.items) |*mounted| {
+            if (mounted.writable or !mounted.reader.isReady() or mounted.pin_count != 0) continue;
+            if (mounted.last_used <= oldest) {
+                oldest = mounted.last_used;
+                victim = mounted;
+            }
+        }
+        return victim;
+    }
+
+    fn evictReadonlyLocked(self: *Volume) !void {
+        while (self.readonlyReadyCountLocked() > self.options.max_open_stores) {
+            const victim = self.lruIdleReadonlyLocked() orelse break;
+            try victim.reader.park();
+        }
+    }
+
     fn refreshWritableMount(self: *Volume) !void {
         const mounted = self.writableMount() orelse return error.PermissionDenied;
         mounted.reader.close(std.heap.smp_allocator);
@@ -325,56 +424,121 @@ pub const Volume = struct {
     }
 
     pub fn openPath(self: *Volume, volume_handle: u64, path: []const u8) !file_handle.FileHandle {
-        for (self.mounts.items) |mounted| {
-            const file_entry = mounted.reader.resolvePath(std.heap.smp_allocator, path) catch |e| switch (e) {
-                error.NotFound => continue,
-                else => |err| return err,
-            };
-            return self.openEntry(volume_handle, file_entry);
-        }
-        return error.NotFound;
+        const file_entry = blk: {
+            lockMutex(&self.lock);
+            defer self.lock.unlock();
+            for (self.mounts.items) |mounted| {
+                const file_entry = mounted.reader.resolvePath(std.heap.smp_allocator, path) catch |e| switch (e) {
+                    error.NotFound => continue,
+                    else => |err| return err,
+                };
+                break :blk file_entry;
+            }
+            return error.NotFound;
+        };
+        return self.openEntry(volume_handle, file_entry);
     }
 
     pub fn openEntry(self: *Volume, volume_handle: u64, file_entry: u64) !file_handle.FileHandle {
         if (file_entry == 0) return error.InvalidArgument;
-        for (self.mounts.items) |mounted| {
-            if (try mounted.reader.hasEntryTombstone(std.heap.smp_allocator, file_entry)) return error.NotFound;
-            const manifest = mounted.reader.readFileManifest(std.heap.smp_allocator, file_entry) catch |e| switch (e) {
-                error.NotFound => continue,
+        var index: usize = 0;
+        while (true) {
+            const pack_id = blk: {
+                lockMutex(&self.lock);
+                defer self.lock.unlock();
+                if (index >= self.mounts.items.len) return error.NotFound;
+                break :blk self.mounts.items[index].meta.pack_id;
+            };
+            const reader = try self.pinStoreById(pack_id);
+            defer self.unpinStoreById(pack_id);
+            if (try reader.hasEntryTombstone(std.heap.smp_allocator, file_entry)) return error.NotFound;
+            const manifest = reader.readFileManifest(std.heap.smp_allocator, file_entry) catch |e| switch (e) {
+                error.NotFound => {
+                    index += 1;
+                    continue;
+                },
                 else => |err| return err,
             };
-            self.open_file_count += 1;
-            return .{ .volume_handle = volume_handle, .volume = self, .pack = mounted.reader, .pack_id = mounted.meta.pack_id, .pack_generation = mounted.meta.mount_order, .file_entry = file_entry, .size = manifest.header.file_size, .manifest = manifest };
+            const pack_generation = blk: {
+                lockMutex(&self.lock);
+                defer self.lock.unlock();
+                const mounted = self.findMountedPackById(pack_id) orelse return error.NotFound;
+                break :blk mounted.meta.mount_order;
+            };
+            _ = self.open_file_count.fetchAdd(1, .seq_cst);
+            return .{
+                .volume_handle = volume_handle,
+                .volume = self,
+                .pack_id = pack_id,
+                .pack_generation = pack_generation,
+                .file_entry = file_entry,
+                .size = manifest.header.file_size,
+                .manifest = manifest,
+            };
         }
-        return error.NotFound;
     }
 
     pub fn statPath(self: *Volume, path: []const u8) !pack_reader.Stat {
-        for (self.mounts.items) |mounted| {
-            const file_entry = mounted.reader.resolvePath(std.heap.smp_allocator, path) catch |e| switch (e) {
-                error.NotFound => continue,
-                else => |err| return err,
-            };
-            return self.statEntry(file_entry);
-        }
-        return error.NotFound;
+        const file_entry = blk: {
+            lockMutex(&self.lock);
+            defer self.lock.unlock();
+            for (self.mounts.items) |mounted| {
+                const file_entry = mounted.reader.resolvePath(std.heap.smp_allocator, path) catch |e| switch (e) {
+                    error.NotFound => continue,
+                    else => |err| return err,
+                };
+                break :blk file_entry;
+            }
+            return error.NotFound;
+        };
+        return self.statEntry(file_entry);
     }
 
     pub fn statEntry(self: *Volume, file_entry: u64) !pack_reader.Stat {
         if (file_entry == 0) return error.InvalidArgument;
-        for (self.mounts.items) |mounted| {
-            if (try mounted.reader.hasEntryTombstone(std.heap.smp_allocator, file_entry)) return error.NotFound;
-            return mounted.reader.statEntry(std.heap.smp_allocator, file_entry) catch |e| switch (e) {
-                error.NotFound => continue,
+        var index: usize = 0;
+        while (true) {
+            const pack_id = blk: {
+                lockMutex(&self.lock);
+                defer self.lock.unlock();
+                if (index >= self.mounts.items.len) return error.NotFound;
+                break :blk self.mounts.items[index].meta.pack_id;
+            };
+            const reader = try self.pinStoreById(pack_id);
+            defer self.unpinStoreById(pack_id);
+            if (try reader.hasEntryTombstone(std.heap.smp_allocator, file_entry)) return error.NotFound;
+            return reader.statEntry(std.heap.smp_allocator, file_entry) catch |e| switch (e) {
+                error.NotFound => {
+                    index += 1;
+                    continue;
+                },
                 else => |err| return err,
             };
         }
-        return error.NotFound;
+    }
+
+    fn pinStoreById(self: *Volume, pack_id: u32) !*pack_reader.PackReader {
+        lockMutex(&self.lock);
+        defer self.lock.unlock();
+        const mounted = self.findMountedPackById(pack_id) orelse return error.NotFound;
+        try self.pinMountedLocked(mounted);
+        return mounted.reader;
+    }
+
+    fn unpinStoreById(self: *Volume, pack_id: u32) void {
+        lockMutex(&self.lock);
+        defer self.lock.unlock();
+        const mounted = self.findMountedPackById(pack_id) orelse return;
+        if (mounted.pin_count > 0) mounted.pin_count -= 1;
     }
 };
 
 fn mountedHigherPriority(_: void, a: Volume.MountedPack, b: Volume.MountedPack) bool {
     return a.meta.priority > b.meta.priority;
+}
+
+fn lockMutex(m: *std.atomic.Mutex) void {
+    while (!m.tryLock()) std.atomic.spinLoopHint();
 }
 
 fn createEmptyPack(pack_path: []const u8) !void {
@@ -540,6 +704,112 @@ test "volume page-level incremental uses explicit refs and fails on missing or c
     handle = try corrupt.openEntry(1, 3001);
     try std.testing.expectError(error.Corruption, handle.readAt(4, buf[0..4]));
     handle.close();
+}
+
+test "volume concurrent readers share one pack store" {
+    const builder = @import("../build/pack_builder.zig");
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const pack_path = "zig-cache-vfs-concurrent-pack";
+    const source_path = "zig-cache-vfs-concurrent-source.bin";
+    _ = std.Io.Dir.cwd().deleteTree(io, pack_path) catch {};
+    _ = std.Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, pack_path) catch {};
+    defer _ = std.Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    const payload = "concurrent-read-payload!!";
+    try builder.writeSourceFileForTest(source_path, payload);
+    try builder.createPack(pack_path, &.{.{ .source_path = source_path, .virtual_path = "/c.bin", .file_entry = 8001, .page_size = 8 }}, .{});
+
+    var v = try Volume.open("concurrent-root", .{});
+    defer v.close();
+    try v.mountPackWithPriority(pack_path, 1, 0);
+
+    const Ctx = struct {
+        volume: *Volume,
+        errors: *[4]u32,
+        payload: []const u8,
+
+        fn reader(ctx: *@This(), id: usize) void {
+            var handle = ctx.volume.openPath(1, "/c.bin") catch {
+                ctx.errors[id] = 1;
+                return;
+            };
+            defer handle.close();
+            var round: usize = 0;
+            while (round < 32) : (round += 1) {
+                var buf: [32]u8 = undefined;
+                const n = handle.readAt(0, &buf) catch {
+                    ctx.errors[id] = 2;
+                    return;
+                };
+                if (n != ctx.payload.len or !std.mem.eql(u8, buf[0..n], ctx.payload)) {
+                    ctx.errors[id] = 3;
+                    return;
+                }
+            }
+        }
+    };
+
+    var errors = [_]u32{0} ** 4;
+    var ctx = Ctx{ .volume = &v, .errors = &errors, .payload = payload };
+    var threads: [4]std.Thread = undefined;
+    for (&threads, 0..) |*thread, i| thread.* = try std.Thread.spawn(.{}, Ctx.reader, .{ &ctx, i });
+    for (&threads) |*thread| thread.join();
+    for (errors) |e| try std.testing.expectEqual(@as(u32, 0), e);
+    _ = allocator;
+}
+
+test "volume parks idle readonly stores under max_open_stores" {
+    const builder = @import("../build/pack_builder.zig");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const n_packs = 4;
+    var pack_paths: [n_packs][64]u8 = undefined;
+    var source_paths: [n_packs][64]u8 = undefined;
+    var pack_slices: [n_packs][]u8 = undefined;
+    var i: usize = 0;
+    while (i < n_packs) : (i += 1) {
+        pack_slices[i] = std.fmt.bufPrint(&pack_paths[i], "zig-cache-vfs-store-gc-{d}", .{i}) catch unreachable;
+        const source = std.fmt.bufPrint(&source_paths[i], "zig-cache-vfs-store-gc-src-{d}.bin", .{i}) catch unreachable;
+        _ = std.Io.Dir.cwd().deleteTree(io, pack_slices[i]) catch {};
+        _ = std.Io.Dir.cwd().deleteFile(io, source) catch {};
+        var payload: [8]u8 = undefined;
+        @memset(&payload, @as(u8, 'A') + @as(u8, @intCast(i)));
+        try builder.writeSourceFileForTest(source, &payload);
+        try builder.createPack(pack_slices[i], &.{.{
+            .source_path = source,
+            .virtual_path = "/f.bin",
+            .file_entry = 9000 + i,
+            .page_size = 8,
+        }}, .{ .pack_id = @intCast(20 + i) });
+    }
+    defer {
+        var j: usize = 0;
+        while (j < n_packs) : (j += 1) {
+            _ = std.Io.Dir.cwd().deleteTree(io, pack_slices[j]) catch {};
+            const source = std.fmt.bufPrint(&source_paths[j], "zig-cache-vfs-store-gc-src-{d}.bin", .{j}) catch unreachable;
+            _ = std.Io.Dir.cwd().deleteFile(io, source) catch {};
+        }
+    }
+
+    var v = try Volume.open("gc-root", .{ .max_open_stores = 2 });
+    defer v.close();
+    i = 0;
+    while (i < n_packs) : (i += 1) {
+        try v.mountPackWithPriority(pack_slices[i], @intCast(i + 1), 0);
+    }
+    try std.testing.expect(v.readonlyReadyCount() <= 2);
+
+    i = 0;
+    while (i < n_packs) : (i += 1) {
+        var handle = try v.openEntry(1, 9000 + i);
+        var buf: [8]u8 = undefined;
+        const n = try handle.readAt(0, &buf);
+        handle.close();
+        var expect: [8]u8 = undefined;
+        @memset(&expect, @as(u8, 'A') + @as(u8, @intCast(i)));
+        try std.testing.expectEqualSlices(u8, &expect, buf[0..n]);
+        try std.testing.expect(v.readonlyReadyCount() <= 2);
+    }
 }
 
 fn optimizeDbForTest(path: []const u8) !void {

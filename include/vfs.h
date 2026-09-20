@@ -25,6 +25,8 @@ typedef struct vfs_open_options {
     uint32_t struct_size;
     uint32_t flags;
     uint64_t reserved0;
+    uint32_t max_open_stores;
+    uint32_t reserved1;
 } vfs_open_options_t;
 
 typedef struct vfs_stat {

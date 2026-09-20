@@ -1,14 +1,11 @@
 const std = @import("std");
-const pack_reader = @import("../pack/pack_reader.zig");
 const volume_mod = @import("../volume/volume.zig");
 const file_manifest_fmt = @import("../format/file_manifest.zig");
 const page_value_fmt = @import("../format/page_value.zig");
 const registry = @import("../compress/registry.zig");
 const object_key = @import("../object_key.zig");
-const hash = @import("../hash.zig");
 
 const PageSource = struct {
-    reader: *pack_reader.PackReader,
     pack_id: u32,
     pack_generation: u64,
     identity: page_value_fmt.PageIdentity,
@@ -21,7 +18,6 @@ const PageSource = struct {
 pub const FileHandle = struct {
     volume_handle: u64,
     volume: *volume_mod.Volume,
-    pack: *pack_reader.PackReader,
     pack_id: u32,
     pack_generation: u64,
     file_entry: u64,
@@ -30,7 +26,7 @@ pub const FileHandle = struct {
 
     pub fn close(self: *FileHandle) void {
         self.manifest.deinit(std.heap.smp_allocator);
-        if (self.volume.open_file_count > 0) self.volume.open_file_count -= 1;
+        _ = self.volume.open_file_count.fetchSub(1, .seq_cst);
     }
 
     pub fn readAt(self: *FileHandle, offset: u64, dst: []u8) !usize {
@@ -56,11 +52,9 @@ pub const FileHandle = struct {
                 const block_index: u32 = @intCast(block_i);
                 const source: PageSource = if ((block.flags & file_manifest_fmt.BLOCK_FLAG_EXPLICIT_PAGE_REFS) != 0) blk: {
                     const ref = try self.manifest.pageRef(block, page_index);
-                    const mounted = self.volume.findMountedPackContainingGeneration(ref.pack_id, ref.pack_generation) orelse return error.NotFound;
                     break :blk .{
-                        .reader = mounted.reader,
-                        .pack_id = mounted.meta.pack_id,
-                        .pack_generation = mounted.meta.pack_version,
+                        .pack_id = ref.pack_id,
+                        .pack_generation = ref.pack_generation,
                         .identity = page_value_fmt.PageIdentity{ .file_entry = ref.file_entry, .block_index = ref.block_index, .page_index = ref.page_index },
                         .page_key = ref.page_key,
                         .content_hash = ref.content_hash,
@@ -69,7 +63,6 @@ pub const FileHandle = struct {
                     };
                 } else blk: {
                     break :blk .{
-                        .reader = self.pack,
                         .pack_id = self.pack_id,
                         .pack_generation = self.pack_generation,
                         .identity = page_value_fmt.PageIdentity{ .file_entry = self.file_entry, .block_index = block_index, .page_index = page_index },
@@ -79,23 +72,31 @@ pub const FileHandle = struct {
                         .check_ref = false,
                     };
                 };
-                const page = try self.volume.page_cache.getOrLoadObject(std.heap.smp_allocator, source.reader, .{
-                    .pack_id = source.pack_id,
-                    .pack_generation = source.pack_generation,
-                    .file_entry = source.identity.file_entry,
-                    .block_index = source.identity.block_index,
-                    .page_index = source.identity.page_index,
-                    .codec_identity = codec_identity.version_hash,
-                }, source.identity, block.codec, source.page_key);
-                if (source.check_ref) {
-                    if (hash.crc32c(page) != source.raw_crc) return error.ChecksumMismatch;
-                    if (!std.mem.eql(u8, &hash.contentHash(page), &source.content_hash)) return error.ChecksumMismatch;
-                }
+                const reader = try self.volume.pinStore(source.pack_id, source.pack_generation);
+                defer self.volume.unpinStore(source.pack_id, source.pack_generation);
                 const copy_start_abs = @max(request_start, page_start);
                 const copy_end_abs = @min(request_end, page_end);
                 const page_off: usize = @intCast(copy_start_abs - page_start);
                 const copy_len: usize = @intCast(copy_end_abs - copy_start_abs);
-                @memcpy(dst[copied..][0..copy_len], page[page_off..][0..copy_len]);
+                try self.volume.page_cache.copyRange(
+                    std.heap.smp_allocator,
+                    reader,
+                    .{
+                        .pack_id = source.pack_id,
+                        .pack_generation = source.pack_generation,
+                        .file_entry = source.identity.file_entry,
+                        .block_index = source.identity.block_index,
+                        .page_index = source.identity.page_index,
+                        .codec_identity = codec_identity.version_hash,
+                    },
+                    source.identity,
+                    block.codec,
+                    source.page_key,
+                    page_off,
+                    dst[copied..][0..copy_len],
+                    if (source.check_ref) source.raw_crc else null,
+                    if (source.check_ref) source.content_hash else null,
+                );
                 copied += copy_len;
             }
         }
