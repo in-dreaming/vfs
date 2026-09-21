@@ -24,10 +24,21 @@ typedef uint64_t vfs_file_entry_t;
 typedef struct vfs_open_options {
     uint32_t struct_size;
     uint32_t flags;
-    uint64_t reserved0;
+    /* Decoded page cache budget in bytes; 0 = default (8 MiB). */
+    uint64_t page_cache_bytes;
+    /* Maximum simultaneously open read-only pack stores; 0 = default (16). */
     uint32_t max_open_stores;
-    uint32_t reserved1;
+    /* Extra read-only OS handles per pack data file so concurrent reads are
+     * not serialized on one file object; 0 = default (4). */
+    uint32_t read_handles;
 } vfs_open_options_t;
+
+/* Flags for vfs_open_path / vfs_open_entry. */
+enum {
+    /* Reads covering a whole page bypass the page cache and decode straight
+     * into the caller's buffer. Use for one-shot whole-file loads. */
+    VFS_OPEN_STREAMING = 1u << 0,
+};
 
 typedef struct vfs_stat {
     uint32_t struct_size;

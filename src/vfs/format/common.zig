@@ -56,32 +56,24 @@ pub fn getU64(src: []const u8, off: usize) u64 {
         (@as(u64, src[off + 7]) << 56);
 }
 
+const crc32c_impl = @import("db_internal").format.crc32c_impl;
+
 /// CRC32C (Castagnoli), fixed algorithm and constants; no platform-specific state.
+/// Shares the hardware-accelerated implementation with libdb (bit-identical output).
 pub fn crc32c(bytes: []const u8) u32 {
-    var crc: u32 = 0xffffffff;
-    for (bytes) |byte| {
-        crc ^= byte;
-        var i: u8 = 0;
-        while (i < 8) : (i += 1) {
-            const mask: u32 = 0 -% (crc & 1);
-            crc = (crc >> 1) ^ (0x82f63b78 & mask);
-        }
-    }
-    return ~crc;
+    return crc32c_impl.hash(bytes);
 }
 
+/// CRC32C over `bytes` with the 4 bytes at `zero_offset` treated as zero, so a
+/// header can be hashed in place without copying it to clear its own crc field.
 pub fn crc32cWithZeroU32(bytes: []const u8, zero_offset: usize) u32 {
-    var crc: u32 = 0xffffffff;
-    for (bytes, 0..) |actual, i| {
-        const byte: u8 = if (i >= zero_offset and i < zero_offset + 4) 0 else actual;
-        crc ^= byte;
-        var bit: u8 = 0;
-        while (bit < 8) : (bit += 1) {
-            const mask: u32 = 0 -% (crc & 1);
-            crc = (crc >> 1) ^ (0x82f63b78 & mask);
-        }
-    }
-    return ~crc;
+    const zero = [_]u8{ 0, 0, 0, 0 };
+    if (zero_offset >= bytes.len) return crc32c_impl.hash(bytes);
+    const hole_end = @min(bytes.len, zero_offset + 4);
+    var state = crc32c_impl.update(crc32c_impl.init_state, bytes[0..zero_offset]);
+    state = crc32c_impl.update(state, zero[0 .. hole_end - zero_offset]);
+    state = crc32c_impl.update(state, bytes[hole_end..]);
+    return crc32c_impl.finish(state);
 }
 
 pub fn checkedSize(value: u64) !usize {
@@ -103,4 +95,13 @@ test "VFS common little-endian and crc helpers are stable" {
     try std.testing.expectEqual(@as(u32, 0x89abcdef), getU32(&b, 2));
     try std.testing.expectEqual(@as(u64, 0x0123456789abcdef), getU64(&b, 6));
     try std.testing.expectEqual(@as(u32, 0xe3069283), crc32c("123456789"));
+
+    var with_hole = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    var zeroed = with_hole;
+    @memset(zeroed[3..7], 0);
+    try std.testing.expectEqual(crc32c(&zeroed), crc32cWithZeroU32(&with_hole, 3));
+    @memset(zeroed[8..10], 0);
+    zeroed[3..7].* = with_hole[3..7].*;
+    try std.testing.expectEqual(crc32c(&zeroed), crc32cWithZeroU32(&with_hole, 8));
+    try std.testing.expectEqual(crc32c(&with_hole), crc32cWithZeroU32(&with_hole, 10));
 }

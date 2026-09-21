@@ -1,6 +1,7 @@
 const std = @import("std");
 const fmt = @import("../format.zig");
 const pf = @import("../platform/file.zig");
+const sync = @import("../platform/sync.zig");
 
 pub const RECORD_ALIGNMENT: u64 = 16;
 pub const DATA_HEADER_SIZE: u64 = 80;
@@ -26,7 +27,17 @@ pub const CreateOptions = struct {
 
 pub const OpenOptions = struct {
     repair_tail: bool = true,
+    /// Open the data file without write access. Tail repair results are then
+    /// applied in memory only and never persisted.
+    read_only: bool = false,
+    /// Number of additional read-only OS handles to open for positional reads.
+    /// On Windows every synchronous file object serializes its IO inside the
+    /// kernel, so concurrent readers on one handle queue up; spreading readers
+    /// over several handles restores parallelism. 0 keeps a single handle.
+    read_handles: u8 = 0,
 };
+
+pub const MAX_READ_HANDLES: usize = 16;
 
 pub const AppendOptions = struct {
     durability: fmt.Durability = .async,
@@ -128,12 +139,45 @@ pub const DataFile = struct {
     file: pf.FileHandle,
     logical_tail: u64,
     epoch: u64,
-    append_mutex: std.atomic.Mutex = .unlocked,
+    append_mutex: sync.Mutex = .{},
+    read_only: bool = false,
+    read_files: [MAX_READ_HANDLES]pf.FileHandle = undefined,
+    read_file_count: u8 = 0,
 
     pub fn close(self: *DataFile) !void {
+        var i: usize = 0;
+        while (i < self.read_file_count) : (i += 1) pf.close(&self.read_files[i]);
+        self.read_file_count = 0;
         if (!self.file.isOpen()) return;
-        try pf.flushMetadata(self.file);
+        if (!self.read_only) try pf.flushMetadata(self.file);
         pf.close(&self.file);
+    }
+
+    /// Handle to use for a positional read on the calling thread.
+    pub fn readHandle(self: *const DataFile) pf.FileHandle {
+        if (self.read_file_count == 0) return self.file;
+        return self.read_files[sync.threadSlot() % self.read_file_count];
+    }
+
+    /// Single-pass, single-syscall record read. The whole record
+    /// `[header][key][payload][footer]` is read into a thread-local scratch
+    /// buffer, the header crc / key / footer magic / record crc are verified,
+    /// and the payload is returned as a borrowed slice that stays valid until
+    /// the next `readRecordBorrow` on the same thread.
+    ///
+    /// `expected_stored_size` comes from the index entry so the read size is
+    /// known before the header is parsed. Only the record crc is verified over
+    /// the payload: it covers header bytes (which embed payload_crc), key,
+    /// payload and footer magic, so a separate payload_crc pass adds nothing.
+    pub fn readRecordBorrow(self: *DataFile, offset: u64, key: fmt.Key128, key_bytes: []const u8, expected_stored_size: u32) ![]const u8 {
+        return dataReadRecordBorrow(self, offset, key, key_bytes, expected_stored_size);
+    }
+
+    /// Reads and validates only the header plus stored key, returning the
+    /// record metadata. Used by size queries that must confirm the raw key
+    /// matches without touching the payload.
+    pub fn readMetaCheckKey(self: *DataFile, offset: u64, key: fmt.Key128, key_bytes: []const u8) !RecordMeta {
+        return dataReadMetaCheckKey(self, offset, key, key_bytes);
     }
 
     pub fn append(self: *DataFile, key: fmt.Key128, payload: []const u8, options: AppendOptions) !AppendResult {
@@ -189,10 +233,7 @@ pub fn createIn(dir: pf.Directory, path: []const u8, options: CreateOptions) !Da
 }
 
 pub fn open(path: []const u8, options: OpenOptions) !DataFile {
-    var file = try pf.open(path, .{ .mode = .read_write });
-    errdefer pf.close(&file);
-    const sb = try loadAndMaybeRepair(file, options);
-    return .{ .file = file, .logical_tail = sb.logical_tail, .epoch = sb.epoch };
+    return openIn(.fromOs(std.Io.Dir.cwd()), path, options);
 }
 
 pub fn openAt(dir: std.Io.Dir, path: []const u8, options: OpenOptions) !DataFile {
@@ -200,10 +241,22 @@ pub fn openAt(dir: std.Io.Dir, path: []const u8, options: OpenOptions) !DataFile
 }
 
 pub fn openIn(dir: pf.Directory, path: []const u8, options: OpenOptions) !DataFile {
-    var file = try pf.openIn(dir, path, .{ .mode = .read_write });
+    var file = try pf.openIn(dir, path, .{ .mode = if (options.read_only) .read_only else .read_write });
     errdefer pf.close(&file);
     const sb = try loadAndMaybeRepair(file, options);
-    return .{ .file = file, .logical_tail = sb.logical_tail, .epoch = sb.epoch };
+    var out = DataFile{ .file = file, .logical_tail = sb.logical_tail, .epoch = sb.epoch, .read_only = options.read_only };
+    errdefer {
+        var i: usize = 0;
+        while (i < out.read_file_count) : (i += 1) pf.close(&out.read_files[i]);
+    }
+    const wanted: usize = @min(@as(usize, options.read_handles), MAX_READ_HANDLES);
+    while (out.read_file_count < wanted) {
+        // Custom file backends own their handle semantics; only pool OS files.
+        if (dir.custom_ops != null) break;
+        out.read_files[out.read_file_count] = try pf.openIn(dir, path, .{ .mode = .read_only });
+        out.read_file_count += 1;
+    }
+    return out;
 }
 
 fn initializeNew(file: pf.FileHandle, options: CreateOptions) !void {
@@ -269,9 +322,11 @@ fn loadAndMaybeRepair(file: pf.FileHandle, options: OpenOptions) !DataSuperBlock
             chosen.logical_tail = scanned_tail;
             chosen.file_size = @max(chosen.file_size, scanned_tail);
             chosen.durable_tail = scanned_tail;
-            try writeSuper(file, DATA_SUPERBLOCK_A_OFFSET, chosen);
-            try writeSuper(file, DATA_SUPERBLOCK_B_OFFSET, chosen);
-            try pf.flushMetadata(file);
+            if (!options.read_only) {
+                try writeSuper(file, DATA_SUPERBLOCK_A_OFFSET, chosen);
+                try writeSuper(file, DATA_SUPERBLOCK_B_OFFSET, chosen);
+                try pf.flushMetadata(file);
+            }
         }
     }
     return chosen;
@@ -283,7 +338,7 @@ pub fn append(file: *DataFile, key: fmt.Key128, payload: []const u8, options: Ap
 
 pub fn appendBatch(file: *DataFile, allocator: std.mem.Allocator, records: []const BatchAppendInput) ![]AppendResult {
     if (records.len == 0) return allocator.alloc(AppendResult, 0);
-    while (!file.append_mutex.tryLock()) std.atomic.spinLoopHint();
+    file.append_mutex.lock();
     defer file.append_mutex.unlock();
 
     var total_bytes: u64 = 0;
@@ -371,7 +426,7 @@ pub fn appendRawKey(file: *DataFile, key: fmt.Key128, key_bytes: []const u8, pay
 fn dataAppendRawKey(file: *DataFile, key: fmt.Key128, key_bytes: []const u8, payload: []const u8, options: AppendOptions) !AppendResult {
     if (payload.len > std.math.maxInt(u32)) return error.InvalidArgument;
     if (key_bytes.len > std.math.maxInt(u32)) return error.InvalidArgument;
-    while (!file.append_mutex.tryLock()) std.atomic.spinLoopHint();
+    file.append_mutex.lock();
     defer file.append_mutex.unlock();
 
     const offset = file.logical_tail;
@@ -493,19 +548,72 @@ fn dataReadPayloadRawKey(file: *DataFile, offset: u64, key: fmt.Key128, key_byte
 }
 
 fn dataReadPayloadRawKeyMaybe(file: *DataFile, offset: u64, key: fmt.Key128, maybe_key_bytes: ?[]const u8, dst: []u8) !usize {
-    const parsed = try readAndValidateHeader(file.file, offset);
+    const fh = file.readHandle();
+    const parsed = try readAndValidateHeader(fh, offset);
     if (parsed.meta.key.hi != key.hi or parsed.meta.key.lo != key.lo) return error.NotFound;
     if (maybe_key_bytes) |key_bytes| {
         if (key_bytes.len != parsed.meta.key_size) return error.NotFound;
         const stored_key = try std.heap.smp_allocator.alloc(u8, parsed.meta.key_size);
         defer std.heap.smp_allocator.free(stored_key);
-        try readExact(file.file, offset + RECORD_HEADER_SIZE, stored_key);
+        try readExact(fh, offset + RECORD_HEADER_SIZE, stored_key);
         if (!std.mem.eql(u8, stored_key, key_bytes)) return error.NotFound;
     }
     if (dst.len < parsed.meta.raw_size) return error.BufferTooSmall;
-    try readExact(file.file, offset + RECORD_HEADER_SIZE + parsed.meta.key_size, dst[0..parsed.meta.stored_size]);
-    try verifyPayloadAndFooter(file.file, offset, parsed.header_buf, dst[0..parsed.meta.stored_size], parsed.meta);
+    try readExact(fh, offset + RECORD_HEADER_SIZE + parsed.meta.key_size, dst[0..parsed.meta.stored_size]);
+    try verifyPayloadAndFooter(fh, offset, parsed.header_buf, dst[0..parsed.meta.stored_size], parsed.meta);
     return parsed.meta.raw_size;
+}
+
+/// Thread-local scratch for whole-record reads. It grows to the largest record
+/// read on this thread and is intentionally never shrunk; a thread that reads
+/// packs keeps at most one page-sized buffer alive.
+threadlocal var record_scratch: []u8 = &.{};
+
+fn recordScratch(len: usize) ![]u8 {
+    if (record_scratch.len >= len) return record_scratch[0..len];
+    const grown = @max(len, @max(record_scratch.len * 2, 4096));
+    if (record_scratch.len != 0) {
+        record_scratch = try std.heap.smp_allocator.realloc(record_scratch, grown);
+    } else {
+        record_scratch = try std.heap.smp_allocator.alloc(u8, grown);
+    }
+    return record_scratch[0..len];
+}
+
+fn dataReadRecordBorrow(file: *DataFile, offset: u64, key: fmt.Key128, key_bytes: []const u8, expected_stored_size: u32) ![]const u8 {
+    const key_len: u64 = key_bytes.len;
+    const total: u64 = @as(u64, RECORD_HEADER_SIZE) + key_len + expected_stored_size + RECORD_FOOTER_SIZE;
+    const total_usize = std.math.cast(usize, total) orelse return error.InvalidArgument;
+    const buf = try recordScratch(total_usize);
+    try readExact(file.readHandle(), offset, buf);
+
+    const header_buf: *const [RECORD_HEADER_SIZE]u8 = buf[0..RECORD_HEADER_SIZE];
+    const meta = try parseAndValidateHeader(header_buf, offset);
+    if (meta.key.hi != key.hi or meta.key.lo != key.lo) return error.NotFound;
+    if (meta.key_size != key_bytes.len) return error.NotFound;
+    if (meta.stored_size != expected_stored_size) return error.Corruption;
+
+    const key_start: usize = RECORD_HEADER_SIZE;
+    const payload_start: usize = key_start + key_bytes.len;
+    const footer_start: usize = payload_start + meta.stored_size;
+    const stored_key = buf[key_start..payload_start];
+    if (!std.mem.eql(u8, stored_key, key_bytes)) return error.NotFound;
+    const payload = buf[payload_start..footer_start];
+    const footer = decodeRecordFooter(buf[footer_start..][0..RECORD_FOOTER_SIZE]);
+    if (footer.magic_commit != RECORD_FOOTER_MAGIC) return error.Corruption;
+    if (crcRecord(header_buf, stored_key, payload) != footer.record_crc) return error.ChecksumMismatch;
+    return payload;
+}
+
+fn dataReadMetaCheckKey(file: *DataFile, offset: u64, key: fmt.Key128, key_bytes: []const u8) !RecordMeta {
+    const total: usize = RECORD_HEADER_SIZE + key_bytes.len;
+    const buf = try recordScratch(total);
+    try readExact(file.readHandle(), offset, buf);
+    const meta = try parseAndValidateHeader(buf[0..RECORD_HEADER_SIZE], offset);
+    if (meta.key.hi != key.hi or meta.key.lo != key.lo) return error.NotFound;
+    if (meta.key_size != key_bytes.len) return error.NotFound;
+    if (!std.mem.eql(u8, buf[RECORD_HEADER_SIZE..total], key_bytes)) return error.NotFound;
+    return meta;
 }
 
 pub fn verifyRecord(file: *DataFile, offset: u64) !RecordMeta {
@@ -551,6 +659,10 @@ fn readAndValidateHeader(file: pf.FileHandle, offset: u64) !ParsedHeader {
 fn readAndValidateHeaderHandle(file: pf.FileHandle, offset: u64) !ParsedHeader {
     var buf: [RECORD_HEADER_SIZE]u8 = undefined;
     try readExact(file, offset, &buf);
+    return .{ .header_buf = buf, .meta = try parseAndValidateHeader(&buf, offset) };
+}
+
+fn parseAndValidateHeader(buf: *const [RECORD_HEADER_SIZE]u8, offset: u64) !RecordMeta {
     const magic = fmt.readU32Le(buf[0..4]);
     const header_version = fmt.readU16Le(buf[4..6]);
     const flags = fmt.readU16Le(buf[6..8]);
@@ -567,29 +679,26 @@ fn readAndValidateHeaderHandle(file: pf.FileHandle, offset: u64) !ParsedHeader {
     const txn_id = fmt.readU64Le(buf[56..64]);
     if (magic != RECORD_MAGIC or header_version != 2 or header_size != RECORD_HEADER_SIZE) return error.Corruption;
     if (stored_size != raw_size) return error.Corruption;
-    var crc_buf = buf;
+    var crc_buf = buf.*;
     fmt.writeU32Le(crc_buf[40..44], 0);
     if (fmt.crc32c(&crc_buf) != header_crc) return error.Corruption;
     const total = @as(u64, RECORD_HEADER_SIZE) + key_size + stored_size + RECORD_FOOTER_SIZE;
     const aligned = try fmt.alignUp(total, RECORD_ALIGNMENT);
     return .{
-        .header_buf = buf,
-        .meta = .{
-            .key = .{ .hi = key_hi, .lo = key_lo },
-            .key_size = key_size,
-            .offset = offset,
-            .header_size = header_size,
-            .stored_size = stored_size,
-            .raw_size = raw_size,
-            .payload_crc = payload_crc,
-            .record_crc = 0,
-            .flags = flags,
-            .codec = codec,
-            .version = version,
-            .txn_id = txn_id,
-            .total_size = total,
-            .aligned_size = aligned,
-        },
+        .key = .{ .hi = key_hi, .lo = key_lo },
+        .key_size = key_size,
+        .offset = offset,
+        .header_size = header_size,
+        .stored_size = stored_size,
+        .raw_size = raw_size,
+        .payload_crc = payload_crc,
+        .record_crc = 0,
+        .flags = flags,
+        .codec = codec,
+        .version = version,
+        .txn_id = txn_id,
+        .total_size = total,
+        .aligned_size = aligned,
     };
 }
 
@@ -606,26 +715,13 @@ fn verifyPayloadAndFooter(file: pf.FileHandle, offset: u64, header_buf: [RECORD_
 }
 
 fn crcRecord(header: *const [RECORD_HEADER_SIZE]u8, key_bytes: []const u8, payload: []const u8) u32 {
-    var crc = fmt.crc32c(header);
     var footer_magic: [4]u8 = undefined;
     fmt.writeU32Le(&footer_magic, RECORD_FOOTER_MAGIC);
-    crc = crc32cContinue(crc, key_bytes);
-    crc = crc32cContinue(crc, payload);
-    crc = crc32cContinue(crc, &footer_magic);
-    return crc;
-}
-
-fn crc32cContinue(previous: u32, bytes: []const u8) u32 {
-    var crc: u32 = ~previous;
-    for (bytes) |byte| {
-        crc ^= byte;
-        var i: u8 = 0;
-        while (i < 8) : (i += 1) {
-            const mask: u32 = 0 -% (crc & 1);
-            crc = (crc >> 1) ^ (0x82f63b78 & mask);
-        }
-    }
-    return ~crc;
+    var state = fmt.crc32c_impl.update(fmt.crc32c_impl.init_state, header);
+    state = fmt.crc32c_impl.update(state, key_bytes);
+    state = fmt.crc32c_impl.update(state, payload);
+    state = fmt.crc32c_impl.update(state, &footer_magic);
+    return fmt.crc32c_impl.finish(state);
 }
 
 fn readExact(file: pf.FileHandle, offset: u64, dst: []u8) !void {
@@ -831,4 +927,52 @@ test "data db create append read verify corruption truncation reopen" {
     try pf.setLen(reopened.file, r3.offset + RECORD_HEADER_SIZE + 2);
     try testing.expectError(error.UnexpectedEnd, verifyRecord(&reopened, r3.offset));
     pf.close(&reopened.file);
+}
+
+test "data db single-read record borrow validates key footer and crc, read handle pool shares content" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var df = try createAt(tmp.dir, "data_000.db", .{ .durability = .sync });
+    const key: fmt.Key128 = .{ .hi = 0x11, .lo = 0x22 };
+    const key_bytes = "raw-key";
+    const payload = "borrowed-payload-bytes";
+    const r = try appendRawKey(&df, key, key_bytes, payload, .{ .version = 1, .durability = .sync });
+    const other = try appendRawKey(&df, .{ .hi = 0x33, .lo = 0x44 }, "k2", "second", .{ .version = 1, .durability = .sync });
+    try df.close();
+
+    var ro = try openIn(.fromOs(tmp.dir), "data_000.db", .{ .read_only = true, .read_handles = 3 });
+    defer ro.close() catch unreachable;
+    try testing.expectEqual(@as(u8, 3), ro.read_file_count);
+
+    const got = try ro.readRecordBorrow(r.offset, key, key_bytes, r.stored_size);
+    try testing.expectEqualStrings(payload, got);
+    const meta = try ro.readMetaCheckKey(r.offset, key, key_bytes);
+    try testing.expectEqual(@as(u32, payload.len), meta.raw_size);
+
+    try testing.expectError(error.NotFound, ro.readRecordBorrow(r.offset, .{ .hi = 0x11, .lo = 0x23 }, key_bytes, r.stored_size));
+    try testing.expectError(error.NotFound, ro.readRecordBorrow(r.offset, key, "raw-keY", r.stored_size));
+    try testing.expectError(error.NotFound, ro.readRecordBorrow(r.offset, key, "raw-ke", r.stored_size));
+    try testing.expectError(error.NotFound, ro.readMetaCheckKey(r.offset, key, "raw-keY"));
+    try testing.expectError(error.Corruption, ro.readRecordBorrow(r.offset, key, key_bytes, r.stored_size + 1));
+
+    const second = try ro.readRecordBorrow(other.offset, .{ .hi = 0x33, .lo = 0x44 }, "k2", other.stored_size);
+    try testing.expectEqualStrings("second", second);
+
+    var rw = try openAt(tmp.dir, "data_000.db", .{});
+    defer rw.close() catch unreachable;
+    const flip_offset = r.offset + RECORD_HEADER_SIZE + key_bytes.len + 3;
+    var one: [1]u8 = undefined;
+    try readExact(rw.file, flip_offset, &one);
+    one[0] ^= 0x55;
+    try pf.pwriteAll(rw.file, flip_offset, &one);
+    try testing.expectError(error.ChecksumMismatch, rw.readRecordBorrow(r.offset, key, key_bytes, r.stored_size));
+    one[0] ^= 0x55;
+    try pf.pwriteAll(rw.file, flip_offset, &one);
+    try testing.expectEqualStrings(payload, try rw.readRecordBorrow(r.offset, key, key_bytes, r.stored_size));
+
+    const footer_offset = r.offset + RECORD_HEADER_SIZE + key_bytes.len + payload.len;
+    try pf.pwriteAll(rw.file, footer_offset, "XXXX");
+    try testing.expectError(error.Corruption, rw.readRecordBorrow(r.offset, key, key_bytes, r.stored_size));
 }

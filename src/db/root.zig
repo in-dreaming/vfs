@@ -23,6 +23,7 @@ pub const index = struct {
 pub const platform = struct {
     pub const file = @import("platform/file.zig");
     pub const inmemory_file_ops = @import("platform/inmemory_file_ops.zig");
+    pub const sync = @import("platform/sync.zig");
 };
 
 comptime {
@@ -100,6 +101,7 @@ test {
     _ = recovery_verify;
     _ = platform.file;
     _ = platform.inmemory_file_ops;
+    _ = platform.sync;
 }
 
 test "root maintenance ABI works with custom InMemoryFileOps except recover unsupported" {

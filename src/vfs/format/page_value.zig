@@ -80,13 +80,16 @@ pub fn decodePageValue(bytes: []const u8, expected: PageIdentity) !PageValue {
     if (bytes.len != HEADER_SIZE + stored_size) return error.Corruption;
     const payload = bytes[HEADER_SIZE..];
     const stored_crc = fmt.getU32(bytes, 44);
-    if (fmt.crc32c(payload) != stored_crc) return error.ChecksumMismatch;
+    // One pass over the payload: for the `none` codec stored bytes are the raw
+    // bytes, so the same value must also match raw_crc.
+    const payload_crc = fmt.crc32c(payload);
+    if (payload_crc != stored_crc) return error.ChecksumMismatch;
     const codec: file_manifest.Codec = @enumFromInt(fmt.getU16(bytes, 24));
     const raw_crc = fmt.getU32(bytes, 40);
     const raw_size = fmt.getU32(bytes, 32);
     if (codec == .none) {
         if (raw_size != stored_size) return error.Corruption;
-        if (fmt.crc32c(payload) != raw_crc) return error.ChecksumMismatch;
+        if (payload_crc != raw_crc) return error.ChecksumMismatch;
     }
     var h: [32]u8 = undefined;
     @memcpy(&h, bytes[48..80][0..32]);

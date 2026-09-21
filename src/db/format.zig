@@ -128,6 +128,8 @@ pub fn checkedMul(a: u64, b: u64) Error!u64 {
     return std.math.mul(u64, a, b) catch error.Overflow;
 }
 
+pub const crc32c_impl = @import("crc32c.zig");
+
 /// CRC32C (Castagnoli) in reflected bit order.
 ///
 /// Parameters:
@@ -137,17 +139,15 @@ pub fn checkedMul(a: u64, b: u64) Error!u64 {
 /// - xorout: 0xffffffff
 ///
 /// Standard vector: crc32c("123456789") == 0xe3069283.
+/// Backed by a hardware instruction when the target supports one; see crc32c.zig.
 pub fn crc32c(bytes: []const u8) u32 {
-    var crc: u32 = 0xffffffff;
-    for (bytes) |byte| {
-        crc ^= byte;
-        var i: u8 = 0;
-        while (i < 8) : (i += 1) {
-            const mask: u32 = 0 -% (crc & 1);
-            crc = (crc >> 1) ^ (0x82f63b78 & mask);
-        }
-    }
-    return ~crc;
+    return crc32c_impl.hash(bytes);
+}
+
+/// Continue a CRC32C whose final value was `previous` over `bytes`, as if the
+/// two byte ranges had been hashed as one contiguous buffer.
+pub fn crc32cContinue(previous: u32, bytes: []const u8) u32 {
+    return crc32c_impl.hashContinue(previous, bytes);
 }
 
 fn mix64(x: u64) u64 {
@@ -211,6 +211,11 @@ test "little-endian helpers encode and decode fixed-width integers" {
 test "crc32c fixed vectors" {
     try std.testing.expectEqual(@as(u32, 0x00000000), crc32c(""));
     try std.testing.expectEqual(@as(u32, 0xe3069283), crc32c("123456789"));
+    try std.testing.expectEqual(crc32c("123456789"), crc32cContinue(crc32c("1234"), "56789"));
+}
+
+test {
+    _ = crc32c_impl;
 }
 
 test "mixHash128To64 fixed vectors" {

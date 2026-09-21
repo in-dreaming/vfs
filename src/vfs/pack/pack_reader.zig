@@ -15,13 +15,25 @@ pub const Stat = struct {
     page_size: u64,
 };
 
+pub const OpenOptions = struct {
+    /// Extra read-only OS handles on the data file so concurrent page reads
+    /// are not serialized by the kernel on one file object (Windows).
+    read_handles: u8 = DEFAULT_READ_HANDLES,
+};
+
+pub const DEFAULT_READ_HANDLES: u8 = 4;
+
 pub const PackReader = struct {
     db: kv.KvDb,
     manifest: pack_manifest_fmt.PackManifest,
     path_index: []u8,
 
     pub fn open(allocator: std.mem.Allocator, pack_path: []const u8) !PackReader {
-        var db = try kv.KvDb.open(pack_path, .{ .mode = .read_only, .create_if_missing = false });
+        return openWithOptions(allocator, pack_path, .{});
+    }
+
+    pub fn openWithOptions(allocator: std.mem.Allocator, pack_path: []const u8, options: OpenOptions) !PackReader {
+        var db = try kv.KvDb.open(pack_path, .{ .mode = .read_only, .create_if_missing = false, .read_handles = options.read_handles });
         errdefer db.close() catch {};
         const manifest_bytes = try readObjectFromDb(&db, allocator, object_key.packManifestKey());
         defer allocator.free(manifest_bytes);
@@ -90,15 +102,21 @@ pub const PackReader = struct {
         if (self.db.isParked()) return error.Busy;
         return readObjectFromDb(&self.db, allocator, key);
     }
+
+    /// Single-syscall object read. The returned slice is a thread-local
+    /// borrow valid until the next DB read on this thread; copy out before
+    /// touching the pack again.
+    pub fn readObjectBorrow(self: *PackReader, key: u64) ![]const u8 {
+        if (self.db.isParked()) return error.Busy;
+        var key_bytes = object_key.encodeDbKey(key);
+        return self.db.getBorrowedBytes(&key_bytes);
+    }
 };
 
 fn readObjectFromDb(db: *kv.KvDb, allocator: std.mem.Allocator, key: u64) ![]u8 {
     var key_bytes = object_key.encodeDbKey(key);
-    const size = try db.getSizeBytes(&key_bytes);
-    const buf = try allocator.alloc(u8, size);
-    errdefer allocator.free(buf);
-    _ = try db.getIntoBytes(&key_bytes, buf);
-    return buf;
+    const borrowed = try db.getBorrowedBytes(&key_bytes);
+    return allocator.dupe(u8, borrowed);
 }
 
 test "pack reader resolves path and entry from builder output" {

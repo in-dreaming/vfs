@@ -15,14 +15,23 @@ const PageSource = struct {
     check_ref: bool,
 };
 
+/// `vfs_open_*` flag: reads that cover a whole page bypass the page cache and
+/// decode straight into the caller's buffer. Intended for one-shot whole-file
+/// loads, where caching would only evict pages other readers still want.
+pub const OPEN_FLAG_STREAMING: u32 = 1 << 0;
+
 pub const FileHandle = struct {
     volume_handle: u64,
     volume: *volume_mod.Volume,
+    /// The mount this file's manifest was resolved from. Stable for the
+    /// volume's lifetime; pinned once per `readAt` instead of once per page.
+    mounted: *volume_mod.Volume.MountedPack,
     pack_id: u32,
     pack_generation: u64,
     file_entry: u64,
     manifest: file_manifest_fmt.DecodedFileManifest,
     size: u64 = 0,
+    flags: u32 = 0,
 
     pub fn close(self: *FileHandle) void {
         self.manifest.deinit(std.heap.smp_allocator);
@@ -37,20 +46,30 @@ pub const FileHandle = struct {
         const request_start = offset;
         const request_end = offset + wanted;
 
+        // One pin on our own pack for the whole request. Explicit page refs
+        // that point into other packs pin those per page.
+        try self.volume.pinMounted(self.mounted);
+        defer self.volume.unpinMounted(self.mounted);
+
         for (self.manifest.blocks, 0..) |block, block_i| {
             if (block.codec != .none) return error.UnsupportedFeature;
             if (block.page_size == 0 and block.page_count != 0) return error.Corruption;
             const block_start = block.raw_offset;
             const block_end = block.raw_offset + block.raw_size;
             if (request_end <= block_start or request_start >= block_end) continue;
-            var page_index: u32 = 0;
+            const codec_identity = try registry.codecIdentity(block.codec);
+            const block_index: u32 = @intCast(block_i);
+            const explicit_refs = (block.flags & file_manifest_fmt.BLOCK_FLAG_EXPLICIT_PAGE_REFS) != 0;
+
+            // Skip straight to the first overlapping page instead of scanning.
+            var page_index: u32 = if (request_start > block_start) @intCast((request_start - block_start) / block.page_size) else 0;
             while (page_index < block.page_count) : (page_index += 1) {
                 const page_start = block_start + @as(u64, page_index) * @as(u64, block.page_size);
+                if (request_end <= page_start) break;
                 const page_end = @min(block_end, page_start + block.page_size);
-                if (request_end <= page_start or request_start >= page_end) continue;
-                const codec_identity = try registry.codecIdentity(block.codec);
-                const block_index: u32 = @intCast(block_i);
-                const source: PageSource = if ((block.flags & file_manifest_fmt.BLOCK_FLAG_EXPLICIT_PAGE_REFS) != 0) blk: {
+                if (request_start >= page_end) continue;
+
+                const source: PageSource = if (explicit_refs) blk: {
                     const ref = try self.manifest.pageRef(block, page_index);
                     break :blk .{
                         .pack_id = ref.pack_id,
@@ -72,31 +91,59 @@ pub const FileHandle = struct {
                         .check_ref = false,
                     };
                 };
-                const reader = try self.volume.pinStore(source.pack_id, source.pack_generation);
-                defer self.volume.unpinStore(source.pack_id, source.pack_generation);
+
                 const copy_start_abs = @max(request_start, page_start);
                 const copy_end_abs = @min(request_end, page_end);
                 const page_off: usize = @intCast(copy_start_abs - page_start);
                 const copy_len: usize = @intCast(copy_end_abs - copy_start_abs);
-                try self.volume.page_cache.copyRange(
-                    std.heap.smp_allocator,
-                    reader,
-                    .{
-                        .pack_id = source.pack_id,
-                        .pack_generation = source.pack_generation,
-                        .file_entry = source.identity.file_entry,
-                        .block_index = source.identity.block_index,
-                        .page_index = source.identity.page_index,
-                        .codec_identity = codec_identity.version_hash,
-                    },
-                    source.identity,
-                    block.codec,
-                    source.page_key,
-                    page_off,
-                    dst[copied..][0..copy_len],
-                    if (source.check_ref) source.raw_crc else null,
-                    if (source.check_ref) source.content_hash else null,
-                );
+                const cache_key: @import("page_cache.zig").PageCacheKey = .{
+                    .pack_id = source.pack_id,
+                    .pack_generation = source.pack_generation,
+                    .file_entry = source.identity.file_entry,
+                    .block_index = source.identity.block_index,
+                    .page_index = source.identity.page_index,
+                    .codec_identity = codec_identity.version_hash,
+                };
+
+                const whole_page = page_off == 0 and copy_len == page_end - page_start;
+                if (!explicit_refs and whole_page and (self.flags & OPEN_FLAG_STREAMING) != 0) {
+                    try self.volume.page_cache.readThrough(
+                        self.mounted.reader,
+                        cache_key,
+                        source.identity,
+                        block.codec,
+                        source.page_key,
+                        dst[copied..][0..copy_len],
+                    );
+                } else if (!explicit_refs) {
+                    try self.volume.page_cache.copyRange(
+                        std.heap.smp_allocator,
+                        self.mounted.reader,
+                        cache_key,
+                        source.identity,
+                        block.codec,
+                        source.page_key,
+                        page_off,
+                        dst[copied..][0..copy_len],
+                        null,
+                        null,
+                    );
+                } else {
+                    const foreign = try self.volume.pinStoreMounted(source.pack_id, source.pack_generation);
+                    defer self.volume.unpinMounted(foreign);
+                    try self.volume.page_cache.copyRange(
+                        std.heap.smp_allocator,
+                        foreign.reader,
+                        cache_key,
+                        source.identity,
+                        block.codec,
+                        source.page_key,
+                        page_off,
+                        dst[copied..][0..copy_len],
+                        source.raw_crc,
+                        source.content_hash,
+                    );
+                }
                 copied += copy_len;
             }
         }

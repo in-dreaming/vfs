@@ -111,14 +111,18 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tests/vfs_concurrent_read_bench.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "vfs", .module = vfs_mod }},
+        .imports = &.{
+            .{ .name = "vfs", .module = vfs_mod },
+            .{ .name = "db_internal", .module = db_internal_mod },
+        },
     });
     const bench_exe = b.addExecutable(.{
         .name = "vfs_concurrent_read_bench",
         .root_module = bench_mod,
     });
     const run_bench = b.addRunArtifact(bench_exe);
-    const bench_step = b.step("bench-read", "Benchmark sequential vs concurrent VFS reads");
+    if (b.args) |args| run_bench.addArgs(args);
+    const bench_step = b.step("bench-read", "Benchmark sequential vs concurrent VFS reads (pass max thread count as -- N)");
     bench_step.dependOn(&run_bench.step);
 
     const vfs_pack_roundtrip = b.addTest(.{

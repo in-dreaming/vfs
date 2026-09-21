@@ -10,6 +10,7 @@ const journal_mod = @import("index/delta_journal.zig");
 const checkpoint_mod = @import("index/checkpoint.zig");
 const alloc_mod = @import("data/allocator.zig");
 const pf = @import("platform/file.zig");
+const sync = @import("platform/sync.zig");
 const inmemory_file_ops = @import("platform/inmemory_file_ops.zig");
 const KEY_LOCK_COUNT: usize = 256;
 
@@ -21,6 +22,11 @@ pub const OpenOptions = struct {
     hash_fn: ?DbHashFn = null,
     hash_user_data: ?*anyopaque = null,
     file_ops: ?pf.CustomFileOps = null,
+    /// Read-only stores may open extra OS handles on the data file so that
+    /// concurrent positional reads are not serialized on one file object
+    /// (Windows synchronous handles). 0 = single handle. Ignored unless
+    /// `mode == .read_only`.
+    read_handles: u8 = 0,
 };
 
 pub const AccessMode = enum(u32) {
@@ -53,19 +59,26 @@ pub const KvDb = struct {
     data: data_mod.DataFile,
     index: *index_mod.IndexFile,
     delta: delta_mod.DeltaIndex,
+    /// Active base index, mapped once at open (and re-mapped after checkpoint /
+    /// optimize) instead of being mmap'ed, verified and unmapped on every
+    /// lookup. `null` when the store has no base region yet.
+    base: ?base_mod.BaseIndex = null,
+    /// Guards `base` replacement in read-write mode. Read-only stores never
+    /// replace it and skip the lock entirely.
+    base_lock: sync.RwLock = .{},
     batch_counter: u64 = 1,
     key_locks: [KEY_LOCK_COUNT]std.atomic.Mutex = [_]std.atomic.Mutex{.unlocked} ** KEY_LOCK_COUNT,
-    batch_lock: std.atomic.Mutex = .unlocked,
-    pending_lock: std.atomic.Mutex = .unlocked,
-    maintenance_lock: std.atomic.Mutex = .unlocked,
+    batch_lock: sync.Mutex = .{},
+    pending_lock: sync.Mutex = .{},
+    maintenance_lock: sync.Mutex = .{},
     pending: std.ArrayList(PendingOp) = .empty,
     mode: AccessMode = .read_write,
     hash_fn: ?DbHashFn = null,
     hash_user_data: ?*anyopaque = null,
     reopen_path: []u8 = &.{},
     reopen_options: OpenOptions = .{},
-    parked: bool = false,
-    park_lock: std.atomic.Mutex = .unlocked,
+    parked: std.atomic.Value(bool) = .init(false),
+    park_lock: sync.Mutex = .{},
 
     pub fn openAt(dir: std.Io.Dir, options: OpenOptions) !KvDb {
         return openIn(.fromOs(dir), options);
@@ -77,7 +90,11 @@ pub const KvDb = struct {
             else => |e| return e,
         };
         errdefer man.close() catch {};
-        var data = data_mod.openIn(dir, "data_000.db", .{}) catch |err| switch (err) {
+        const data_options: data_mod.OpenOptions = .{
+            .read_only = options.mode == .read_only,
+            .read_handles = if (options.mode == .read_only) options.read_handles else 0,
+        };
+        var data = data_mod.openIn(dir, "data_000.db", data_options) catch |err| switch (err) {
             error.FileNotFound => if (options.mode == .read_only or !options.create_if_missing) return err else try data_mod.createIn(dir, "data_000.db", .{ .durability = options.durability }),
             else => |e| return e,
         };
@@ -90,7 +107,7 @@ pub const KvDb = struct {
         };
         errdefer index_ptr.close() catch {};
         const delta_entries = pow2AtLeast(options.max_delta_entries);
-        const delta = if (options.mode == .read_only)
+        var delta = if (options.mode == .read_only)
             delta_mod.openReadOnly(index_ptr) catch |err| switch (err) {
                 error.Busy => try delta_mod.open(index_ptr),
                 error.NotFound => return err,
@@ -101,7 +118,28 @@ pub const KvDb = struct {
                 error.NotFound => try delta_mod.create(index_ptr, delta_entries, journalSizeForEntries(delta_entries)),
                 else => |e| return e,
             };
-        return .{ .dir = dir, .manifest = man, .data = data, .index = index_ptr, .delta = delta, .mode = options.mode, .hash_fn = options.hash_fn, .hash_user_data = options.hash_user_data };
+        errdefer delta.close() catch {};
+        const base = try openBaseIndex(index_ptr);
+        return .{ .dir = dir, .manifest = man, .data = data, .index = index_ptr, .delta = delta, .base = base, .mode = options.mode, .hash_fn = options.hash_fn, .hash_user_data = options.hash_user_data };
+    }
+
+    fn openBaseIndex(index: *const index_mod.IndexFile) !?base_mod.BaseIndex {
+        return base_mod.open(index) catch |err| switch (err) {
+            // Matches the historical lookup semantics: a missing or unreadable
+            // base region behaves like an empty base.
+            error.NotFound, error.Corruption => null,
+            else => |e| return e,
+        };
+    }
+
+    /// Re-map the active base index after checkpoint/optimize rebuilt it.
+    fn refreshBase(self: *KvDb) !void {
+        var fresh = try openBaseIndex(self.index);
+        errdefer if (fresh) |*b| b.close();
+        self.base_lock.lock();
+        defer self.base_lock.unlock();
+        if (self.base) |*old| old.close();
+        self.base = fresh;
     }
 
     pub fn open(path: []const u8, options: OpenOptions) !KvDb {
@@ -125,7 +163,7 @@ pub const KvDb = struct {
     }
 
     pub fn close(self: *KvDb) !void {
-        if (!self.parked) {
+        if (!self.isParked()) {
             if (self.canWrite()) try self.commitPending(null);
             try self.closeFiles();
         }
@@ -139,32 +177,41 @@ pub const KvDb = struct {
             std.heap.smp_allocator.free(self.reopen_path);
             self.reopen_path = &.{};
         }
-        self.parked = false;
+        self.parked.store(false, .release);
     }
 
     pub fn isParked(self: *const KvDb) bool {
-        return self.parked;
+        return self.parked.load(.acquire);
     }
 
     pub fn park(self: *KvDb) !void {
-        lockMutex(&self.park_lock);
+        self.park_lock.lock();
         defer self.park_lock.unlock();
-        if (self.parked) return;
+        if (self.isParked()) return;
         if (self.mode != .read_only) return error.PermissionDenied;
         if (self.reopen_path.len == 0) return error.InvalidArgument;
-        try self.closeFiles();
-        self.parked = true;
+        // Publish "parked" before the files go away so readers racing on the
+        // fast path observe Busy instead of a closed handle. Callers (Volume)
+        // additionally guarantee no reader is pinned while parking.
+        self.parked.store(true, .seq_cst);
+        self.closeFiles() catch |err| {
+            self.parked.store(false, .seq_cst);
+            return err;
+        };
     }
 
     pub fn ensureReady(self: *KvDb) !void {
-        lockMutex(&self.park_lock);
+        if (!self.isParked()) return;
+        self.park_lock.lock();
         defer self.park_lock.unlock();
-        if (!self.parked) return;
+        if (!self.isParked()) return;
         try self.reopenFiles();
-        self.parked = false;
+        self.parked.store(false, .seq_cst);
     }
 
     fn closeFiles(self: *KvDb) !void {
+        if (self.base) |*b| b.close();
+        self.base = null;
         try self.delta.close();
         try self.index.close();
         std.heap.smp_allocator.destroy(self.index);
@@ -189,51 +236,71 @@ pub const KvDb = struct {
         self.data = fresh.data;
         self.index = fresh.index;
         self.delta = fresh.delta;
+        self.base = fresh.base;
         self.mode = fresh.mode;
         self.hash_fn = fresh.hash_fn;
         self.hash_user_data = fresh.hash_user_data;
     }
 
     pub fn discardPending(self: *KvDb) void {
-        lockMutex(&self.pending_lock);
+        self.pending_lock.lock();
         defer self.pending_lock.unlock();
         self.freePending();
         self.pending.clearRetainingCapacity();
     }
 
-    pub fn getSize(self: *KvDb, key: fmt.Key128) !u64 {
+    /// Reads never observe staged (uncommitted) writes, so a read-write store
+    /// flushes them first. A read-only store cannot have any and skips the lock.
+    fn prepareRead(self: *KvDb) !void {
         try self.requireRead();
-        try self.commitPending(null);
-        const info = try self.lookupInfoNoLock(key);
+        if (self.canWrite()) try self.commitPending(null);
+    }
+
+    pub fn getSize(self: *KvDb, key: fmt.Key128) !u64 {
+        try self.prepareRead();
+        const info = try self.lookupInfo(key);
         return info.raw_size;
     }
 
     pub fn getInto(self: *KvDb, key: fmt.Key128, dst: []u8) !usize {
-        try self.requireRead();
-        try self.commitPending(null);
-        const info = try self.lookupInfoNoLock(key);
+        try self.prepareRead();
+        const info = try self.lookupInfo(key);
         return data_mod.readPayload(&self.data, info.offset, key, dst);
     }
 
-    pub fn getSizeBytes(self: *KvDb, key_bytes: []const u8) !u64 {
+    /// Index lookup by raw key, with the stored key bytes confirmed against
+    /// `key_bytes` (hash collisions report NotFound). Reads only header+key.
+    pub fn lookupBytes(self: *KvDb, key_bytes: []const u8) !fmt.IndexInfo {
         const key = try self.keyFromBytes(key_bytes);
-        try self.requireRead();
-        try self.commitPending(null);
-        const info = try self.lookupInfoNoLock(key);
-        if (key_bytes.len != 0) {
-            const tmp = try std.heap.smp_allocator.alloc(u8, info.raw_size);
-            defer std.heap.smp_allocator.free(tmp);
-            _ = try data_mod.readPayloadRawKey(&self.data, info.offset, key, key_bytes, tmp);
-        }
+        try self.prepareRead();
+        const info = try self.lookupInfo(key);
+        if (key_bytes.len != 0) _ = try self.data.readMetaCheckKey(info.offset, key, key_bytes);
+        return info;
+    }
+
+    pub fn getSizeBytes(self: *KvDb, key_bytes: []const u8) !u64 {
+        const info = try self.lookupBytes(key_bytes);
         return info.raw_size;
     }
 
     pub fn getIntoBytes(self: *KvDb, key_bytes: []const u8, dst: []u8) !usize {
         const key = try self.keyFromBytes(key_bytes);
-        try self.requireRead();
-        try self.commitPending(null);
-        const info = try self.lookupInfoNoLock(key);
-        return data_mod.readPayloadRawKey(&self.data, info.offset, key, key_bytes, dst);
+        try self.prepareRead();
+        const info = try self.lookupInfo(key);
+        if (dst.len < info.raw_size) return error.BufferTooSmall;
+        const payload = try self.data.readRecordBorrow(info.offset, key, key_bytes, info.stored_size);
+        @memcpy(dst[0..payload.len], payload);
+        return payload.len;
+    }
+
+    /// Single-syscall value read. The returned slice lives in a thread-local
+    /// scratch buffer and is valid until the next borrowed/positional read on
+    /// the same thread. Callers that need to keep the bytes must copy them.
+    pub fn getBorrowedBytes(self: *KvDb, key_bytes: []const u8) ![]const u8 {
+        const key = try self.keyFromBytes(key_bytes);
+        try self.prepareRead();
+        const info = try self.lookupInfo(key);
+        return self.data.readRecordBorrow(info.offset, key, key_bytes, info.stored_size);
     }
 
     pub fn put(self: *KvDb, key: fmt.Key128, data: []const u8, options: PutOptions) !void {
@@ -242,7 +309,7 @@ pub const KvDb = struct {
         errdefer std.heap.smp_allocator.free(owned_key);
         const owned = try std.heap.smp_allocator.dupe(u8, data);
         errdefer std.heap.smp_allocator.free(owned);
-        lockMutex(&self.pending_lock);
+        self.pending_lock.lock();
         defer self.pending_lock.unlock();
         try self.pending.append(std.heap.smp_allocator, .{ .put = .{ .key = key, .key_bytes = owned_key, .data = owned, .flags = options.flags, .durability = options.durability } });
     }
@@ -254,7 +321,7 @@ pub const KvDb = struct {
         errdefer std.heap.smp_allocator.free(owned_key);
         const owned_data = try std.heap.smp_allocator.dupe(u8, data);
         errdefer std.heap.smp_allocator.free(owned_data);
-        lockMutex(&self.pending_lock);
+        self.pending_lock.lock();
         defer self.pending_lock.unlock();
         try self.pending.append(std.heap.smp_allocator, .{ .put = .{ .key = key, .key_bytes = owned_key, .data = owned_data, .flags = options.flags, .durability = options.durability } });
     }
@@ -267,7 +334,7 @@ pub const KvDb = struct {
 
     pub fn delete(self: *KvDb, key: fmt.Key128, options: DeleteOptions) !void {
         try self.requireWrite();
-        lockMutex(&self.pending_lock);
+        self.pending_lock.lock();
         defer self.pending_lock.unlock();
         try self.pending.append(std.heap.smp_allocator, .{ .delete = .{ .key = key, .durability = options.durability } });
     }
@@ -284,21 +351,23 @@ pub const KvDb = struct {
     pub fn checkpoint(self: *KvDb) !void {
         try self.requireWrite();
         try self.commitPending(null);
-        lockMutex(&self.maintenance_lock);
+        self.maintenance_lock.lock();
         defer self.maintenance_lock.unlock();
         try checkpoint_mod.run(self, std.heap.smp_allocator);
+        try self.refreshBase();
     }
 
     pub fn optimize(self: *KvDb) !void {
         try self.requireWrite();
         try self.commitPending(null);
-        lockMutex(&self.maintenance_lock);
+        self.maintenance_lock.lock();
         defer self.maintenance_lock.unlock();
         try self.optimizeNoConcurrentAccess(std.heap.smp_allocator);
+        try self.refreshBase();
     }
 
     pub fn nextBatchId(self: *KvDb) u64 {
-        lockMutex(&self.batch_lock);
+        self.batch_lock.lock();
         defer self.batch_lock.unlock();
         return self.nextBatchIdNoLock();
     }
@@ -322,7 +391,7 @@ pub const KvDb = struct {
     }
 
     pub fn beginBatchCommit(self: *KvDb) void {
-        lockMutex(&self.batch_lock);
+        self.batch_lock.lock();
     }
 
     pub fn endBatchCommit(self: *KvDb) void {
@@ -366,7 +435,7 @@ pub const KvDb = struct {
             .tail_free_bytes = 0,
             .mmap_index_bytes = pf.len(self.index.file) catch 0,
         };
-        lockMutex(&self.pending_lock);
+        self.pending_lock.lock();
         out.pending_ops = self.pending.items.len;
         self.pending_lock.unlock();
         if (data_mod.currentSuper(&self.data)) |sb| {
@@ -382,16 +451,16 @@ pub const KvDb = struct {
     }
 
     pub fn commitPending(self: *KvDb, durability_override: ?fmt.Durability) !void {
-        lockMutex(&self.pending_lock);
+        self.pending_lock.lock();
         if (self.pending.items.len == 0) {
             self.pending_lock.unlock();
             return;
         }
         self.pending_lock.unlock();
 
-        lockMutex(&self.batch_lock);
+        self.batch_lock.lock();
         defer self.batch_lock.unlock();
-        lockMutex(&self.pending_lock);
+        self.pending_lock.lock();
         defer self.pending_lock.unlock();
         if (self.pending.items.len == 0) return;
         try self.requireWrite();
@@ -473,22 +542,26 @@ pub const KvDb = struct {
     }
 
     fn lookupMetaNoLock(self: *KvDb, key: fmt.Key128) !data_mod.RecordMeta {
-        const info = try self.lookupInfoNoLock(key);
+        const info = try self.lookupInfo(key);
         return data_mod.readMeta(&self.data, info.offset);
     }
 
-    fn lookupInfoNoLock(self: *KvDb, key: fmt.Key128) !fmt.IndexInfo {
+    /// delta first, then the cached base index. Lock-free for read-only stores;
+    /// a read-write store takes `base_lock` shared so checkpoint/optimize can
+    /// swap the mapping underneath concurrent readers.
+    fn lookupInfo(self: *KvDb, key: fmt.Key128) !fmt.IndexInfo {
         switch (try self.delta.lookup(key)) {
             .found => |info| return info,
             .deleted => return error.NotFound,
             .not_found => {},
         }
-        var base = base_mod.open(self.index) catch |err| switch (err) {
-            error.NotFound => return error.NotFound,
-            error.Corruption => return error.NotFound,
-            else => |e| return e,
-        };
-        defer base.close();
+        if (self.mode == .read_only) {
+            const base = &(self.base orelse return error.NotFound);
+            return base.lookup(key);
+        }
+        self.base_lock.lockShared();
+        defer self.base_lock.unlockShared();
+        const base = &(self.base orelse return error.NotFound);
         return base.lookup(key);
     }
 
@@ -505,7 +578,7 @@ pub const KvDb = struct {
     }
 
     fn requireRead(self: *const KvDb) !void {
-        if (self.parked) return error.Busy;
+        if (self.isParked()) return error.Busy;
         if (!self.canRead()) return error.PermissionDenied;
     }
 
@@ -730,7 +803,7 @@ pub const db_info_t = extern struct {
 };
 
 pub const HandleKind = enum(u8) { db, batch, snapshot };
-var handle_lock: std.atomic.Mutex = .unlocked;
+var handle_lock: sync.RwLock = .{};
 var handles: std.AutoHashMapUnmanaged(u64, HandleKind) = .empty;
 
 threadlocal var last_status: c_int = @intFromEnum(fmt.DbStatus.ok);
@@ -757,22 +830,22 @@ pub fn setOk() c_int {
 }
 
 pub fn registerHandle(handle: u64, kind: HandleKind) !void {
-    lockMutex(&handle_lock);
+    handle_lock.lock();
     defer handle_lock.unlock();
     try handles.put(std.heap.smp_allocator, handle, kind);
 }
 
 pub fn unregisterHandle(handle: u64) void {
-    lockMutex(&handle_lock);
+    handle_lock.lock();
     defer handle_lock.unlock();
     _ = handles.remove(handle);
 }
 
 pub fn validateHandle(comptime T: type, handle: u64, kind: HandleKind) !*T {
     if (handle == 0) return error.InvalidArgument;
-    lockMutex(&handle_lock);
+    handle_lock.lockShared();
     const found = handles.get(handle);
-    handle_lock.unlock();
+    handle_lock.unlockShared();
     if (found == null or found.? != kind) return error.InvalidArgument;
     return @ptrFromInt(handle);
 }

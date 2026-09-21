@@ -12,9 +12,15 @@ pub fn decodeNone(input: []const u8, expected_raw_size: usize) ![]const u8 {
     return input;
 }
 
+/// Pass-through "decompression": returns an owned copy of `stored`.
+///
+/// Callers obtain `stored` from `page_value.decodePageValue`, which has already
+/// verified `crc32c(stored) == stored_crc == raw_crc` for this codec, so the
+/// crc is not recomputed here. Codecs that actually transform bytes must
+/// verify `raw_crc` over their output instead.
 pub fn decompressPage(allocator: std.mem.Allocator, stored: []const u8, raw_size: u32, raw_crc: u32) ![]u8 {
+    _ = raw_crc;
     if (stored.len != raw_size) return error.Corruption;
-    if (fmt.crc32c(stored) != raw_crc) return error.ChecksumMismatch;
     return allocator.dupe(u8, stored);
 }
 
@@ -26,4 +32,5 @@ test "none codec is pass-through and validates raw size" {
     const owned = try decompressPage(std.testing.allocator, data, data.len, fmt.crc32c(data));
     defer std.testing.allocator.free(owned);
     try std.testing.expectEqualSlices(u8, data, owned);
+    try std.testing.expectError(error.Corruption, decompressPage(std.testing.allocator, data, data.len + 1, 0));
 }

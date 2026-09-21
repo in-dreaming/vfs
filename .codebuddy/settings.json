@@ -1,0 +1,21 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "GOLDEN_EVAL_MODEL_GUARD='1' python3 $CODEBUDDY_PROJECT_DIR/.codebuddy/hooks/golden_eval-guard.py 'blind-model-b' '测试模型 B'",
+            "timeout": 10,
+            "metadata": {
+              "managed_by": "golden_eval",
+              "guard_type": "model",
+              "description": "Golden Eval 模型拦截：检测用户选错模型时阻止发送。修改上方 command 中的 GOLDEN_EVAL_MODEL_GUARD 为 0 关闭。"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "_goldenEval": "以下 UserPromptSubmit Hook 由混元智囊团众测模式管理，用于阻止选错模型"
+}

@@ -7,9 +7,11 @@ const file_mod = @import("io/file_handle.zig");
 pub const vfs_open_options_t = extern struct {
     struct_size: u32,
     flags: u32,
-    reserved0: u64,
+    /// Decoded page cache budget in bytes; 0 = default.
+    page_cache_bytes: u64 = 0,
     max_open_stores: u32 = 0,
-    reserved1: u32 = 0,
+    /// Extra read-only OS handles per pack data file; 0 = default.
+    read_handles: u32 = 0,
 };
 
 pub const vfs_stat_t = extern struct {
@@ -51,8 +53,14 @@ fn optionsFromC(options: ?*const vfs_open_options_t) !volume_mod.OpenOptions {
     const opts = options orelse return .{};
     if (opts.struct_size < @offsetOf(vfs_open_options_t, "flags") + @sizeOf(u32)) return error.InvalidArgument;
     var out = volume_mod.OpenOptions{ .flags = opts.flags };
+    if (opts.struct_size >= @offsetOf(vfs_open_options_t, "page_cache_bytes") + @sizeOf(u64) and opts.page_cache_bytes != 0) {
+        out.page_cache_bytes = std.math.cast(usize, opts.page_cache_bytes) orelse return error.InvalidArgument;
+    }
     if (opts.struct_size >= @offsetOf(vfs_open_options_t, "max_open_stores") + @sizeOf(u32) and opts.max_open_stores != 0) {
         out.max_open_stores = opts.max_open_stores;
+    }
+    if (opts.struct_size >= @offsetOf(vfs_open_options_t, "read_handles") + @sizeOf(u32) and opts.read_handles != 0) {
+        out.read_handles = std.math.cast(u8, opts.read_handles) orelse return error.InvalidArgument;
     }
     return out;
 }
@@ -101,22 +109,26 @@ pub export fn vfs_mount_pack(volume: u64, pack_path: ?[*:0]const u8, priority: u
     return setOk();
 }
 
+/// Accepted `flags` for vfs_open_path / vfs_open_entry (mirrors vfs.h).
+pub const VFS_OPEN_STREAMING: u32 = file_mod.OPEN_FLAG_STREAMING;
+const OPEN_FLAGS_MASK: u32 = VFS_OPEN_STREAMING;
+
 pub export fn vfs_open_path(volume: u64, path: ?[*:0]const u8, flags: u32, out_file: ?*u64) c_int {
-    _ = flags;
     const out = out_file orelse return setStatus(.invalid_argument, "out_file is null");
     out.* = 0;
+    if ((flags & ~OPEN_FLAGS_MASK) != 0) return setStatus(.invalid_argument, "unknown open flags");
     const v = registry.validate(volume_mod.Volume, volume, .volume) catch |e| return setError(e);
     const p = spanZ(path) catch |e| return setError(e);
-    return openFileHandle(volume, out, v.openPath(volume, p));
+    return openFileHandle(volume, out, v.openPathWithFlags(volume, p, flags));
 }
 
 pub export fn vfs_open_entry(volume: u64, file_entry: u64, flags: u32, out_file: ?*u64) c_int {
-    _ = flags;
     const out = out_file orelse return setStatus(.invalid_argument, "out_file is null");
     out.* = 0;
+    if ((flags & ~OPEN_FLAGS_MASK) != 0) return setStatus(.invalid_argument, "unknown open flags");
     const v = registry.validate(volume_mod.Volume, volume, .volume) catch |e| return setError(e);
     if (file_entry == 0) return setStatus(.invalid_argument, "file_entry is zero");
-    return openFileHandle(volume, out, v.openEntry(volume, file_entry));
+    return openFileHandle(volume, out, v.openEntryWithFlags(volume, file_entry, flags));
 }
 
 pub export fn vfs_stat_path(volume: u64, path: ?[*:0]const u8, out_stat: ?*vfs_stat_t) c_int {
@@ -549,6 +561,52 @@ fn mountPackForTest(volume: u64, pack_path: []const u8, priority: u32) !c_int {
     return vfs_mount_pack(volume, z_pack_path.ptr, priority, 0);
 }
 
+test "vfs abi streaming flag reads whole pages without caching and rejects unknown flags" {
+    const builder = @import("build/pack_builder.zig");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const pack_path = "zig-cache-vfs-abi-streaming-pack";
+    const source_path = "zig-cache-vfs-abi-streaming-source.bin";
+    _ = std.Io.Dir.cwd().deleteTree(io, pack_path) catch {};
+    _ = std.Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, pack_path) catch {};
+    defer _ = std.Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    var payload: [4096 * 3 + 100]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i *% 31);
+    try builder.writeSourceFileForTest(source_path, &payload);
+    try builder.createPack(pack_path, &.{.{ .source_path = source_path, .virtual_path = "/s.bin", .file_entry = 8201, .page_size = 4096 }}, .{});
+
+    var volume: u64 = 0;
+    try std.testing.expectEqual(err.code(.ok), vfs_open_volume("root", null, &volume));
+    defer _ = vfs_close_volume(volume);
+    try std.testing.expectEqual(err.code(.ok), try mountPackForTest(volume, pack_path, 1));
+
+    var file: u64 = 0;
+    try std.testing.expectEqual(err.code(.invalid_argument), vfs_open_entry(volume, 8201, 0x80, &file));
+    try std.testing.expectEqual(err.code(.ok), vfs_open_entry(volume, 8201, VFS_OPEN_STREAMING, &file));
+    defer _ = vfs_close_file(file);
+
+    const v: *volume_mod.Volume = @ptrFromInt(volume);
+    var out: [payload.len]u8 = undefined;
+    var n: u64 = 0;
+    // Whole-file read: every page (including the short 100-byte tail page) is
+    // read in full, so all of them stream past the cache.
+    try std.testing.expectEqual(err.code(.ok), vfs_read_at(file, 0, &out, out.len, &n));
+    try std.testing.expectEqual(@as(u64, payload.len), n);
+    try std.testing.expectEqualSlices(u8, &payload, &out);
+    try std.testing.expectEqual(@as(usize, 0), v.page_cache.residentCount());
+    // Unaligned read through the same handle touches two partial pages, which
+    // go through the cache and must be exact.
+    var mid: [5000]u8 = undefined;
+    try std.testing.expectEqual(err.code(.ok), vfs_read_at(file, 1000, &mid, mid.len, &n));
+    try std.testing.expectEqual(@as(u64, mid.len), n);
+    try std.testing.expectEqualSlices(u8, payload[1000..6000], &mid);
+    try std.testing.expectEqual(@as(usize, 2), v.page_cache.residentCount());
+    // A resident page is served from the cache even on the streaming handle.
+    var page1: [4096]u8 = undefined;
+    try std.testing.expectEqual(err.code(.ok), vfs_read_at(file, 4096, &page1, page1.len, &n));
+    try std.testing.expectEqualSlices(u8, payload[4096..8192], &page1);
+}
+
 test "vfs abi concurrent read_at on one volume" {
     const builder = @import("build/pack_builder.zig");
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -565,9 +623,9 @@ test "vfs abi concurrent read_at on one volume" {
     var opts = vfs_open_options_t{
         .struct_size = @sizeOf(vfs_open_options_t),
         .flags = 0,
-        .reserved0 = 0,
+        .page_cache_bytes = 0,
         .max_open_stores = 2,
-        .reserved1 = 0,
+        .read_handles = 0,
     };
     var volume: u64 = 0;
     try std.testing.expectEqual(err.code(.ok), vfs_open_volume("root", &opts, &volume));
