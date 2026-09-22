@@ -23,9 +23,13 @@ pub const OPEN_FLAG_STREAMING: u32 = 1 << 0;
 pub const FileHandle = struct {
     volume_handle: u64,
     volume: *volume_mod.Volume,
-    /// The mount this file's manifest was resolved from. Stable for the
+    /// Top layer for page resolution: the overlay when one is mounted for
+    /// this pack, otherwise the mount the manifest came from. Stable for the
     /// volume's lifetime; pinned once per `readAt` instead of once per page.
     mounted: *volume_mod.Volume.MountedPack,
+    /// Base layer that implicit page reads fall through to when `mounted`
+    /// is an overlay and does not hold the page.
+    base: ?*volume_mod.Volume.MountedPack = null,
     pack_id: u32,
     pack_generation: u64,
     file_entry: u64,
@@ -52,7 +56,6 @@ pub const FileHandle = struct {
         defer self.volume.unpinMounted(self.mounted);
 
         for (self.manifest.blocks, 0..) |block, block_i| {
-            if (block.codec != .none) return error.UnsupportedFeature;
             if (block.page_size == 0 and block.page_count != 0) return error.Corruption;
             const block_start = block.raw_offset;
             const block_end = block.raw_offset + block.raw_size;
@@ -106,28 +109,26 @@ pub const FileHandle = struct {
                 };
 
                 const whole_page = page_off == 0 and copy_len == page_end - page_start;
-                if (!explicit_refs and whole_page and (self.flags & OPEN_FLAG_STREAMING) != 0) {
-                    try self.volume.page_cache.readThrough(
-                        self.mounted.reader,
-                        cache_key,
-                        source.identity,
-                        block.codec,
-                        source.page_key,
-                        dst[copied..][0..copy_len],
-                    );
-                } else if (!explicit_refs) {
-                    try self.volume.page_cache.copyRange(
-                        std.heap.smp_allocator,
-                        self.mounted.reader,
-                        cache_key,
-                        source.identity,
-                        block.codec,
-                        source.page_key,
-                        page_off,
-                        dst[copied..][0..copy_len],
-                        null,
-                        null,
-                    );
+                if (!explicit_refs) {
+                    // Implicit key: the page lives in our layer or, for an
+                    // overlay, falls through to the base layer. A placeholder
+                    // in our layer terminates the search.
+                    const streaming = whole_page and (self.flags & OPEN_FLAG_STREAMING) != 0;
+                    self.readImplicit(self.mounted, cache_key, source, block.codec, page_off, dst[copied..][0..copy_len], streaming) catch |e| switch (e) {
+                        error.NotFound => {
+                            const base = self.base orelse return error.NotFound;
+                            try self.volume.pinMounted(base);
+                            defer self.volume.unpinMounted(base);
+                            var base_key = cache_key;
+                            base_key.pack_generation = base.mount_order.load(.acquire);
+                            self.readImplicit(base, base_key, source, block.codec, page_off, dst[copied..][0..copy_len], streaming) catch |e2| switch (e2) {
+                                error.PagePlaceholder => return error.NotFound,
+                                else => |err| return err,
+                            };
+                        },
+                        error.PagePlaceholder => return error.NotFound,
+                        else => |err| return err,
+                    };
                 } else {
                     const foreign = try self.volume.pinStoreMounted(source.pack_id, source.pack_generation);
                     defer self.volume.unpinMounted(foreign);
@@ -148,5 +149,21 @@ pub const FileHandle = struct {
             }
         }
         return copied;
+    }
+
+    fn readImplicit(
+        self: *FileHandle,
+        layer: *volume_mod.Volume.MountedPack,
+        cache_key: @import("page_cache.zig").PageCacheKey,
+        source: PageSource,
+        codec: file_manifest_fmt.Codec,
+        page_off: usize,
+        dst: []u8,
+        streaming: bool,
+    ) !void {
+        if (streaming) {
+            return self.volume.page_cache.readThrough(layer.reader, cache_key, source.identity, codec, source.page_key, dst);
+        }
+        return self.volume.page_cache.copyRange(std.heap.smp_allocator, layer.reader, cache_key, source.identity, codec, source.page_key, page_off, dst, null, null);
     }
 };

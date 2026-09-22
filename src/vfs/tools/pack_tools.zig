@@ -13,6 +13,9 @@ const path_index_fmt = @import("../format/path_index.zig");
 const file_manifest_fmt = @import("../format/file_manifest.zig");
 const page_value_fmt = @import("../format/page_value.zig");
 const tombstone_fmt = @import("../format/tombstone.zig");
+const page_placeholder_fmt = @import("../format/page_placeholder.zig");
+const patch_intent_fmt = @import("../format/patch_intent.zig");
+const directory_manifest_fmt = @import("../format/directory_manifest.zig");
 const registry = @import("../compress/registry.zig");
 const volume_mod = @import("../volume/volume.zig");
 const volume_staging = @import("../volume/staging.zig");
@@ -46,6 +49,11 @@ pub const IssueKind = enum {
     manifest_file_count_mismatch,
     manifest_tombstone_count_mismatch,
     volume_manifest_invalid,
+    /// A patch was interrupted: PatchIntent still present.
+    patch_in_progress,
+    page_placeholder_invalid,
+    /// Placeholders only make sense in an overlay pack.
+    placeholder_in_non_overlay,
 };
 
 pub const Issue = struct {
@@ -126,6 +134,7 @@ const ScanState = struct {
     tombstone_count: u64 = 0,
     pack_manifest_count: u64 = 0,
     path_index_count: u64 = 0,
+    placeholder_count: u64 = 0,
 
     fn init(allocator: std.mem.Allocator) ScanState {
         return .{ .file_entries = std.AutoHashMap(u64, void).init(allocator) };
@@ -303,6 +312,25 @@ fn scanLiveObjects(db: *kv.KvDb, allocator: std.mem.Allocator, report: *VerifyRe
                 continue;
             };
             scan.tombstone_count += 1;
+        } else if (magic == page_placeholder_fmt.MAGIC) {
+            const file_entry = if (bytes.len >= 16) fmt.getU64(bytes, 8) else 0;
+            const block_index = if (bytes.len >= 20) fmt.getU32(bytes, 16) else 0;
+            const page_index = if (bytes.len >= 24) fmt.getU32(bytes, 20) else 0;
+            const expected_key = object_key.pageKey(file_entry, block_index, page_index) catch 0;
+            if (expected_key == 0 or !try keyMatchesObject(db, entry.key, expected_key)) {
+                try report.add(allocator, .{ .kind = .page_key_mismatch, .object_key = expected_key, .file_entry = file_entry, .block_index = block_index, .page_index = page_index });
+            }
+            _ = page_placeholder_fmt.decode(bytes, .{ .file_entry = file_entry, .block_index = block_index, .page_index = page_index }) catch {
+                try report.add(allocator, .{ .kind = .page_placeholder_invalid, .object_key = expected_key, .file_entry = file_entry, .block_index = block_index, .page_index = page_index });
+                continue;
+            };
+            scan.placeholder_count += 1;
+        } else if (magic == patch_intent_fmt.MAGIC) {
+            try report.add(allocator, .{ .kind = .patch_in_progress, .object_key = object_key.patchIntentKey() });
+        } else if (magic == directory_manifest_fmt.MAGIC) {
+            if (!try keyMatchesObject(db, entry.key, object_key.directoryManifestKey())) {
+                try report.add(allocator, .{ .kind = .unknown_object, .object_key = object_key.directoryManifestKey() });
+            }
         } else {
             try report.add(allocator, .{ .kind = .unknown_object });
         }
@@ -316,11 +344,18 @@ fn finishScanChecks(allocator: std.mem.Allocator, report: *VerifyReport, scan: *
         }
     }
     if (manifest) |m| {
-        if (m.file_count != scan.manifests.items.len) {
-            try report.add(allocator, .{ .kind = .manifest_file_count_mismatch });
-        }
-        if (m.tombstone_count != scan.tombstone_count) {
-            try report.add(allocator, .{ .kind = .manifest_tombstone_count_mismatch });
+        // Overlay packs hold only a subset of the logical pack; their counts
+        // describe the merged view and cannot be checked locally.
+        if (!m.isOverlay()) {
+            if (m.file_count != scan.manifests.items.len) {
+                try report.add(allocator, .{ .kind = .manifest_file_count_mismatch });
+            }
+            if (m.tombstone_count != scan.tombstone_count) {
+                try report.add(allocator, .{ .kind = .manifest_tombstone_count_mismatch });
+            }
+            if (scan.placeholder_count != 0) {
+                try report.add(allocator, .{ .kind = .placeholder_in_non_overlay });
+            }
         }
     }
 }
@@ -354,12 +389,18 @@ fn verifyExpectedPages(db: *kv.KvDb, allocator: std.mem.Allocator, report: *Veri
                 };
                 const page_bytes = readObjectAlloc(db, allocator, key) catch |e| switch (e) {
                     error.NotFound => {
+                        // An overlay's manifest may reference pages that live in the base layer.
+                        if (pack_manifest.isOverlay()) continue;
                         try report.add(allocator, .{ .kind = if ((block.flags & file_manifest_fmt.BLOCK_FLAG_EXPLICIT_PAGE_REFS) != 0) .page_ref_missing else .page_missing, .object_key = key, .file_entry = identity.file_entry, .block_index = identity.block_index, .page_index = identity.page_index });
                         continue;
                     },
                     else => |err| return err,
                 };
                 defer allocator.free(page_bytes);
+                if (page_placeholder_fmt.isPlaceholder(page_bytes)) {
+                    if (!pack_manifest.isOverlay()) try report.add(allocator, .{ .kind = .placeholder_in_non_overlay, .object_key = key, .file_entry = identity.file_entry, .block_index = identity.block_index, .page_index = identity.page_index });
+                    continue;
+                }
                 const page = page_value_fmt.decodePageValue(page_bytes, identity) catch {
                     try report.add(allocator, .{ .kind = if ((block.flags & file_manifest_fmt.BLOCK_FLAG_EXPLICIT_PAGE_REFS) != 0) .page_ref_identity_mismatch else .page_invalid, .object_key = key, .file_entry = identity.file_entry, .block_index = identity.block_index, .page_index = identity.page_index });
                     continue;

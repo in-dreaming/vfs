@@ -37,6 +37,44 @@ pub fn entryTombstoneKey(file_entry: u64) !ObjectKey {
     return key;
 }
 
+/// Marks an in-progress patch on the target pack (docs/vfs/diff_patch.md §14).
+pub fn patchIntentKey() ObjectKey {
+    return hash.hash64("vfs.object.singleton.v1", "patch-intent");
+}
+
+// ---- DiffPack object keys (a DiffPack is its own libdb store) ----
+
+pub fn diffManifestKey() ObjectKey {
+    return hash.hash64("vfs.diff.singleton.v1", "diff-manifest");
+}
+
+pub fn diffFileOpTableKey() ObjectKey {
+    return hash.hash64("vfs.diff.singleton.v1", "file-op-table");
+}
+
+pub fn diffPathDeltaKey() ObjectKey {
+    return hash.hash64("vfs.diff.singleton.v1", "path-delta");
+}
+
+pub fn diffUnitTableKey(shard: u32) ObjectKey {
+    return hash.hashIdentity1("vfs.diff.unit-table.v1", shard);
+}
+
+pub fn diffChunkKey(chunk_id: u32) ObjectKey {
+    return hash.hashIdentity1("vfs.diff.chunk.v1", chunk_id);
+}
+
+/// Data shard used by builders and patchers for every object of a file
+/// (pages, manifest, tombstone). Keeping a file inside one shard makes a
+/// patch unit's writes atomic within one shard batch and keeps its pages
+/// physically adjacent. The DB itself routes reads by `IndexInfo.data_db_id`,
+/// so this is a placement policy, not a lookup rule.
+pub fn fileShard(file_entry: u64, shard_count: u32) u32 {
+    if (shard_count <= 1 or file_entry == 0) return 0;
+    const h = std.hash.Wyhash.hash(0x7366735f73686172, std.mem.asBytes(&file_entry));
+    return @intCast(h % shard_count);
+}
+
 pub fn encodeDbKey(key: ObjectKey) [8]u8 {
     var b = [_]u8{0} ** 8;
     fmt.putU64(&b, 0, key);
@@ -47,8 +85,8 @@ pub fn decodeDbKey(bytes: *const [8]u8) ObjectKey {
     return fmt.getU64(bytes, 0);
 }
 
-pub fn reservedKeys() [4]ObjectKey {
-    return .{ 0, packManifestKey(), pathIndexKey(), directoryManifestKey() };
+pub fn reservedKeys() [5]ObjectKey {
+    return .{ 0, packManifestKey(), pathIndexKey(), directoryManifestKey(), patchIntentKey() };
 }
 
 pub fn isReservedKey(key: ObjectKey) bool {

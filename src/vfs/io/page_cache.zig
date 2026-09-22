@@ -15,6 +15,7 @@ const std = @import("std");
 const pack_reader = @import("../pack/pack_reader.zig");
 const page_value_fmt = @import("../format/page_value.zig");
 const file_manifest_fmt = @import("../format/file_manifest.zig");
+const page_placeholder_fmt = @import("../format/page_placeholder.zig");
 const registry = @import("../compress/registry.zig");
 const object_key = @import("../object_key.zig");
 const hash = @import("../hash.zig");
@@ -220,11 +221,24 @@ pub const PageCache = struct {
             shard.stats.misses += 1;
             shard.lock.unlock();
         }
-        if (codec != .none) return error.UnsupportedFeature;
         const page_bytes = try reader.readObjectBorrow(page_object_key);
+        if (page_placeholder_fmt.isPlaceholder(page_bytes)) {
+            _ = try page_placeholder_fmt.decode(page_bytes, expected);
+            return error.PagePlaceholder;
+        }
         const page = try page_value_fmt.decodePageValue(page_bytes, expected);
-        if (page.payload.len != page.raw_size or page.payload.len != dst.len) return error.Corruption;
-        @memcpy(dst, page.payload);
+        if (page.codec != codec and page.codec != .none) return error.Corruption;
+        if (page.raw_size != dst.len) return error.Corruption;
+        if (page.codec == .none) {
+            if (page.payload.len != page.raw_size) return error.Corruption;
+            @memcpy(dst, page.payload);
+            return;
+        }
+        // Streaming path for compressed pages: decode into a scratch buffer
+        // and copy; still bypasses the cache.
+        const raw = try registry.decompressPage(std.heap.smp_allocator, page.codec, page.payload, page.raw_size, page.raw_crc);
+        defer std.heap.smp_allocator.free(raw);
+        @memcpy(dst, raw);
     }
 
     pub fn getOrLoad(
@@ -415,8 +429,16 @@ fn loadPage(
     expect_hash: ?[32]u8,
 ) ![]u8 {
     const page_bytes = try reader.readObjectBorrow(page_object_key);
+    if (page_placeholder_fmt.isPlaceholder(page_bytes)) {
+        _ = try page_placeholder_fmt.decode(page_bytes, expected);
+        return error.PagePlaceholder;
+    }
     const page = try page_value_fmt.decodePageValue(page_bytes, expected);
-    const raw = try registry.decompressPage(allocator, codec, page.payload, page.raw_size, page.raw_crc);
+    // The block declares the codec the builder asked for; the page header
+    // records what was actually stored (a page that did not shrink is kept
+    // raw with codec none). Both are legal; the page header is authoritative.
+    if (page.codec != codec and page.codec != .none) return error.Corruption;
+    const raw = try registry.decompressPage(allocator, page.codec, page.payload, page.raw_size, page.raw_crc);
     errdefer allocator.free(raw);
     if (expect_crc) |crc| {
         if (hash.crc32c(raw) != crc) return error.ChecksumMismatch;

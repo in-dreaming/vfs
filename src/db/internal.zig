@@ -1,4 +1,5 @@
 pub const kv_db = @import("kv_db.zig");
+pub const batch_snapshot = @import("batch_snapshot.zig");
 pub const format = @import("format.zig");
 pub const platform = struct {
     pub const file = @import("platform/file.zig");

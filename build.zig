@@ -151,7 +151,10 @@ pub fn build(b: *std.Build) void {
 
     const smoke_assets = b.addWriteFiles();
     const smoke_payload = smoke_assets.add("a.bin", "hello-vfs-cabi");
+    const smoke_payload_v2 = smoke_assets.add("a_v2.bin", "hello-vfs-cabi-v2-patched");
     const smoke_pack_dir = ".zig-cache/vfs_cabi_smoke_pack";
+    const smoke_pack_v2_dir = ".zig-cache/vfs_cabi_smoke_pack_v2";
+    const smoke_diff_dir = ".zig-cache/vfs_cabi_smoke_diff";
 
     const prepare_pack = b.addRunArtifact(vfs_exe);
     prepare_pack.addArg("put-file");
@@ -159,10 +162,33 @@ pub fn build(b: *std.Build) void {
     prepare_pack.addArg("/textures/a.bin");
     prepare_pack.addArg("1001");
     prepare_pack.addFileArg(smoke_payload);
+    prepare_pack.addArg("1");
+    // The smoke patches the v1 pack in place; always rebuild it first.
+    prepare_pack.has_side_effects = true;
+
+    const prepare_pack_v2 = b.addRunArtifact(vfs_exe);
+    prepare_pack_v2.addArg("put-file");
+    prepare_pack_v2.addArg(smoke_pack_v2_dir);
+    prepare_pack_v2.addArg("/textures/a.bin");
+    prepare_pack_v2.addArg("1001");
+    prepare_pack_v2.addFileArg(smoke_payload_v2);
+    prepare_pack_v2.addArg("2");
+    prepare_pack_v2.has_side_effects = true;
+
+    const prepare_diff = b.addRunArtifact(vfs_exe);
+    prepare_diff.addArg("diff-pack");
+    prepare_diff.addArg(smoke_pack_dir);
+    prepare_diff.addArg(smoke_pack_v2_dir);
+    prepare_diff.addArg(smoke_diff_dir);
+    prepare_diff.has_side_effects = true;
+    prepare_diff.step.dependOn(&prepare_pack.step);
+    prepare_diff.step.dependOn(&prepare_pack_v2.step);
 
     const run_vfs_cabi_smoke = b.addRunArtifact(vfs_cabi_smoke);
     run_vfs_cabi_smoke.addArg(smoke_pack_dir);
-    run_vfs_cabi_smoke.step.dependOn(&prepare_pack.step);
+    run_vfs_cabi_smoke.addArg(smoke_diff_dir);
+    run_vfs_cabi_smoke.has_side_effects = true;
+    run_vfs_cabi_smoke.step.dependOn(&prepare_diff.step);
 
     const run_tests = b.addRunArtifact(tests);
     const run_vfs_tests = b.addRunArtifact(vfs_tests);

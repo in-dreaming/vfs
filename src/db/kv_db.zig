@@ -27,7 +27,13 @@ pub const OpenOptions = struct {
     /// (Windows synchronous handles). 0 = single handle. Ignored unless
     /// `mode == .read_only`.
     read_handles: u8 = 0,
+    /// Number of `data_NNN.db` shards to create for a brand new store. Ignored
+    /// when opening an existing store (the manifest is authoritative). Must be
+    /// >= 1.
+    data_file_count: u32 = 1,
 };
+
+pub const MAX_DATA_FILES: u32 = 256;
 
 pub const AccessMode = enum(u32) {
     read_only = 0,
@@ -38,6 +44,8 @@ pub const AccessMode = enum(u32) {
 pub const PutOptions = struct {
     durability: fmt.Durability = .sync,
     flags: u32 = 0,
+    /// Target data shard. `null` = `KvDb.defaultShard(key)`.
+    shard: ?u32 = null,
 };
 
 pub const DeleteOptions = struct {
@@ -45,7 +53,7 @@ pub const DeleteOptions = struct {
 };
 
 const PendingOp = union(enum) {
-    put: struct { key: fmt.Key128, key_bytes: []u8, data: []u8, flags: u32, durability: fmt.Durability },
+    put: struct { key: fmt.Key128, key_bytes: []u8, data: []u8, flags: u32, durability: fmt.Durability, shard: u32 },
     delete: struct { key: fmt.Key128, durability: fmt.Durability },
 };
 
@@ -56,7 +64,11 @@ pub const KvDb = struct {
     owns_dir: bool = false,
     owned_root: []u8 = &.{},
     manifest: manifest_mod.Manifest,
+    /// Shard 0 (`data_000.db`). Kept as a value so single-shard code paths
+    /// and tests are unchanged.
     data: data_mod.DataFile,
+    /// Shards 1..n-1 in manifest table order; `extra_data[i]` is shard `i+1`.
+    extra_data: []data_mod.DataFile = &.{},
     index: *index_mod.IndexFile,
     delta: delta_mod.DeltaIndex,
     /// Active base index, mapped once at open (and re-mapped after checkpoint /
@@ -85,8 +97,9 @@ pub const KvDb = struct {
     }
 
     pub fn openIn(dir: pf.Directory, options: OpenOptions) !KvDb {
+        if (options.data_file_count == 0 or options.data_file_count > MAX_DATA_FILES) return error.InvalidArgument;
         var man = manifest_mod.openIn(dir, "manifest.db") catch |err| switch (err) {
-            error.FileNotFound => if (options.mode == .read_only or !options.create_if_missing) return err else try manifest_mod.createIn(dir, "manifest.db", .{ .initial_data_files = 1 }),
+            error.FileNotFound => if (options.mode == .read_only or !options.create_if_missing) return err else try manifest_mod.createIn(dir, "manifest.db", .{ .initial_data_files = options.data_file_count }),
             else => |e| return e,
         };
         errdefer man.close() catch {};
@@ -94,11 +107,19 @@ pub const KvDb = struct {
             .read_only = options.mode == .read_only,
             .read_handles = if (options.mode == .read_only) options.read_handles else 0,
         };
-        var data = data_mod.openIn(dir, "data_000.db", data_options) catch |err| switch (err) {
-            error.FileNotFound => if (options.mode == .read_only or !options.create_if_missing) return err else try data_mod.createIn(dir, "data_000.db", .{ .durability = options.durability }),
-            else => |e| return e,
-        };
+        const shard_count = man.dataFileCount();
+        if (shard_count == 0 or shard_count > MAX_DATA_FILES) return error.Corruption;
+        var data = try openOrCreateData(dir, &man, 0, data_options, options);
         errdefer data.close() catch {};
+        const extra = try std.heap.smp_allocator.alloc(data_mod.DataFile, shard_count - 1);
+        var extra_opened: usize = 0;
+        errdefer {
+            for (extra[0..extra_opened]) |*d| d.close() catch {};
+            std.heap.smp_allocator.free(extra);
+        }
+        while (extra_opened < extra.len) : (extra_opened += 1) {
+            extra[extra_opened] = try openOrCreateData(dir, &man, @intCast(extra_opened + 1), data_options, options);
+        }
         const index_ptr = try std.heap.smp_allocator.create(index_mod.IndexFile);
         errdefer std.heap.smp_allocator.destroy(index_ptr);
         index_ptr.* = index_mod.openIn(dir, "index.db") catch |err| switch (err) {
@@ -120,7 +141,45 @@ pub const KvDb = struct {
             };
         errdefer delta.close() catch {};
         const base = try openBaseIndex(index_ptr);
-        return .{ .dir = dir, .manifest = man, .data = data, .index = index_ptr, .delta = delta, .base = base, .mode = options.mode, .hash_fn = options.hash_fn, .hash_user_data = options.hash_user_data };
+        return .{ .dir = dir, .manifest = man, .data = data, .extra_data = extra, .index = index_ptr, .delta = delta, .base = base, .mode = options.mode, .hash_fn = options.hash_fn, .hash_user_data = options.hash_user_data };
+    }
+
+    fn openOrCreateData(dir: pf.Directory, man: *const manifest_mod.Manifest, table_index: u32, data_options: data_mod.OpenOptions, options: OpenOptions) !data_mod.DataFile {
+        const file_id = try man.dataFileId(table_index);
+        var name_buf: [32]u8 = undefined;
+        const name = try man.dataFileName(file_id, &name_buf);
+        return data_mod.openIn(dir, name, data_options) catch |err| switch (err) {
+            error.FileNotFound => if (options.mode == .read_only or !options.create_if_missing) return err else try data_mod.createIn(dir, name, .{ .durability = options.durability }),
+            else => |e| return e,
+        };
+    }
+
+    /// Number of data shards (`data_NNN.db` files) in this store.
+    pub fn shardCount(self: *const KvDb) u32 {
+        return @intCast(self.extra_data.len + 1);
+    }
+
+    /// Data file backing shard `id`.
+    pub fn dataFile(self: *KvDb, id: u32) !*data_mod.DataFile {
+        if (id == 0) return &self.data;
+        if (id - 1 >= self.extra_data.len) return error.Corruption;
+        return &self.extra_data[id - 1];
+    }
+
+    /// Deterministic shard for a key when the caller does not pin one.
+    pub fn defaultShard(self: *const KvDb, key: fmt.Key128) u32 {
+        return shardForKey(key, self.shardCount());
+    }
+
+    pub fn shardForKey(key: fmt.Key128, shard_count: u32) u32 {
+        if (shard_count <= 1) return 0;
+        return @intCast(fmt.mixHash128To64(key) % shard_count);
+    }
+
+    /// Same routing as `defaultShard` for a store without a custom hash_fn;
+    /// lets tooling compute a key's shard without opening the store.
+    pub fn shardForKeyBytes(key_bytes: []const u8, shard_count: u32) u32 {
+        return shardForKey(fmt.hashBytes128(key_bytes), shard_count);
     }
 
     fn openBaseIndex(index: *const index_mod.IndexFile) !?base_mod.BaseIndex {
@@ -217,6 +276,9 @@ pub const KvDb = struct {
         std.heap.smp_allocator.destroy(self.index);
         self.index = undefined;
         try self.data.close();
+        for (self.extra_data) |*d| try d.close();
+        std.heap.smp_allocator.free(self.extra_data);
+        self.extra_data = &.{};
         try self.manifest.close();
         if (self.owns_dir) if (self.dir.os) |dir| dir.close(std.Io.Threaded.global_single_threaded.io());
         self.owns_dir = false;
@@ -234,6 +296,7 @@ pub const KvDb = struct {
         self.owns_dir = true;
         self.manifest = fresh.manifest;
         self.data = fresh.data;
+        self.extra_data = fresh.extra_data;
         self.index = fresh.index;
         self.delta = fresh.delta;
         self.base = fresh.base;
@@ -265,7 +328,7 @@ pub const KvDb = struct {
     pub fn getInto(self: *KvDb, key: fmt.Key128, dst: []u8) !usize {
         try self.prepareRead();
         const info = try self.lookupInfo(key);
-        return data_mod.readPayload(&self.data, info.offset, key, dst);
+        return data_mod.readPayload(try self.dataFile(info.data_db_id), info.offset, key, dst);
     }
 
     /// Index lookup by raw key, with the stored key bytes confirmed against
@@ -274,7 +337,7 @@ pub const KvDb = struct {
         const key = try self.keyFromBytes(key_bytes);
         try self.prepareRead();
         const info = try self.lookupInfo(key);
-        if (key_bytes.len != 0) _ = try self.data.readMetaCheckKey(info.offset, key, key_bytes);
+        if (key_bytes.len != 0) _ = try (try self.dataFile(info.data_db_id)).readMetaCheckKey(info.offset, key, key_bytes);
         return info;
     }
 
@@ -288,7 +351,7 @@ pub const KvDb = struct {
         try self.prepareRead();
         const info = try self.lookupInfo(key);
         if (dst.len < info.raw_size) return error.BufferTooSmall;
-        const payload = try self.data.readRecordBorrow(info.offset, key, key_bytes, info.stored_size);
+        const payload = try (try self.dataFile(info.data_db_id)).readRecordBorrow(info.offset, key, key_bytes, info.stored_size);
         @memcpy(dst[0..payload.len], payload);
         return payload.len;
     }
@@ -300,35 +363,63 @@ pub const KvDb = struct {
         const key = try self.keyFromBytes(key_bytes);
         try self.prepareRead();
         const info = try self.lookupInfo(key);
-        return self.data.readRecordBorrow(info.offset, key, key_bytes, info.stored_size);
+        return (try self.dataFile(info.data_db_id)).readRecordBorrow(info.offset, key, key_bytes, info.stored_size);
+    }
+
+    /// Reads the raw key bytes persisted with the record that `info` points at.
+    /// Returns the number of bytes written into `dst`.
+    pub fn readKeyBytes(self: *KvDb, info: fmt.IndexInfo, dst: []u8) !usize {
+        try self.requireRead();
+        return (try self.dataFile(info.data_db_id)).readKeyBytes(info.offset, dst);
+    }
+
+    pub const LiveEntry = base_mod.BuildEntry;
+
+    /// Every live (non-deleted, committed) key with its index entry. Reads
+    /// base index + committed journal; staged (uncommitted) puts are flushed
+    /// first on a writable store.
+    pub fn collectLiveKeys(self: *KvDb, allocator: std.mem.Allocator) ![]LiveEntry {
+        try self.prepareRead();
+        return checkpoint_mod.collectLiveEntries(self, allocator);
     }
 
     pub fn put(self: *KvDb, key: fmt.Key128, data: []const u8, options: PutOptions) !void {
         try self.requireWrite();
+        const shard = try self.resolveShard(key, options.shard);
         const owned_key = try std.heap.smp_allocator.alloc(u8, 0);
         errdefer std.heap.smp_allocator.free(owned_key);
         const owned = try std.heap.smp_allocator.dupe(u8, data);
         errdefer std.heap.smp_allocator.free(owned);
         self.pending_lock.lock();
         defer self.pending_lock.unlock();
-        try self.pending.append(std.heap.smp_allocator, .{ .put = .{ .key = key, .key_bytes = owned_key, .data = owned, .flags = options.flags, .durability = options.durability } });
+        try self.pending.append(std.heap.smp_allocator, .{ .put = .{ .key = key, .key_bytes = owned_key, .data = owned, .flags = options.flags, .durability = options.durability, .shard = shard } });
     }
 
     pub fn putBytes(self: *KvDb, key_bytes: []const u8, data: []const u8, options: PutOptions) !void {
         try self.requireWrite();
         const key = try self.keyFromBytes(key_bytes);
+        const shard = try self.resolveShard(key, options.shard);
         const owned_key = try std.heap.smp_allocator.dupe(u8, key_bytes);
         errdefer std.heap.smp_allocator.free(owned_key);
         const owned_data = try std.heap.smp_allocator.dupe(u8, data);
         errdefer std.heap.smp_allocator.free(owned_data);
         self.pending_lock.lock();
         defer self.pending_lock.unlock();
-        try self.pending.append(std.heap.smp_allocator, .{ .put = .{ .key = key, .key_bytes = owned_key, .data = owned_data, .flags = options.flags, .durability = options.durability } });
+        try self.pending.append(std.heap.smp_allocator, .{ .put = .{ .key = key, .key_bytes = owned_key, .data = owned_data, .flags = options.flags, .durability = options.durability, .shard = shard } });
+    }
+
+    pub fn resolveShard(self: *const KvDb, key: fmt.Key128, requested: ?u32) !u32 {
+        if (requested) |s| {
+            if (s >= self.shardCount()) return error.InvalidArgument;
+            return s;
+        }
+        return self.defaultShard(key);
     }
 
     pub fn putNoLock(self: *KvDb, key: fmt.Key128, data: []const u8, options: PutOptions) !void {
-        const r = try data_mod.append(&self.data, key, data, .{ .version = self.nextVersionNoLock(key), .durability = options.durability });
-        const info = fmt.IndexInfo{ .data_db_id = 0, .flags = options.flags, .offset = r.offset, .stored_size = r.stored_size, .raw_size = r.raw_size, .version = r.version, .crc = r.crc, .codec = r.codec, .reserved = 0 };
+        const shard = try self.resolveShard(key, options.shard);
+        const r = try data_mod.append(try self.dataFile(shard), key, data, .{ .version = self.nextVersionNoLock(key), .durability = options.durability });
+        const info = fmt.IndexInfo{ .data_db_id = shard, .flags = options.flags, .offset = r.offset, .stored_size = r.stored_size, .raw_size = r.raw_size, .version = r.version, .crc = r.crc, .codec = r.codec, .reserved = 0 };
         try self.delta.put(key, info, .{ .durability = options.durability, .data_durable = true });
     }
 
@@ -427,7 +518,11 @@ pub const KvDb = struct {
             .feature_flags = 0x1,
             .key_count = 0,
             .value_count = 0,
-            .data_bytes = pf.len(self.data.file) catch 0,
+            .data_bytes = blk: {
+                var total: u64 = pf.len(self.data.file) catch 0;
+                for (self.extra_data) |*d| total += pf.len(d.file) catch 0;
+                break :blk total;
+            },
             .index_bytes = pf.len(self.index.file) catch 0,
             .delta_entries = self.delta.used_slots,
             .pending_ops = 0,
@@ -466,34 +561,27 @@ pub const KvDb = struct {
         try self.requireWrite();
         try self.delta.ensureRoomFor(@intCast(self.pending.items.len));
 
-        var prealloc_bytes: u64 = 0;
-        for (self.pending.items) |op| switch (op) {
-            .put => |p| {
-                const total = @as(u64, data_mod.RECORD_HEADER_SIZE) + p.key_bytes.len + p.data.len + data_mod.RECORD_FOOTER_SIZE;
-                prealloc_bytes += try fmt.alignUp(total, data_mod.RECORD_ALIGNMENT);
-            },
-            .delete => {},
-        };
-        if (prealloc_bytes != 0) try pf.preallocate(self.data.file, self.data.logical_tail, prealloc_bytes);
-
         const batch_id = self.nextBatchIdNoLock();
         const durability = durability_override orelse pendingMaxDurability(self.pending.items);
         _ = try self.delta.journal.appendBatchBegin(batch_id, .{ .durability = .none, .defer_header = true });
         errdefer _ = self.delta.journal.appendBatchAbort(batch_id, .{ .durability = durability }) catch {};
 
-        var data_inputs = std.ArrayList(data_mod.BatchAppendInput).empty;
+        var data_inputs = std.ArrayList(ShardedAppendInput).empty;
         defer data_inputs.deinit(std.heap.smp_allocator);
         for (self.pending.items) |op| switch (op) {
             .put => |p| try data_inputs.append(std.heap.smp_allocator, .{
-                .key = p.key,
-                .key_bytes = p.key_bytes,
-                .payload = p.data,
-                .options = .{ .version = self.nextVersionNoLock(p.key), .durability = .none, .defer_superblock = true },
+                .shard = p.shard,
+                .input = .{
+                    .key = p.key,
+                    .key_bytes = p.key_bytes,
+                    .payload = p.data,
+                    .options = .{ .version = self.nextVersionNoLock(p.key), .durability = .none, .defer_superblock = true },
+                },
             }),
             .delete => {},
         };
-        const data_results = try data_mod.appendBatch(&self.data, std.heap.smp_allocator, data_inputs.items);
-        defer std.heap.smp_allocator.free(data_results);
+        var appended = try self.appendSharded(std.heap.smp_allocator, data_inputs.items);
+        defer appended.deinit(std.heap.smp_allocator);
 
         var published = std.ArrayList(delta_mod.PublishEntry).empty;
         defer published.deinit(std.heap.smp_allocator);
@@ -505,9 +593,9 @@ pub const KvDb = struct {
                 const lock = self.keyLock(p.key);
                 lockMutex(lock);
                 defer lock.unlock();
-                const r = data_results[put_i];
+                const r = appended.results[put_i];
                 put_i += 1;
-                const info = fmt.IndexInfo{ .data_db_id = 0, .flags = p.flags, .offset = r.offset, .stored_size = r.stored_size, .raw_size = r.raw_size, .version = r.version, .crc = r.crc, .codec = r.codec, .reserved = 0 };
+                const info = fmt.IndexInfo{ .data_db_id = p.shard, .flags = p.flags, .offset = r.offset, .stored_size = r.stored_size, .raw_size = r.raw_size, .version = r.version, .crc = r.crc, .codec = r.codec, .reserved = 0 };
                 try journal_inputs.append(std.heap.smp_allocator, .{ .op = .put, .key = p.key, .info = info });
                 try published.append(std.heap.smp_allocator, .{ .key = p.key, .info = info, .deleted = false });
             },
@@ -520,15 +608,75 @@ pub const KvDb = struct {
             },
         };
         try self.delta.journal.appendMany(std.heap.smp_allocator, journal_inputs.items, .{ .durability = .none, .batch_id = batch_id, .data_durable = true, .defer_header = true });
-        try self.flushDataForCommit(durability);
+        try self.flushShardsForCommit(appended.touched_shards, durability);
         _ = try self.delta.journal.appendBatchCommit(batch_id, .{ .durability = durability });
         try self.delta.publishCommittedMany(published.items);
         self.freePending();
         self.pending.clearRetainingCapacity();
     }
 
+    pub const ShardedAppendInput = struct {
+        shard: u32,
+        input: data_mod.BatchAppendInput,
+    };
+
+    pub const ShardedAppendResult = struct {
+        /// Aligned with the input slice order.
+        results: []data_mod.AppendResult,
+        /// Bitmask-like list of shards that received at least one record.
+        touched_shards: []u32,
+
+        pub fn deinit(self: *ShardedAppendResult, allocator: std.mem.Allocator) void {
+            allocator.free(self.results);
+            allocator.free(self.touched_shards);
+            self.* = undefined;
+        }
+    };
+
+    /// Groups records by shard and appends each group to its data file.
+    /// Only each data file's own `append_mutex` is taken, so callers that
+    /// target disjoint shards proceed in parallel. Records are not yet
+    /// indexed; the caller must journal + publish them afterwards.
+    pub fn appendSharded(self: *KvDb, allocator: std.mem.Allocator, inputs: []const ShardedAppendInput) !ShardedAppendResult {
+        const results = try allocator.alloc(data_mod.AppendResult, inputs.len);
+        errdefer allocator.free(results);
+        var touched = std.ArrayList(u32).empty;
+        errdefer touched.deinit(allocator);
+        if (inputs.len == 0) return .{ .results = results, .touched_shards = try touched.toOwnedSlice(allocator) };
+
+        const n = self.shardCount();
+        var shard: u32 = 0;
+        while (shard < n) : (shard += 1) {
+            var group = std.ArrayList(data_mod.BatchAppendInput).empty;
+            defer group.deinit(allocator);
+            var positions = std.ArrayList(usize).empty;
+            defer positions.deinit(allocator);
+            var prealloc_bytes: u64 = 0;
+            for (inputs, 0..) |in, i| {
+                if (in.shard != shard) continue;
+                try group.append(allocator, in.input);
+                try positions.append(allocator, i);
+                const total = @as(u64, data_mod.RECORD_HEADER_SIZE) + in.input.key_bytes.len + in.input.payload.len + data_mod.RECORD_FOOTER_SIZE;
+                prealloc_bytes += try fmt.alignUp(total, data_mod.RECORD_ALIGNMENT);
+            }
+            if (group.items.len == 0) continue;
+            const file = try self.dataFile(shard);
+            if (prealloc_bytes != 0) pf.preallocate(file.file, file.logical_tail, prealloc_bytes) catch {};
+            const group_results = try data_mod.appendBatch(file, allocator, group.items);
+            defer allocator.free(group_results);
+            for (group_results, positions.items) |r, pos| results[pos] = r;
+            try touched.append(allocator, shard);
+        }
+        return .{ .results = results, .touched_shards = try touched.toOwnedSlice(allocator) };
+    }
+
     pub fn flushDataForCommit(self: *KvDb, durability: fmt.Durability) !void {
         try data_mod.publishSuper(&self.data, durability);
+        for (self.extra_data) |*d| try data_mod.publishSuper(d, durability);
+    }
+
+    pub fn flushShardsForCommit(self: *KvDb, shards: []const u32, durability: fmt.Durability) !void {
+        for (shards) |s| try data_mod.publishSuper(try self.dataFile(s), durability);
     }
 
     fn freePending(self: *KvDb) void {
@@ -543,7 +691,7 @@ pub const KvDb = struct {
 
     fn lookupMetaNoLock(self: *KvDb, key: fmt.Key128) !data_mod.RecordMeta {
         const info = try self.lookupInfo(key);
-        return data_mod.readMeta(&self.data, info.offset);
+        return data_mod.readMeta(try self.dataFile(info.data_db_id), info.offset);
     }
 
     /// delta first, then the cached base index. Lock-free for read-only stores;
@@ -563,6 +711,25 @@ pub const KvDb = struct {
         defer self.base_lock.unlockShared();
         const base = &(self.base orelse return error.NotFound);
         return base.lookup(key);
+    }
+
+    pub const KeyState = enum { live, deleted, unknown };
+
+    /// What the index knows about `key`: a live entry, a delete tombstone
+    /// (not yet checkpointed away), or nothing. Verification uses this to
+    /// tell superseded/deleted records (normal garbage) from orphans.
+    pub fn keyState(self: *KvDb, key: fmt.Key128) !KeyState {
+        switch (try self.delta.lookup(key)) {
+            .found => return .live,
+            .deleted => return .deleted,
+            .not_found => {},
+        }
+        const info = self.lookupInfo(key) catch |e| switch (e) {
+            error.NotFound => return .unknown,
+            else => |err| return err,
+        };
+        _ = info;
+        return .live;
     }
 
     fn canWrite(self: *const KvDb) bool {
@@ -586,17 +753,37 @@ pub const KvDb = struct {
         const live_entries = try checkpoint_mod.collectLiveEntries(self, allocator);
         defer allocator.free(live_entries);
 
+        var seen_live_total: usize = 0;
+        var shard: u32 = 0;
+        while (shard < self.shardCount()) : (shard += 1) {
+            seen_live_total += try self.optimizeShard(allocator, shard, live_entries);
+        }
+        if (seen_live_total != live_entries.len) return error.Corruption;
+
+        _ = try base_mod.build(self.index, allocator, live_entries);
+        const slot_count = self.delta.journal.header.slot_count;
+        const journal_size = self.delta.journal.header.journal_size;
+        var fresh_delta = try delta_mod.create(self.index, slot_count, journal_size);
+        errdefer fresh_delta.close() catch {};
+        try self.delta.close();
+        self.delta = fresh_delta;
+    }
+
+    /// Rebuilds the free list / tail of one data shard. Returns how many live
+    /// entries were found in it.
+    fn optimizeShard(self: *KvDb, allocator: std.mem.Allocator, shard: u32, live_entries: []const base_mod.BuildEntry) !usize {
+        const data = try self.dataFile(shard);
         var live_offsets = std.AutoHashMap(u64, void).init(allocator);
         defer live_offsets.deinit();
-        for (live_entries) |entry| try live_offsets.put(entry.info.offset, {});
+        for (live_entries) |entry| if (entry.info.data_db_id == shard) try live_offsets.put(entry.info.offset, {});
 
         var free_blocks = std.ArrayList(alloc_mod.Block).empty;
         defer free_blocks.deinit(allocator);
 
         var seen_live: usize = 0;
         var off = data_mod.RECORD_AREA_OFFSET;
-        while (off < self.data.logical_tail) {
-            const meta = try data_mod.verifyRecord(&self.data, off);
+        while (off < data.logical_tail) {
+            const meta = try data_mod.verifyRecord(data, off);
             if (live_offsets.contains(off)) {
                 seen_live += 1;
             } else {
@@ -604,11 +791,11 @@ pub const KvDb = struct {
             }
             off += meta.aligned_size;
         }
-        if (off != self.data.logical_tail or seen_live != live_entries.len) return error.Corruption;
+        if (off != data.logical_tail or seen_live != live_offsets.count()) return error.Corruption;
 
         var free_len = coalesceBlocks(free_blocks.items);
         free_blocks.shrinkRetainingCapacity(free_len);
-        var new_tail = self.data.logical_tail;
+        var new_tail = data.logical_tail;
         var tail_free_bytes: u64 = 0;
         while (true) {
             var found_i: ?usize = null;
@@ -642,15 +829,15 @@ pub const KvDb = struct {
 
         var data_allocator = alloc_mod.Allocator.init(allocator, new_tail);
         defer data_allocator.deinit();
-        data_allocator.epoch.current = self.data.epoch + 1;
+        data_allocator.epoch.current = data.epoch + 1;
         for (free_blocks.items) |b| try data_allocator.free.append(allocator, b);
 
-        if (new_tail != self.data.logical_tail) {
-            try pf.setLen(self.data.file, new_tail);
-            try pf.flushMetadata(self.data.file);
-            self.data.logical_tail = new_tail;
+        if (new_tail != data.logical_tail) {
+            try pf.setLen(data.file, new_tail);
+            try pf.flushMetadata(data.file);
+            data.logical_tail = new_tail;
         }
-        self.data.epoch += 1;
+        data.epoch += 1;
         var alloc_super = data_mod.AllocatorSuper{
             .checkpoint_offset = 0,
             .checkpoint_size = 0,
@@ -660,19 +847,12 @@ pub const KvDb = struct {
             .tail_free_bytes = tail_free_bytes,
         };
         if (checkpoint_size != 0) {
-            try data_allocator.writeCheckpoint(self.data.file, data_mod.ALLOCATOR_CHECKPOINT_OFFSET);
+            try data_allocator.writeCheckpoint(data.file, data_mod.ALLOCATOR_CHECKPOINT_OFFSET);
             alloc_super.checkpoint_offset = data_mod.ALLOCATOR_CHECKPOINT_OFFSET;
             alloc_super.checkpoint_size = checkpoint_size;
         }
-        try data_mod.publishSuperWithAllocator(&self.data, .sync, alloc_super);
-
-        _ = try base_mod.build(self.index, allocator, live_entries);
-        const slot_count = self.delta.journal.header.slot_count;
-        const journal_size = self.delta.journal.header.journal_size;
-        var fresh_delta = try delta_mod.create(self.index, slot_count, journal_size);
-        errdefer fresh_delta.close() catch {};
-        try self.delta.close();
-        self.delta = fresh_delta;
+        try data_mod.publishSuperWithAllocator(data, .sync, alloc_super);
+        return seen_live;
     }
 };
 
@@ -758,6 +938,9 @@ pub const db_open_options_t = extern struct {
     reserved0: u32,
     max_delta_entries: u64,
     data_file_target_size: u64,
+    /// Number of data shards to create (create only). 0 = 1.
+    data_file_count: u32,
+    reserved1: u32,
 };
 
 pub const db_file_ops_t = extern struct {
@@ -894,6 +1077,7 @@ fn optionsFromC(options: ?*const db_open_options_t, context: ?*const db_context_
         }
     }
     const o = options orelse return .{ .create_if_missing = create_if_missing, .hash_fn = hash_fn, .hash_user_data = hash_user_data, .file_ops = custom_file_ops };
+    const data_file_count: u32 = if (fieldFits(db_open_options_t, "data_file_count", o.struct_size) and o.data_file_count != 0) o.data_file_count else 1;
     return .{ .durability = switch (o.durability) {
         0 => .none,
         1 => .async,
@@ -903,7 +1087,7 @@ fn optionsFromC(options: ?*const db_open_options_t, context: ?*const db_context_
         1 => .read_only,
         2 => .write_only,
         else => .read_write,
-    }, .create_if_missing = create_if_missing, .hash_fn = hash_fn, .hash_user_data = hash_user_data, .file_ops = custom_file_ops };
+    }, .create_if_missing = create_if_missing, .hash_fn = hash_fn, .hash_user_data = hash_user_data, .file_ops = custom_file_ops, .data_file_count = data_file_count };
 }
 
 fn openImpl(path: [*:0]const u8, options: ?*const db_open_options_t, context: ?*const db_context_t, create_if_missing: bool) u64 {
@@ -1481,4 +1665,132 @@ test "kv db read-only park releases files and ensureReady rereads" {
     var writable = try KvDb.open(pack_path, .{ .create_if_missing = false });
     defer writable.close() catch {};
     try testing.expectError(error.PermissionDenied, writable.park());
+}
+
+test "kv db multi shard put get delete overwrite optimize verify and reopen" {
+    const testing = std.testing;
+    const batch_mod = @import("batch_snapshot.zig");
+    const verify_mod = @import("recovery_verify.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try KvDb.openAt(tmp.dir, .{ .data_file_count = 4, .max_delta_entries = 256 });
+    try testing.expectEqual(@as(u32, 4), db.shardCount());
+
+    var shards_seen = [_]bool{false} ** 4;
+    var i: u64 = 0;
+    while (i < 64) : (i += 1) {
+        var key_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key_bytes, 1000 + i, .little);
+        var value: [16]u8 = undefined;
+        const v = try std.fmt.bufPrint(&value, "value-{d}", .{i});
+        try db.putBytes(&key_bytes, v, .{});
+    }
+    try db.commitPending(.sync);
+    i = 0;
+    while (i < 64) : (i += 1) {
+        var key_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key_bytes, 1000 + i, .little);
+        const info = try db.lookupBytes(&key_bytes);
+        shards_seen[info.data_db_id] = true;
+        const got = try db.getBorrowedBytes(&key_bytes);
+        var expect: [16]u8 = undefined;
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "value-{d}", .{i}), got);
+        var key_back: [16]u8 = undefined;
+        const n = try db.readKeyBytes(info, &key_back);
+        try testing.expectEqualSlices(u8, &key_bytes, key_back[0..n]);
+    }
+    for (shards_seen) |seen| try testing.expect(seen);
+
+    // Pinned-shard batch lands in that shard.
+    var b = try batch_mod.Batch.beginWithOptions(&db, testing.allocator, .{ .shard = 3 });
+    defer b.deinit();
+    var pinned_key: [8]u8 = undefined;
+    std.mem.writeInt(u64, &pinned_key, 77, .little);
+    try b.putBytes(&pinned_key, "pinned", 0);
+    try b.commit(.sync);
+    try testing.expectEqual(@as(u32, 3), (try db.lookupBytes(&pinned_key)).data_db_id);
+    try testing.expectError(error.InvalidArgument, batch_mod.Batch.beginWithOptions(&db, testing.allocator, .{ .shard = 4 }));
+
+    // Overwrite + delete across shards, then optimize and verify.
+    var k5: [8]u8 = undefined;
+    std.mem.writeInt(u64, &k5, 1005, .little);
+    try db.putBytes(&k5, "overwritten", .{});
+    var k6: [8]u8 = undefined;
+    std.mem.writeInt(u64, &k6, 1006, .little);
+    try db.deleteBytes(&k6, .{});
+    try db.commitPending(.sync);
+    try db.optimize();
+    try testing.expectEqualStrings("overwritten", try db.getBorrowedBytes(&k5));
+    try testing.expectError(error.NotFound, db.getSizeBytes(&k6));
+    const live = try db.collectLiveKeys(testing.allocator);
+    defer testing.allocator.free(live);
+    try testing.expectEqual(@as(usize, 64), live.len); // 64 original - 1 deleted + 1 pinned
+    try db.close();
+
+    var report = try verify_mod.verifyAt(tmp.dir, testing.allocator);
+    defer report.deinit();
+    try testing.expect(report.ok());
+
+    var reopened = try KvDb.openAt(tmp.dir, .{ .create_if_missing = false });
+    defer reopened.close() catch {};
+    try testing.expectEqual(@as(u32, 4), reopened.shardCount());
+    try testing.expectEqualStrings("pinned", try reopened.getBorrowedBytes(&pinned_key));
+    try testing.expectEqualStrings("overwritten", try reopened.getBorrowedBytes(&k5));
+}
+
+test "kv db parallel batches on disjoint shards commit correctly" {
+    const testing = std.testing;
+    const batch_mod = @import("batch_snapshot.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try KvDb.openAt(tmp.dir, .{ .data_file_count = 3, .max_delta_entries = 1024 });
+    defer db.close() catch {};
+
+    const Worker = struct {
+        fn run(d: *KvDb, shard: u32, err_out: *?anyerror) void {
+            var round: u32 = 0;
+            while (round < 8) : (round += 1) {
+                var b = batch_mod.Batch.beginWithOptions(d, std.heap.smp_allocator, .{ .shard = shard }) catch |e| {
+                    err_out.* = e;
+                    return;
+                };
+                defer b.deinit();
+                var j: u32 = 0;
+                while (j < 16) : (j += 1) {
+                    var key_bytes: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &key_bytes, (@as(u64, shard) << 32) | (round * 16 + j), .little);
+                    var value: [24]u8 = undefined;
+                    const v = std.fmt.bufPrint(&value, "s{d}-r{d}-j{d}", .{ shard, round, j }) catch unreachable;
+                    b.putBytes(&key_bytes, v, 0) catch |e| {
+                        err_out.* = e;
+                        return;
+                    };
+                }
+                b.commit(.none) catch |e| {
+                    err_out.* = e;
+                    return;
+                };
+            }
+        }
+    };
+
+    var errs = [_]?anyerror{null} ** 3;
+    var threads: [3]std.Thread = undefined;
+    for (&threads, 0..) |*t, s| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &db, @as(u32, @intCast(s)), &errs[s] });
+    for (threads) |t| t.join();
+    for (errs) |e| try testing.expect(e == null);
+
+    var shard: u32 = 0;
+    while (shard < 3) : (shard += 1) {
+        var n: u32 = 0;
+        while (n < 128) : (n += 1) {
+            var key_bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &key_bytes, (@as(u64, shard) << 32) | n, .little);
+            const info = try db.lookupBytes(&key_bytes);
+            try testing.expectEqual(shard, info.data_db_id);
+            var expect: [24]u8 = undefined;
+            try testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "s{d}-r{d}-j{d}", .{ shard, n / 16, n % 16 }), try db.getBorrowedBytes(&key_bytes));
+        }
+    }
 }

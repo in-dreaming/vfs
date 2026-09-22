@@ -62,8 +62,91 @@ enum {
     VFS_KEY_COLLISION = 9,
     VFS_DB_ERROR = 10,
     VFS_BUSY = 11,
+    /* A patch was cancelled by the caller. */
+    VFS_CANCELLED = 12,
+    /* The patch target does not match what the DiffPacks expect (content
+     * hash, PatchIntent of another chain, overlay/base mismatch). */
+    VFS_PRECONDITION_FAILED = 13,
     VFS_INTERNAL_ERROR = 100,
 };
+
+/* ---- Patch (V1.5, polling; no callbacks) ---------------------------------- */
+
+typedef uint64_t vfs_patch_t;
+
+/* Flags for vfs_patch_options_t.flags. */
+enum {
+    /* Load every DiffPack fully into memory (default: automatic by size). */
+    VFS_PATCH_IN_MEMORY = 1u << 0,
+    /* Read DiffPacks from disk even when small. */
+    VFS_PATCH_DISK = 1u << 1,
+    /* Accept a pending PatchIntent left by a different chain to the same version. */
+    VFS_PATCH_FORCE = 1u << 2,
+    /* Run the store optimizer after the new version is published. */
+    VFS_PATCH_OPTIMIZE = 1u << 3,
+};
+
+/* Values for vfs_patch_options_t.verify. */
+enum {
+    VFS_PATCH_VERIFY_NONE = 0,
+    /* Re-decode every page written by this run. */
+    VFS_PATCH_VERIFY_TOUCHED = 1,
+    /* TOUCHED plus a whole-pack verification after the store is closed. */
+    VFS_PATCH_VERIFY_FULL = 2,
+};
+
+typedef struct vfs_patch_options {
+    uint32_t struct_size;
+    uint32_t flags;
+    /* Worker threads; 0 = default (logical CPU count). */
+    uint32_t threads;
+    /* Staged bytes per shard before a batch is committed; 0 = default (16 MiB). */
+    uint32_t batch_bytes;
+    /* Automatic in-memory loading applies to DiffPacks up to this size; 0 = default (512 MiB). */
+    uint64_t in_memory_max_bytes;
+    uint32_t verify;
+    uint32_t reserved;
+    /* Stop at this pack version; 0 = highest reachable. */
+    uint64_t to_version;
+} vfs_patch_options_t;
+
+/* Values for vfs_patch_progress_t.state. */
+enum {
+    VFS_PATCH_RUNNING = 0,
+    VFS_PATCH_DONE = 1,
+    VFS_PATCH_FAILED = 2,
+    VFS_PATCH_CANCELLED = 3,
+};
+
+typedef struct vfs_patch_progress {
+    uint32_t struct_size;
+    uint32_t state;
+    uint64_t units_total;
+    uint64_t units_done;
+    uint64_t bytes_written;
+    uint64_t bytes_read;
+    /* VFS_OK while running or on success; the failure status otherwise. */
+    int32_t last_status;
+    int32_t reserved;
+    /* Filled once state != VFS_PATCH_RUNNING. */
+    uint64_t from_version;
+    uint64_t to_version;
+} vfs_patch_progress_t;
+
+/* Starts a patch on a background thread. `target_pack` is patched in place,
+ * or, when `overlay_pack_or_null` is given, stays read-only and the changes
+ * are written to the overlay (created if missing). */
+VFS_API int vfs_patch_begin(const char* target_pack, const char* overlay_pack_or_null,
+                            const char* const* diff_dirs, uint32_t diff_count,
+                            const vfs_patch_options_t* options, vfs_patch_t* out_patch);
+/* Non-blocking snapshot of the progress counters. */
+VFS_API int vfs_patch_poll(vfs_patch_t patch, vfs_patch_progress_t* out_progress);
+/* Blocks until the patch finished or `timeout_ms` elapsed; returns VFS_BUSY on timeout. */
+VFS_API int vfs_patch_wait(vfs_patch_t patch, uint32_t timeout_ms);
+/* Requests cancellation; the run stops at the next task boundary. */
+VFS_API int vfs_patch_cancel(vfs_patch_t patch);
+/* Releases the handle; a still-running patch is cancelled and joined first. */
+VFS_API int vfs_patch_end(vfs_patch_t patch);
 
 VFS_API int vfs_open_volume(const char* path, const vfs_open_options_t* options, vfs_volume_t* out_volume);
 VFS_API int vfs_close_volume(vfs_volume_t volume);

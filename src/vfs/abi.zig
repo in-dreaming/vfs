@@ -3,6 +3,8 @@ const err = @import("error.zig");
 const registry = @import("handle_registry.zig");
 const volume_mod = @import("volume/volume.zig");
 const file_mod = @import("io/file_handle.zig");
+const patch_mod = @import("patch/root.zig");
+const task_sched = @import("task/scheduler.zig");
 
 pub const vfs_open_options_t = extern struct {
     struct_size: u32,
@@ -200,6 +202,344 @@ fn fillStat(out: *vfs_stat_t, requested: u32, st: @import("pack/pack_reader.zig"
     out.size = st.size;
     out.page_size = st.page_size;
     out.reserved0 = 0;
+}
+
+// ---- patch (polling, background thread) --------------------------------------
+
+pub const vfs_patch_options_t = extern struct {
+    struct_size: u32,
+    flags: u32,
+    threads: u32 = 0,
+    batch_bytes: u32 = 0,
+    in_memory_max_bytes: u64 = 0,
+    verify: u32 = 0,
+    reserved: u32 = 0,
+    to_version: u64 = 0,
+};
+
+pub const vfs_patch_progress_t = extern struct {
+    struct_size: u32,
+    state: u32,
+    units_total: u64,
+    units_done: u64,
+    bytes_written: u64,
+    bytes_read: u64,
+    last_status: i32,
+    reserved: i32,
+    from_version: u64,
+    to_version: u64,
+};
+
+pub const VFS_PATCH_IN_MEMORY: u32 = 1 << 0;
+pub const VFS_PATCH_DISK: u32 = 1 << 1;
+pub const VFS_PATCH_FORCE: u32 = 1 << 2;
+pub const VFS_PATCH_OPTIMIZE: u32 = 1 << 3;
+const PATCH_FLAGS_MASK: u32 = VFS_PATCH_IN_MEMORY | VFS_PATCH_DISK | VFS_PATCH_FORCE | VFS_PATCH_OPTIMIZE;
+
+pub const PatchState = enum(u32) { running = 0, done = 1, failed = 2, cancelled = 3 };
+
+const PatchJob = struct {
+    allocator: std.mem.Allocator,
+    target: []u8,
+    overlay: ?[]u8,
+    diffs: [][]u8,
+    to_version: ?u64,
+    options: patch_mod.PatchOptions,
+    progress: patch_mod.patch_session.Progress = .{},
+    state: std.atomic.Value(u32) = .init(@intFromEnum(PatchState.running)),
+    last_status: std.atomic.Value(i32) = .init(0),
+    from_version: std.atomic.Value(u64) = .init(0),
+    result_to_version: std.atomic.Value(u64) = .init(0),
+    thread: ?std.Thread = null,
+
+    fn deinit(self: *PatchJob) void {
+        self.allocator.free(self.target);
+        if (self.overlay) |o| self.allocator.free(o);
+        for (self.diffs) |d| self.allocator.free(d);
+        self.allocator.free(self.diffs);
+    }
+
+    fn main(self: *PatchJob) void {
+        const diffs_const: []const []const u8 = @ptrCast(self.diffs);
+        const report = patch_mod.run(self.allocator, self.target, self.overlay, diffs_const, self.to_version, self.options) catch |e| {
+            self.last_status.store(err.code(err.fromError(e)), .release);
+            const st: PatchState = if (e == error.Cancelled) .cancelled else .failed;
+            self.state.store(@intFromEnum(st), .release);
+            return;
+        };
+        self.from_version.store(report.from_version, .release);
+        self.result_to_version.store(report.to_version, .release);
+        self.last_status.store(err.code(.ok), .release);
+        self.state.store(@intFromEnum(PatchState.done), .release);
+    }
+
+    fn finished(self: *const PatchJob) bool {
+        return self.state.load(.acquire) != @intFromEnum(PatchState.running);
+    }
+
+    fn join(self: *PatchJob) void {
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+    }
+};
+
+fn patchOptionsFromC(options: ?*const vfs_patch_options_t) !struct { opts: patch_mod.PatchOptions, to: ?u64 } {
+    var out: patch_mod.PatchOptions = .{};
+    var to: ?u64 = null;
+    const o = options orelse return .{ .opts = out, .to = to };
+    if (o.struct_size < @offsetOf(vfs_patch_options_t, "flags") + @sizeOf(u32)) return error.InvalidArgument;
+    if ((o.flags & ~PATCH_FLAGS_MASK) != 0) return error.InvalidArgument;
+    if ((o.flags & VFS_PATCH_IN_MEMORY) != 0 and (o.flags & VFS_PATCH_DISK) != 0) return error.InvalidArgument;
+    if ((o.flags & VFS_PATCH_IN_MEMORY) != 0) out.diff_load = .in_memory;
+    if ((o.flags & VFS_PATCH_DISK) != 0) out.diff_load = .disk;
+    out.force = (o.flags & VFS_PATCH_FORCE) != 0;
+    out.optimize_after = (o.flags & VFS_PATCH_OPTIMIZE) != 0;
+    if (o.struct_size >= @offsetOf(vfs_patch_options_t, "threads") + @sizeOf(u32) and o.threads != 0) {
+        out.budget = out.budget.withThreads(std.math.cast(u8, o.threads) orelse return error.InvalidArgument);
+    }
+    if (o.struct_size >= @offsetOf(vfs_patch_options_t, "batch_bytes") + @sizeOf(u32) and o.batch_bytes != 0) out.writer.batch_bytes = o.batch_bytes;
+    if (o.struct_size >= @offsetOf(vfs_patch_options_t, "in_memory_max_bytes") + @sizeOf(u64) and o.in_memory_max_bytes != 0) out.in_memory_max_bytes = o.in_memory_max_bytes;
+    if (o.struct_size >= @offsetOf(vfs_patch_options_t, "verify") + @sizeOf(u32)) {
+        out.verify_after = switch (o.verify) {
+            0 => .none,
+            1 => .touched,
+            2 => .full,
+            else => return error.InvalidArgument,
+        };
+    }
+    if (o.struct_size >= @offsetOf(vfs_patch_options_t, "to_version") + @sizeOf(u64) and o.to_version != 0) to = o.to_version;
+    return .{ .opts = out, .to = to };
+}
+
+pub export fn vfs_patch_begin(target_pack: ?[*:0]const u8, overlay_pack_or_null: ?[*:0]const u8, diff_dirs: ?[*]const ?[*:0]const u8, diff_count: u32, options: ?*const vfs_patch_options_t, out_patch: ?*u64) c_int {
+    const out = out_patch orelse return setStatus(.invalid_argument, "out_patch is null");
+    out.* = 0;
+    const allocator = std.heap.smp_allocator;
+    const target = spanZ(target_pack) catch |e| return setError(e);
+    if (diff_count == 0) return setStatus(.invalid_argument, "diff_count is zero");
+    const dirs = diff_dirs orelse return setStatus(.invalid_argument, "diff_dirs is null");
+    const parsed = patchOptionsFromC(options) catch |e| return setError(e);
+
+    const job = allocator.create(PatchJob) catch return setStatus(.internal_error, "allocation failed");
+    job.* = .{ .allocator = allocator, .target = &.{}, .overlay = null, .diffs = &.{}, .to_version = parsed.to, .options = parsed.opts };
+    var ok = false;
+    defer if (!ok) {
+        job.deinit();
+        allocator.destroy(job);
+    };
+    job.target = allocator.dupe(u8, target) catch return setStatus(.internal_error, "allocation failed");
+    if (overlay_pack_or_null) |ov| {
+        const s = spanZ(ov) catch |e| return setError(e);
+        job.overlay = allocator.dupe(u8, s) catch return setStatus(.internal_error, "allocation failed");
+    }
+    job.diffs = allocator.alloc([]u8, diff_count) catch return setStatus(.internal_error, "allocation failed");
+    var filled: usize = 0;
+    // Partially filled slices must not be freed as owned strings.
+    for (job.diffs) |*d| d.* = &.{};
+    while (filled < diff_count) : (filled += 1) {
+        const s = spanZ(dirs[filled]) catch |e| return setError(e);
+        job.diffs[filled] = allocator.dupe(u8, s) catch return setStatus(.internal_error, "allocation failed");
+    }
+    job.options.progress = &job.progress;
+
+    const h = @intFromPtr(job);
+    registry.register(h, .patch) catch |e| return setError(e);
+    job.thread = std.Thread.spawn(.{}, PatchJob.main, .{job}) catch {
+        registry.unregister(h);
+        return setStatus(.internal_error, "thread spawn failed");
+    };
+    ok = true;
+    out.* = h;
+    return setOk();
+}
+
+pub export fn vfs_patch_poll(patch: u64, out_progress: ?*vfs_patch_progress_t) c_int {
+    const out = out_progress orelse return setStatus(.invalid_argument, "out_progress is null");
+    const requested = out.struct_size;
+    if (requested < @offsetOf(vfs_patch_progress_t, "state") + @sizeOf(u32)) return setStatus(.invalid_argument, "struct_size too small");
+    // Poll may run on a different thread than end; hold the registry shared
+    // until the snapshot is taken so end cannot free the job under us.
+    const job = registry.acquire(PatchJob, patch, .patch) catch |e| return setError(e);
+    defer registry.release();
+    var full: vfs_patch_progress_t = .{
+        .struct_size = requested,
+        .state = job.state.load(.acquire),
+        .units_total = job.progress.units_total.load(.monotonic),
+        .units_done = job.progress.units_done.load(.monotonic),
+        .bytes_written = job.progress.bytes_written.load(.monotonic),
+        .bytes_read = job.progress.bytes_read.load(.monotonic),
+        .last_status = job.last_status.load(.acquire),
+        .reserved = 0,
+        .from_version = job.from_version.load(.acquire),
+        .to_version = job.result_to_version.load(.acquire),
+    };
+    const n = @min(@as(usize, requested), @sizeOf(vfs_patch_progress_t));
+    @memcpy(@as([*]u8, @ptrCast(out))[0..n], @as([*]u8, @ptrCast(&full))[0..n]);
+    return setOk();
+}
+
+pub export fn vfs_patch_wait(patch: u64, timeout_ms: u32) c_int {
+    const deadline = task_sched.nowNs() + @as(i128, timeout_ms) * std.time.ns_per_ms;
+    while (true) {
+        // Re-acquire per iteration so a concurrent end is not blocked for
+        // the whole timeout and is observed as invalid_argument afterwards.
+        const job = registry.acquire(PatchJob, patch, .patch) catch |e| return setError(e);
+        const finished = job.finished();
+        registry.release();
+        if (finished) return setOk();
+        if (task_sched.nowNs() >= deadline) return setStatus(.busy, "patch still running");
+        task_sched.sleepNs(500 * std.time.ns_per_us);
+    }
+}
+
+pub export fn vfs_patch_cancel(patch: u64) c_int {
+    const job = registry.acquire(PatchJob, patch, .patch) catch |e| return setError(e);
+    defer registry.release();
+    job.progress.cancel.store(true, .release);
+    return setOk();
+}
+
+pub export fn vfs_patch_end(patch: u64) c_int {
+    // take() removes the handle atomically: a second end (or a racing poll)
+    // sees invalid_argument instead of a freed job.
+    const job = registry.take(PatchJob, patch, .patch) catch |e| return setError(e);
+    if (!job.finished()) job.progress.cancel.store(true, .release);
+    job.join();
+    const st: PatchState = @enumFromInt(job.state.load(.acquire));
+    const status: err.Status = switch (st) {
+        .done => .ok,
+        .cancelled => .cancelled,
+        .failed => @enumFromInt(job.last_status.load(.acquire)),
+        .running => .internal_error,
+    };
+    job.deinit();
+    std.heap.smp_allocator.destroy(job);
+    return setStatus(status, @tagName(status));
+}
+
+test "vfs abi patch begin/poll/wait/end applies a diff and reports errors" {
+    const fixture = @import("diff/test_fixture.zig");
+    const diff_writer = @import("diff/diff_pack_writer.zig");
+    const a = std.testing.allocator;
+    var ds = try fixture.dataset(a);
+    defer ds.deinit();
+    const v1 = "zig-cache-vfs-abi-patch-v1";
+    const v2 = "zig-cache-vfs-abi-patch-v2";
+    const d12 = "zig-cache-vfs-abi-patch-d12";
+    defer fixture.cleanup(v1);
+    defer fixture.cleanup(v2);
+    defer fixture.cleanup(d12);
+    try fixture.buildPack(a, "zig-cache-vfs-abi-patch-fx1", v1, ds.v1, 31, 1, 2);
+    try fixture.buildPack(a, "zig-cache-vfs-abi-patch-fx2", v2, ds.v2, 31, 2, 2);
+    _ = try diff_writer.createDiffPack(a, v1, v2, d12, .{ .engine = .{ .budget = .{ .cpu = 1, .worker_threads = 1 } } });
+
+    var h: u64 = 0;
+    const diffs = [_]?[*:0]const u8{d12};
+    // error paths
+    try std.testing.expectEqual(err.code(.invalid_argument), vfs_patch_begin(null, null, &diffs, 1, null, &h));
+    try std.testing.expectEqual(err.code(.invalid_argument), vfs_patch_begin(v1, null, &diffs, 0, null, &h));
+    try std.testing.expectEqual(err.code(.invalid_argument), vfs_patch_begin(v1, null, &diffs, 1, null, null));
+    var bad_opts: vfs_patch_options_t = .{ .struct_size = @sizeOf(vfs_patch_options_t), .flags = VFS_PATCH_IN_MEMORY | VFS_PATCH_DISK };
+    try std.testing.expectEqual(err.code(.invalid_argument), vfs_patch_begin(v1, null, &diffs, 1, &bad_opts, &h));
+    var prog: vfs_patch_progress_t = undefined;
+    prog.struct_size = @sizeOf(vfs_patch_progress_t);
+    try std.testing.expectEqual(err.code(.invalid_argument), vfs_patch_poll(12345, &prog));
+    try std.testing.expectEqual(err.code(.invalid_argument), vfs_patch_wait(12345, 0));
+    try std.testing.expectEqual(err.code(.invalid_argument), vfs_patch_cancel(12345));
+    try std.testing.expectEqual(err.code(.invalid_argument), vfs_patch_end(12345));
+
+    // missing diff directory: begin succeeds, the run fails with not_found
+    const missing = [_]?[*:0]const u8{"zig-cache-vfs-abi-patch-missing"};
+    try std.testing.expectEqual(err.code(.ok), vfs_patch_begin(v1, null, &missing, 1, null, &h));
+    try std.testing.expectEqual(err.code(.ok), vfs_patch_wait(h, 30_000));
+    try std.testing.expectEqual(err.code(.ok), vfs_patch_poll(h, &prog));
+    try std.testing.expectEqual(@intFromEnum(PatchState.failed), prog.state);
+    try std.testing.expectEqual(err.code(.not_found), prog.last_status);
+    try std.testing.expectEqual(err.code(.not_found), vfs_patch_end(h));
+
+    // real run
+    var opts: vfs_patch_options_t = .{ .struct_size = @sizeOf(vfs_patch_options_t), .flags = VFS_PATCH_IN_MEMORY | VFS_PATCH_OPTIMIZE, .threads = 2, .verify = 1 };
+    try std.testing.expectEqual(err.code(.ok), vfs_patch_begin(v1, null, &diffs, 1, &opts, &h));
+    try std.testing.expect(h != 0);
+    try std.testing.expectEqual(err.code(.ok), vfs_patch_wait(h, 60_000));
+    try std.testing.expectEqual(err.code(.ok), vfs_patch_poll(h, &prog));
+    try std.testing.expectEqual(@intFromEnum(PatchState.done), prog.state);
+    try std.testing.expectEqual(err.code(.ok), prog.last_status);
+    try std.testing.expect(prog.units_total > 0);
+    try std.testing.expectEqual(prog.units_total, prog.units_done);
+    try std.testing.expect(prog.bytes_written > 0 and prog.bytes_read > 0);
+    try std.testing.expectEqual(@as(u64, 1), prog.from_version);
+    try std.testing.expectEqual(@as(u64, 2), prog.to_version);
+    // a truncated progress struct is honoured
+    var small: extern struct { struct_size: u32, state: u32 } align(8) = .{ .struct_size = 8, .state = 99 };
+    try std.testing.expectEqual(err.code(.ok), vfs_patch_poll(h, @ptrCast(&small)));
+    try std.testing.expectEqual(@intFromEnum(PatchState.done), small.state);
+    try std.testing.expectEqual(err.code(.ok), vfs_patch_end(h));
+    try std.testing.expectEqual(err.code(.invalid_argument), vfs_patch_end(h));
+
+    // the patched pack now serves v2 content through the read ABI
+    var volume: u64 = 0;
+    try std.testing.expectEqual(err.code(.ok), vfs_open_volume("abi-patch", null, &volume));
+    try std.testing.expectEqual(err.code(.ok), vfs_mount_pack(volume, v1, 10, 0));
+    for (ds.v2) |spec| {
+        var f: u64 = 0;
+        const zpath = try a.dupeZ(u8, spec.path);
+        defer a.free(zpath);
+        try std.testing.expectEqual(err.code(.ok), vfs_open_path(volume, zpath, 0, &f));
+        const buf = try a.alloc(u8, spec.data.len + 8);
+        defer a.free(buf);
+        var n: u64 = 0;
+        try std.testing.expectEqual(err.code(.ok), vfs_read_at(f, 0, buf.ptr, buf.len, &n));
+        try std.testing.expectEqual(spec.data.len, n);
+        try std.testing.expectEqualSlices(u8, spec.data, buf[0..n]);
+        try std.testing.expectEqual(err.code(.ok), vfs_close_file(f));
+    }
+    var f2: u64 = 0;
+    try std.testing.expectEqual(err.code(.not_found), vfs_open_path(volume, "/c.bin", 0, &f2));
+    try std.testing.expectEqual(err.code(.ok), vfs_close_volume(volume));
+
+    // second run is a no-op that still completes
+    try std.testing.expectEqual(err.code(.ok), vfs_patch_begin(v1, null, &diffs, 1, &opts, &h));
+    try std.testing.expectEqual(err.code(.ok), vfs_patch_end(h));
+}
+
+test "vfs abi patch cancel stops before publishing" {
+    const fixture = @import("diff/test_fixture.zig");
+    const diff_writer = @import("diff/diff_pack_writer.zig");
+    const pack_scan = @import("diff/pack_scan.zig");
+    const a = std.testing.allocator;
+    var ds = try fixture.dataset(a);
+    defer ds.deinit();
+    const v1 = "zig-cache-vfs-abi-cancel-v1";
+    const v2 = "zig-cache-vfs-abi-cancel-v2";
+    const d12 = "zig-cache-vfs-abi-cancel-d12";
+    defer fixture.cleanup(v1);
+    defer fixture.cleanup(v2);
+    defer fixture.cleanup(d12);
+    try fixture.buildPack(a, "zig-cache-vfs-abi-cancel-fx1", v1, ds.v1, 32, 1, 1);
+    try fixture.buildPack(a, "zig-cache-vfs-abi-cancel-fx2", v2, ds.v2, 32, 2, 1);
+    _ = try diff_writer.createDiffPack(a, v1, v2, d12, .{ .engine = .{ .budget = .{ .cpu = 1, .worker_threads = 1 } } });
+    // Cancel before the job can start: the flag is observed at the first task boundary.
+    const job = try std.heap.smp_allocator.create(PatchJob);
+    defer std.heap.smp_allocator.destroy(job);
+    job.* = .{ .allocator = std.heap.smp_allocator, .target = try std.heap.smp_allocator.dupe(u8, v1), .overlay = null, .diffs = try std.heap.smp_allocator.alloc([]u8, 1), .to_version = null, .options = .{ .budget = .{ .cpu = 1, .worker_threads = 1 } } };
+    job.diffs[0] = try std.heap.smp_allocator.dupe(u8, d12);
+    defer job.deinit();
+    job.options.progress = &job.progress;
+    job.progress.cancel.store(true, .release);
+    job.main();
+    try std.testing.expectEqual(@intFromEnum(PatchState.cancelled), job.state.load(.acquire));
+    try std.testing.expectEqual(err.code(.cancelled), job.last_status.load(.acquire));
+    var img = try pack_scan.PackImage.load(a, v1);
+    defer img.deinit();
+    try std.testing.expectEqual(@as(u64, 1), img.manifest.pack_version);
+    // Resume after cancel converges.
+    job.progress.cancel.store(false, .release);
+    job.state.store(@intFromEnum(PatchState.running), .release);
+    job.main();
+    try std.testing.expectEqual(@intFromEnum(PatchState.done), job.state.load(.acquire));
 }
 
 test "vfs abi handle lifecycle before mount remains safe" {

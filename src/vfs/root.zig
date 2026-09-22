@@ -13,9 +13,11 @@ pub const format = struct {
     pub const file_manifest = @import("format/file_manifest.zig");
     pub const page_value = @import("format/page_value.zig");
     pub const tombstone = @import("format/tombstone.zig");
-    pub const patch_manifest = @import("format/patch_manifest.zig");
     pub const volume_manifest = @import("format/volume_manifest.zig");
     pub const volume_transaction = @import("format/volume_transaction.zig");
+    pub const page_placeholder = @import("format/page_placeholder.zig");
+    pub const patch_intent = @import("format/patch_intent.zig");
+    pub const diff_pack = @import("format/diff_pack.zig");
 };
 
 pub const compress = struct {
@@ -33,6 +35,7 @@ pub const pack = struct {
 
 pub const tools = struct {
     pub const pack_tools = @import("tools/pack_tools.zig");
+    pub const diff_tools = @import("tools/diff_tools.zig");
 };
 
 pub const build = struct {
@@ -51,7 +54,10 @@ pub const volume = struct {
     pub const staging = @import("volume/staging.zig");
 };
 
-pub const mutation = @import("mutation/root.zig");
+pub const task = @import("task/root.zig");
+pub const hdiff = @import("hdiff/root.zig");
+pub const diff = @import("diff/root.zig");
+pub const patch = @import("patch/root.zig");
 
 pub const io = struct {
     pub const file_handle = @import("io/file_handle.zig");
@@ -86,9 +92,11 @@ test {
     _ = format.file_manifest;
     _ = format.page_value;
     _ = format.tombstone;
-    _ = format.patch_manifest;
     _ = format.volume_manifest;
     _ = format.volume_transaction;
+    _ = format.page_placeholder;
+    _ = format.patch_intent;
+    _ = format.diff_pack;
     _ = compress.compressor;
     _ = compress.registry;
     _ = compress.none;
@@ -97,6 +105,7 @@ test {
     _ = pack.pack_writer;
     _ = pack.pack_reader;
     _ = tools.pack_tools;
+    _ = tools.diff_tools;
     _ = build.build_cfg;
     _ = build.build_plan;
     _ = build.build_cache;
@@ -107,7 +116,10 @@ test {
     _ = volume.entry_resolver;
     _ = volume.path_resolver;
     _ = volume.staging;
-    _ = mutation;
+    _ = task;
+    _ = hdiff;
+    _ = diff;
+    _ = patch;
     _ = io.file_handle;
     _ = io.page_cache;
     const c = @cImport({

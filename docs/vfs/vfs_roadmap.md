@@ -451,7 +451,10 @@ output_manifest_hash
 
 ---
 
-## Phase 10：Merge / Patch
+## Phase 10：Merge / Patch（已被 Phase 15 取代）
+
+> 本阶段的 whole-file PatchManifest 与 `mutation/*` 路径已在 Phase 15 中删除；
+> 版本间更新统一走 DiffPack + patch（见 docs/vfs/diff_patch.md）。以下内容仅作历史记录。
 
 目标：支持把 patch 描述转换成 pack mutation。
 
@@ -633,6 +636,40 @@ meta 已 commit:
 - pack priority / scene priority。
 
 这些功能不应该阻塞 V1。只有在基础格式、只读路径、overlay、writable pack、verify 都稳定后再进入。
+
+---
+
+## Phase 15：DiffPack 与 Patch（已完成）
+
+目标：pack 版本 A → B 的差量分发与就地/overlay 应用，取代 Phase 10 的 whole-file patch。
+
+设计：docs/vfs/diff_patch.md。
+
+交付：
+
+- DB：多 data shard（`data_NNN.db`）、按 shard pin 的 Batch、`InMemoryFileOps`。
+- 压缩：per-page `lz4`；codec registry 带 `version_hash`。
+- `hdiff/`：纯 Zig 的 HDiffPatch 子集（VHDF 格式），`diffAlloc` / `patchAlloc`。
+- `task/`：通用任务图调度器（`cpu` / `cpu_codec` / `mem_bytes` / `db_write_shard` 资源，yield，trace）。
+- `format/`：`DiffManifest`、`UnitTable`、`FileOpTable`、`PathDelta`、`Chunk`、`PagePlaceholder`、`PatchIntent`。
+- `diff/`：`PackImage` 扫描、strategy ladder（logical / page / replace + ratio downgrade）、planner、engine、DiffPack writer。
+- `patch/`：`DiffPackReader`（in-memory 或 disk）、chain 选择（Dijkstra by payload）、coalesce（per-page / composite block unit）、`OldView` 分层读、`ShardWriter`（per-shard batch，unit 原子 staging）、`patch_session`（intent → graph → drain → finalize → optimize）。
+- Volume：overlay pack 挂载，页解析 overlay → base，placeholder 隐藏 base 页。
+- 工具：`diff-pack` / `dump-diff` / `verify-diff` / `patch-pack` / `bench-patch`；`verify-pack` 识别 placeholder / intent / overlay。
+- C ABI：`vfs_patch_begin / poll / wait / cancel / end`（后台线程 + 轮询，无 callback），新增状态 `VFS_CANCELLED` / `VFS_PRECONDITION_FAILED`。
+
+验收（已由 `zig build test` 覆盖）：
+
+- in-place：v1 →(d12)→ v2 →(d23)→ v3、v1 →(d12,d23)→ v3、v1 →(d13)→ v3 三条路径与直接构建的 v3 逐对象等价。
+- overlay：只读 base v1 + overlay 读出 v2 / v3 内容；删除文件不可见；缩短文件末页被 placeholder 隐藏。
+- 崩溃矩阵：intent 之后、任意 unit / file op 之后、finalize 之前中断，再次运行均收敛；不同链到同版本无 `--force` 拒绝。
+- 前置校验：base content hash 不符 → `PreconditionFailed`；无可达链 → `NoPatchPath`。
+
+暂不做：
+
+- `zstd` codec。
+- diff 构建的 C ABI（构建机工具，不进运行时 ABI）。
+- 跨 pack_id 的 diff。
 
 ---
 

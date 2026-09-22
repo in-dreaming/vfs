@@ -1,7 +1,7 @@
 const std = @import("std");
 const sync = @import("db_internal").platform.sync;
 
-pub const HandleKind = enum(u8) { volume, file };
+pub const HandleKind = enum(u8) { volume, file, patch };
 
 /// Readers (every vfs_read_at / stat) take the lock shared; only open/close
 /// take it exclusively, so validation never serializes concurrent readers.
@@ -26,6 +26,38 @@ pub fn validate(comptime T: type, handle: u64, kind: HandleKind) !*T {
     const found = handles.get(handle);
     lock.unlockShared();
     if (found == null or found.? != kind) return error.InvalidArgument;
+    return @ptrFromInt(handle);
+}
+
+/// Validates and keeps the registry read-locked until `release` so the
+/// object cannot be unregistered (and freed) while the caller uses it. For
+/// handles that are legitimately touched from several threads at once
+/// (patch jobs: one thread polls while another may call end).
+pub fn acquire(comptime T: type, handle: u64, kind: HandleKind) !*T {
+    if (handle == 0) return error.InvalidArgument;
+    lock.lockShared();
+    const found = handles.get(handle);
+    if (found == null or found.? != kind) {
+        lock.unlockShared();
+        return error.InvalidArgument;
+    }
+    return @ptrFromInt(handle);
+}
+
+pub fn release() void {
+    lock.unlockShared();
+}
+
+/// Atomically validates and unregisters: exactly one caller wins the handle,
+/// and every `acquire` holder has released before this returns, so the
+/// winner may free the object.
+pub fn take(comptime T: type, handle: u64, kind: HandleKind) !*T {
+    if (handle == 0) return error.InvalidArgument;
+    lock.lock();
+    defer lock.unlock();
+    const found = handles.get(handle) orelse return error.InvalidArgument;
+    if (found != kind) return error.InvalidArgument;
+    _ = handles.remove(handle);
     return @ptrFromInt(handle);
 }
 

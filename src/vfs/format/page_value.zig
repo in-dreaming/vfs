@@ -58,6 +58,20 @@ pub fn encodePageValue(allocator: std.mem.Allocator, value: PageValue) ![]u8 {
     return out;
 }
 
+/// Identity recorded in a value header whose header CRC is intact, or null
+/// when the bytes are not a well-formed PageValue header. Lets a writer tell
+/// "another object lives under this key" (must not overwrite) apart from
+/// "garbage under this key" (may repair) without decoding the payload.
+pub fn peekIdentity(bytes: []const u8) ?PageIdentity {
+    if (bytes.len < HEADER_SIZE) return null;
+    if (fmt.getU32(bytes, 0) != MAGIC or fmt.getU16(bytes, 6) != HEADER_SIZE) return null;
+    var header = [_]u8{0} ** HEADER_SIZE;
+    @memcpy(&header, bytes[0..HEADER_SIZE]);
+    fmt.putU32(&header, HEADER_CRC_OFFSET, 0);
+    if (fmt.crc32c(&header) != fmt.getU32(bytes, HEADER_CRC_OFFSET)) return null;
+    return .{ .file_entry = fmt.getU64(bytes, 8), .block_index = fmt.getU32(bytes, 16), .page_index = fmt.getU32(bytes, 20) };
+}
+
 pub fn decodePageValue(bytes: []const u8, expected: PageIdentity) !PageValue {
     if (bytes.len < HEADER_SIZE) return error.Corruption;
     if (fmt.getU32(bytes, 0) != MAGIC) return error.Corruption;

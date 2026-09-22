@@ -23,12 +23,15 @@ pub const PlanFile = struct {
     estimated_page_count: u32,
     file_manifest_key: u64,
     first_page_key: u64,
+    diff_strategy: build_cfg.DiffStrategy = .auto,
 };
 
 pub const BuildPlan = struct {
     pack_path: []u8,
     pack_id: u64,
+    pack_version: u64 = 1,
     pack_name: []u8,
+    shards: u32 = 1,
     files: []PlanFile,
 
     pub fn deinit(self: *BuildPlan, allocator: std.mem.Allocator) void {
@@ -79,12 +82,15 @@ pub fn create(allocator: std.mem.Allocator, cfg: build_cfg.BuildCfg) !BuildPlan 
             .estimated_page_count = page_count,
             .file_manifest_key = fm_key,
             .first_page_key = first_page_key,
+            .diff_strategy = file.diff_strategy orelse cfg.default_diff_strategy,
         });
     }
     return .{
         .pack_path = try allocator.dupe(u8, cfg.pack_path),
         .pack_id = cfg.pack_id,
+        .pack_version = cfg.pack_version,
         .pack_name = try allocator.dupe(u8, cfg.pack_name),
+        .shards = cfg.shards,
         .files = try files.toOwnedSlice(allocator),
     };
 }

@@ -14,14 +14,18 @@ This repository ships two independently usable layers for engine and runtime dat
 - Mounted volumes with explicit priority. Higher-priority packs overlay lower-priority packs, and entry tombstones hide lower-priority files.
 - Offset-based file reads with page identity and checksum validation.
 - A writable out pack for whole-file updates, entry deletion, and page-reference reuse for unchanged pages.
-- Build configuration and incremental planning, patch/merge mutation planning, resource-aware task-graph scheduling, and atomic volume-manifest staging/recovery.
-- Pack and volume tools for inspection, verification, extraction, and recovery.
+- Multi-shard packs: a pack's `data_000.db … data_NNN.db` files are written and committed in parallel; every object of a file lives in that file's shard.
+- Per-page `lz4` compression (`none` and `lz4` at runtime; `zstd` is still a reserved enum value).
+- Build configuration and incremental planning, a resource-aware task-graph scheduler (`cpu`, `cpu_codec`, `mem_bytes`, per-shard `db_write_shard` tokens), and atomic volume-manifest staging/recovery.
+- Version-to-version **DiffPacks**: page-level (`hdiff` over stored pages), logical-block (`hdiff` over decompressed blocks, recompressed on apply) or replace units, chosen per file by a strategy ladder with size-ratio downgrade.
+- **Patch** of a pack in place or into an overlay pack, with chain selection across several DiffPacks, per-unit idempotent re-run, a `PatchIntent` marker for crash recovery, and an optional post-patch `optimize`.
+- Pack, diff and volume tools for inspection, verification, extraction, recovery and benchmarking.
 - A stable C ABI with handle validation and caller-owned read buffers; it does not use callbacks.
 
 ### Current limitations
 
-- Runtime compression support is **`none` only**. `lz4` and `zstd` appear in format/config enums as reserved future choices, but pack creation and reading reject them with `UnsupportedFeature`.
-- The public C ABI is currently read/mount oriented. Writable-pack and mutation workflows are available through the Zig library APIs and tools, not as C write calls.
+- `zstd` is not implemented; pack creation and reading reject it with `UnsupportedFeature`.
+- The public C ABI covers read/mount and polling-style patch application. Pack building and diffing are available through the Zig library APIs and tools, not as C calls.
 - `db_context_t.file_ops` is declared by `libdb`, but custom file backends are not implemented. The supported pack storage path uses platform IO.
 
 ## Architecture
@@ -34,15 +38,18 @@ VFS Volume
   mount table · overlay resolver · path/entry resolvers · file handles · page cache
                  |
 VFS Pack
-  pack/path/file manifests · page values · tombstones · build and mutation metadata
+  pack/path/file manifests · page values · tombstones · placeholders · patch intent
+                 |
+VFS Diff / Patch
+  pack scan · strategy · hdiff units · DiffPack · chain · coalesce · shard writers
                  |
 libdb
-  key/value · batch · snapshot · journal · mmap indexes · checkpoint · verify · recover
+  key/value · batch · snapshot · journal · mmap indexes · data shards · checkpoint · verify · recover
 ```
 
 A `FileEntry` is the stable logical identity of a file; paths are a lookup mechanism rather than the identity itself. VFS derives compact object keys for manifests and pages, then verifies file/page identity again from the stored value headers so collisions or corrupt data cannot silently return the wrong content.
 
-Pack directories contain DB files such as `index.db` and `data_*.db`. A volume is a set of mounted packs ordered by priority; equal priorities are rejected to keep resolution deterministic.
+Pack directories contain `manifest.db`, `index.db` and one or more `data_NNN.db` shards. A volume is a set of mounted packs ordered by priority; equal priorities are rejected to keep resolution deterministic. An overlay pack (produced by `patch-pack --overlay`) is mounted above its base and only holds the objects that changed; page placeholders in the overlay hide base pages that no longer exist.
 
 ## Build and test
 
@@ -83,9 +90,38 @@ Installed artifacts are placed in `zig-out/`:
 
 # Build from a VFS build configuration.
 .\zig-out\bin\vfs.exe build .\vfs-build.cfg
+
+# Diff two versions of a pack, inspect and validate the DiffPack.
+.\zig-out\bin\vfs.exe diff-pack .\pack-v1 .\pack-v2 .\diff-1-2 --threads 8
+.\zig-out\bin\vfs.exe dump-diff .\diff-1-2
+.\zig-out\bin\vfs.exe verify-diff .\diff-1-2
+
+# Patch in place (interrupted runs resume idempotently), or into an overlay next to a read-only base.
+.\zig-out\bin\vfs.exe patch-pack .\pack-v1 .\diff-1-2 .\diff-2-3 --threads 8 --optimize --verify full --trace .\patch-trace.json
+.\zig-out\bin\vfs.exe patch-pack .\pack-v1 .\diff-1-2 --overlay .\pack-v1-overlay
+
+# Run the patch experiment matrix (in-memory/disk DiffPack, batch sizes, threads, durability) on a scratch copy.
+.\zig-out\bin\vfs.exe bench-patch .\pack-v1 .\scratch .\diff-1-2
 ```
 
 `put-file` and `build-simple` are aliases with the same arguments. `verify-pack` validates manifests, paths, pages, checksums, and referenced page identities; a failed validation returns a non-zero exit code.
+
+A build configuration is a plain `key=value` file:
+
+```text
+pack_path=zig-out\pack-v2
+pack_id=3
+pack_version=2
+shards=4
+default_page_size=65536
+default_codec=lz4
+default_codec_level=4
+default_diff_strategy=auto
+file=/textures/a.bin|1001|assets\a.bin
+file=/audio/b.bin|1002|assets\b.bin|4096|none|0|page
+```
+
+The optional per-file fields are page size, codec, codec level and diff strategy (`auto | logical | page | replace`). `pack_id` must stay the same across versions of a pack; `pack_version` must increase, and `diff-pack` refuses two packs with the same version.
 
 ## VFS C ABI
 
@@ -117,6 +153,31 @@ if (volume) vfs_close_volume(volume);
 ```
 
 Use `vfs_open_entry(volume, file_entry, ...)` and `vfs_stat_entry(...)` when the caller already owns the stable `FileEntry`. This bypasses path lookup. A volume cannot be closed while it still has open file handles (`VFS_BUSY`).
+
+### Applying DiffPacks from C
+
+`vfs_patch_*` runs a patch on a background thread and exposes progress by polling; there are no callbacks.
+
+```c
+vfs_patch_options_t opts = {0};
+opts.struct_size = sizeof(opts);
+opts.flags = VFS_PATCH_IN_MEMORY | VFS_PATCH_OPTIMIZE;
+opts.threads = 4;
+opts.verify = VFS_PATCH_VERIFY_TOUCHED;
+
+const char* diffs[] = { "diffs/1-2", "diffs/2-3" };
+vfs_patch_t patch = 0;
+if (vfs_patch_begin("packs/base", NULL /* or an overlay dir */, diffs, 2, &opts, &patch) == VFS_OK) {
+    vfs_patch_progress_t p = {0};
+    p.struct_size = sizeof(p);
+    while (vfs_patch_poll(patch, &p) == VFS_OK && p.state == VFS_PATCH_RUNNING) {
+        vfs_patch_wait(patch, 100);   /* returns VFS_BUSY on timeout */
+    }
+    int rc = vfs_patch_end(patch);    /* VFS_OK, VFS_CANCELLED, or the failure status */
+}
+```
+
+The target must not be mounted while it is patched in place. An interrupted patch (crash or `vfs_patch_cancel`) leaves a `PatchIntent` in the pack; running the same DiffPack chain again resumes idempotently, a different chain to the same version is refused with `VFS_PRECONDITION_FAILED` unless `VFS_PATCH_FORCE` is set.
 
 ## Standalone DB storage layer
 

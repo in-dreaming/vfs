@@ -11,8 +11,14 @@ fn keyId(key: fmt.Key128) u128 {
 }
 
 const BatchOp = union(enum) {
-    put: struct { key: fmt.Key128, key_bytes: []u8, data: []u8, flags: u32 },
+    put: struct { key: fmt.Key128, key_bytes: []u8, data: []u8, flags: u32, shard: u32 },
     delete: fmt.Key128,
+};
+
+pub const BatchOptions = struct {
+    /// Pin every put in this batch to one data shard. `null` = per-key
+    /// default shard.
+    shard: ?u32 = null,
 };
 
 pub const Batch = struct {
@@ -20,27 +26,42 @@ pub const Batch = struct {
     allocator: std.mem.Allocator,
     ops: std.ArrayList(BatchOp) = .empty,
     closed: bool = false,
+    options: BatchOptions = .{},
+    staged_bytes: u64 = 0,
 
     pub fn begin(db: *kv.KvDb, allocator: std.mem.Allocator) Batch {
         return .{ .db = db, .allocator = allocator };
     }
 
+    pub fn beginWithOptions(db: *kv.KvDb, allocator: std.mem.Allocator, options: BatchOptions) !Batch {
+        if (options.shard) |s| if (s >= db.shardCount()) return error.InvalidArgument;
+        return .{ .db = db, .allocator = allocator, .options = options };
+    }
+
+    pub fn opCount(self: *const Batch) usize {
+        return self.ops.items.len;
+    }
+
     pub fn put(self: *Batch, key: fmt.Key128, data: []const u8, flags: u32) !void {
         if (self.closed) return error.InvalidArgument;
+        const shard = try self.db.resolveShard(key, self.options.shard);
         const owned_key = try self.allocator.alloc(u8, 0);
         errdefer self.allocator.free(owned_key);
         const owned = try self.allocator.dupe(u8, data);
-        try self.ops.append(self.allocator, .{ .put = .{ .key = key, .key_bytes = owned_key, .data = owned, .flags = flags } });
+        try self.ops.append(self.allocator, .{ .put = .{ .key = key, .key_bytes = owned_key, .data = owned, .flags = flags, .shard = shard } });
+        self.staged_bytes += data.len;
     }
 
     pub fn putBytes(self: *Batch, key_bytes: []const u8, data: []const u8, flags: u32) !void {
         if (self.closed) return error.InvalidArgument;
         const key = try self.db.keyFromBytes(key_bytes);
+        const shard = try self.db.resolveShard(key, self.options.shard);
         const owned_key = try self.allocator.dupe(u8, key_bytes);
         errdefer self.allocator.free(owned_key);
         const owned = try self.allocator.dupe(u8, data);
         errdefer self.allocator.free(owned);
-        try self.ops.append(self.allocator, .{ .put = .{ .key = key, .key_bytes = owned_key, .data = owned, .flags = flags } });
+        try self.ops.append(self.allocator, .{ .put = .{ .key = key, .key_bytes = owned_key, .data = owned, .flags = flags, .shard = shard } });
+        self.staged_bytes += data.len + key_bytes.len;
     }
 
     pub fn deleteBytes(self: *Batch, key_bytes: []const u8) !void {
@@ -52,6 +73,11 @@ pub const Batch = struct {
         try self.ops.append(self.allocator, .{ .delete = key });
     }
 
+    /// Two-phase commit: (a) data records are appended per shard holding only
+    /// that shard's append mutex, so batches on disjoint shards run in
+    /// parallel; (b) the journal/publish phase is serialized on the store's
+    /// batch lock. A record is invisible until (b) completes, and recovery
+    /// treats un-journaled records as orphans.
     pub fn commit(self: *Batch, durability: fmt.Durability) !void {
         if (self.closed) return error.InvalidArgument;
         if (self.ops.items.len == 0) {
@@ -59,26 +85,30 @@ pub const Batch = struct {
             return;
         }
         try self.db.commitPending(null);
+
+        var data_inputs = std.ArrayList(kv.KvDb.ShardedAppendInput).empty;
+        defer data_inputs.deinit(self.allocator);
+        for (self.ops.items) |op| switch (op) {
+            .put => |p| try data_inputs.append(self.allocator, .{
+                .shard = p.shard,
+                .input = .{
+                    .key = p.key,
+                    .key_bytes = p.key_bytes,
+                    .payload = p.data,
+                    .options = .{ .version = self.db.nextVersion(p.key), .durability = .none, .defer_superblock = true },
+                },
+            }),
+            .delete => {},
+        };
+        var appended = try self.db.appendSharded(self.allocator, data_inputs.items);
+        defer appended.deinit(self.allocator);
+
         self.db.beginBatchCommit();
         defer self.db.endBatchCommit();
         try self.db.delta.ensureRoomFor(@intCast(self.ops.items.len));
         const batch_id = self.db.nextBatchIdNoLock();
         _ = try self.db.delta.journal.appendBatchBegin(batch_id, .{ .durability = .none, .defer_header = true });
         errdefer _ = self.db.delta.journal.appendBatchAbort(batch_id, .{ .durability = durability }) catch {};
-
-        var data_inputs = std.ArrayList(data_file.BatchAppendInput).empty;
-        defer data_inputs.deinit(self.allocator);
-        for (self.ops.items) |op| switch (op) {
-            .put => |p| try data_inputs.append(self.allocator, .{
-                .key = p.key,
-                .key_bytes = p.key_bytes,
-                .payload = p.data,
-                .options = .{ .version = self.db.nextVersionNoLock(p.key), .durability = .none, .defer_superblock = true },
-            }),
-            .delete => {},
-        };
-        const data_results = try data_file.appendBatch(&self.db.data, self.allocator, data_inputs.items);
-        defer self.allocator.free(data_results);
 
         var published = std.ArrayList(delta_mod.PublishEntry).empty;
         defer published.deinit(self.allocator);
@@ -87,9 +117,9 @@ pub const Batch = struct {
         var put_i: usize = 0;
         for (self.ops.items) |op| switch (op) {
             .put => |p| {
-                const r = data_results[put_i];
+                const r = appended.results[put_i];
                 put_i += 1;
-                const info = fmt.IndexInfo{ .data_db_id = 0, .flags = p.flags, .offset = r.offset, .stored_size = r.stored_size, .raw_size = r.raw_size, .version = r.version, .crc = r.crc, .codec = r.codec, .reserved = 0 };
+                const info = fmt.IndexInfo{ .data_db_id = p.shard, .flags = p.flags, .offset = r.offset, .stored_size = r.stored_size, .raw_size = r.raw_size, .version = r.version, .crc = r.crc, .codec = r.codec, .reserved = 0 };
                 try journal_inputs.append(self.allocator, .{ .op = .put, .key = p.key, .info = info });
                 try published.append(self.allocator, .{ .key = p.key, .info = info, .deleted = false });
             },
@@ -100,7 +130,7 @@ pub const Batch = struct {
             },
         };
         try self.db.delta.journal.appendMany(self.allocator, journal_inputs.items, .{ .durability = .none, .batch_id = batch_id, .data_durable = true, .defer_header = true });
-        try self.db.flushDataForCommit(durability);
+        try self.db.flushShardsForCommit(appended.touched_shards, durability);
         _ = try self.db.delta.journal.appendBatchCommit(batch_id, .{ .durability = durability });
         try self.db.delta.publishCommittedMany(published.items);
         self.closed = true;
@@ -138,7 +168,7 @@ pub const Snapshot = struct {
             for (entries) |e| {
                 const data = try allocator.alloc(u8, e.info.raw_size);
                 errdefer allocator.free(data);
-                _ = try data_file.readPayload(&db.data, e.info.offset, e.key, data);
+                _ = try data_file.readPayload(try db.dataFile(e.info.data_db_id), e.info.offset, e.key, data);
                 try snap.values.put(keyId(e.key), data);
             }
         }
@@ -150,7 +180,7 @@ pub const Snapshot = struct {
                 .put => {
                     const data = try allocator.alloc(u8, rec.info.raw_size);
                     errdefer allocator.free(data);
-                    _ = try data_file.readPayload(&db.data, rec.info.offset, rec.key, data);
+                    _ = try data_file.readPayload(try db.dataFile(rec.info.data_db_id), rec.info.offset, rec.key, data);
                     if (try snap.values.fetchPut(id, data)) |old| allocator.free(old.value);
                 },
                 .delete => if (snap.values.fetchRemove(id)) |old| allocator.free(old.value),

@@ -14,6 +14,9 @@ pub const VerifyIssueKind = enum {
     corruption,
     checksum_mismatch,
     dangling_index,
+    /// An intact record that no index entry references and whose key is
+    /// unknown to the index: written but never committed (crash between the
+    /// data append and the journal commit).
     orphan_record,
     duplicate_key,
     invalid_superblock,
@@ -77,29 +80,51 @@ pub fn verifyIn(dir: pf.Directory, allocator: std.mem.Allocator) !VerifyReport {
         try report.add(.{ .kind = .invalid_region, .file_id = 0, .offset = 0, .key = null, .message_code = 2 });
     };
 
-    var live_offsets = std.AutoHashMap(u64, fmt.Key128).init(allocator);
-    defer live_offsets.deinit();
-
     const live_entries = checkpoint_mod.collectLiveEntries(&db, allocator) catch |err| {
         try report.add(.{ .kind = if (err == error.Corruption) .corruption else .invalid_record, .file_id = 0, .offset = 0, .key = null, .message_code = 3 });
         return report;
     };
     defer allocator.free(live_entries);
-    for (live_entries) |e| try live_offsets.put(e.info.offset, e.key);
+
+    var shard: u32 = 0;
+    while (shard < db.shardCount()) : (shard += 1) {
+        const data = db.dataFile(shard) catch {
+            try report.add(.{ .kind = .corruption, .file_id = shard, .offset = 0, .key = null, .message_code = 11 });
+            continue;
+        };
+        try verifyShard(&report, allocator, &db, data, shard, live_entries);
+    }
+
+    return report;
+}
+
+/// True when the index still knows `key`: live at some offset (this record
+/// was superseded by a newer version) or deleted with a tombstone. Such a
+/// record is garbage awaiting `optimize`, which is the store's normal
+/// append-first state, not an orphan.
+fn keyKnownToIndex(db: *kv.KvDb, key: fmt.Key128) bool {
+    const state = db.keyState(key) catch return false;
+    return state != .unknown;
+}
+
+fn verifyShard(report: *VerifyReport, allocator: std.mem.Allocator, db: *kv.KvDb, data: *data_mod.DataFile, shard: u32, live_entries: []const base_mod.BuildEntry) !void {
+    var live_offsets = std.AutoHashMap(u64, fmt.Key128).init(allocator);
+    defer live_offsets.deinit();
+    for (live_entries) |e| if (e.info.data_db_id == shard) try live_offsets.put(e.info.offset, e.key);
 
     var free_blocks = std.ArrayList(alloc_mod.Block).empty;
     defer free_blocks.deinit(allocator);
-    const sb = data_mod.currentSuper(&db.data) catch |err| {
-        try report.add(.{ .kind = if (err == error.Corruption) .corruption else .invalid_superblock, .file_id = 0, .offset = 0, .key = null, .message_code = 8 });
-        return report;
+    const sb = data_mod.currentSuper(data) catch |err| {
+        try report.add(.{ .kind = if (err == error.Corruption) .corruption else .invalid_superblock, .file_id = shard, .offset = 0, .key = null, .message_code = 8 });
+        return;
     };
     if (sb.allocator_checkpoint_offset != 0 or sb.allocator_checkpoint_size != 0) {
         if (sb.allocator_checkpoint_offset < data_mod.ALLOCATOR_CHECKPOINT_OFFSET or sb.allocator_checkpoint_offset + sb.allocator_checkpoint_size > data_mod.RECORD_AREA_OFFSET) {
-            try report.add(.{ .kind = .invalid_superblock, .file_id = 0, .offset = sb.allocator_checkpoint_offset, .key = null, .message_code = 9 });
+            try report.add(.{ .kind = .invalid_superblock, .file_id = shard, .offset = sb.allocator_checkpoint_offset, .key = null, .message_code = 9 });
         } else {
-            var data_allocator = alloc_mod.Allocator.readCheckpoint(allocator, db.data.file, sb.allocator_checkpoint_offset) catch |err| {
-                try report.add(.{ .kind = if (err == error.Corruption) .corruption else .invalid_superblock, .file_id = 0, .offset = sb.allocator_checkpoint_offset, .key = null, .message_code = 10 });
-                return report;
+            var data_allocator = alloc_mod.Allocator.readCheckpoint(allocator, data.file, sb.allocator_checkpoint_offset) catch |err| {
+                try report.add(.{ .kind = if (err == error.Corruption) .corruption else .invalid_superblock, .file_id = shard, .offset = sb.allocator_checkpoint_offset, .key = null, .message_code = 10 });
+                return;
             };
             defer data_allocator.deinit();
             for (data_allocator.free.items) |b| try free_blocks.append(allocator, b);
@@ -108,28 +133,26 @@ pub fn verifyIn(dir: pf.Directory, allocator: std.mem.Allocator) !VerifyReport {
 
     var it = live_offsets.iterator();
     while (it.next()) |entry| {
-        const meta = data_mod.verifyRecord(&db.data, entry.key_ptr.*) catch |err| {
-            try report.add(.{ .kind = if (err == error.ChecksumMismatch) .checksum_mismatch else .dangling_index, .file_id = 0, .offset = entry.key_ptr.*, .key = entry.value_ptr.*, .message_code = 4 });
+        const meta = data_mod.verifyRecord(data, entry.key_ptr.*) catch |err| {
+            try report.add(.{ .kind = if (err == error.ChecksumMismatch) .checksum_mismatch else .dangling_index, .file_id = shard, .offset = entry.key_ptr.*, .key = entry.value_ptr.*, .message_code = 4 });
             continue;
         };
         if (meta.key.hi != entry.value_ptr.hi or meta.key.lo != entry.value_ptr.lo) {
-            try report.add(.{ .kind = .dangling_index, .file_id = 0, .offset = entry.key_ptr.*, .key = entry.value_ptr.*, .message_code = 5 });
+            try report.add(.{ .kind = .dangling_index, .file_id = shard, .offset = entry.key_ptr.*, .key = entry.value_ptr.*, .message_code = 5 });
         }
     }
 
     var off = data_mod.RECORD_AREA_OFFSET;
-    while (off < db.data.logical_tail) {
-        const meta = data_mod.verifyRecord(&db.data, off) catch |err| {
-            try report.add(.{ .kind = if (err == error.ChecksumMismatch) .checksum_mismatch else .invalid_record, .file_id = 0, .offset = off, .key = null, .message_code = 6 });
+    while (off < data.logical_tail) {
+        const meta = data_mod.verifyRecord(data, off) catch |err| {
+            try report.add(.{ .kind = if (err == error.ChecksumMismatch) .checksum_mismatch else .invalid_record, .file_id = shard, .offset = off, .key = null, .message_code = 6 });
             break;
         };
-        if (!live_offsets.contains(off) and !blockCovers(free_blocks.items, off, meta.aligned_size)) {
-            try report.add(.{ .kind = .orphan_record, .file_id = 0, .offset = off, .key = meta.key, .message_code = 7 });
+        if (!live_offsets.contains(off) and !blockCovers(free_blocks.items, off, meta.aligned_size) and !keyKnownToIndex(db, meta.key)) {
+            try report.add(.{ .kind = .orphan_record, .file_id = shard, .offset = off, .key = meta.key, .message_code = 7 });
         }
         off += meta.aligned_size;
     }
-
-    return report;
 }
 
 fn blockCovers(blocks: []const alloc_mod.Block, offset: u64, size: u64) bool {
@@ -149,6 +172,16 @@ test "recovery verify clean orphan dirty replay and checksum" {
     var report = try verifyAt(tmp.dir, testing.allocator);
     defer report.deinit();
     try testing.expect(report.ok());
+
+    // Overwriting and deleting leave superseded records behind until
+    // optimize; those are the store's normal state, not orphans.
+    try db.put(key, "abcd", .{});
+    try db.put(.{ .hi = 5, .lo = 5 }, "gone", .{});
+    try db.delete(.{ .hi = 5, .lo = 5 }, .{});
+    try db.commitPending(.sync);
+    var report_superseded = try verifyAt(tmp.dir, testing.allocator);
+    defer report_superseded.deinit();
+    try testing.expect(report_superseded.ok());
 
     _ = try data_mod.append(&db.data, .{ .hi = 9, .lo = 9 }, "orphan", .{ .version = 1 });
     var report2 = try verifyAt(tmp.dir, testing.allocator);
@@ -253,9 +286,12 @@ test "optimize folds deletes into base and persists allocator free holes" {
     try db.commitPending(.sync);
     const tail_before_optimize = db.data.logical_tail;
 
+    // Superseded and deleted records are deferred garbage, not issues: a
+    // store that has only ever been written through the public API always
+    // verifies clean, optimized or not.
     var before = try verifyAt(tmp.dir, testing.allocator);
     defer before.deinit();
-    try testing.expect(!before.ok());
+    try testing.expect(before.ok());
 
     try db.optimize();
     try testing.expect(db.data.logical_tail < tail_before_optimize);

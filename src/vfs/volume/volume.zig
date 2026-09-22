@@ -9,6 +9,7 @@ const file_manifest_fmt = @import("../format/file_manifest.zig");
 const page_value_fmt = @import("../format/page_value.zig");
 const pack_manifest_fmt = @import("../format/pack_manifest.zig");
 const tombstone_fmt = @import("../format/tombstone.zig");
+const page_placeholder_fmt = @import("../format/page_placeholder.zig");
 const hash = @import("../hash.zig");
 const path_mod = @import("../path.zig");
 const object_key = @import("../object_key.zig");
@@ -141,6 +142,7 @@ pub const Volume = struct {
         errdefer std.heap.smp_allocator.destroy(reader);
         reader.* = try pack_reader.PackReader.openWithOptions(std.heap.smp_allocator, pack_path, .{ .read_handles = self.options.read_handles });
         errdefer reader.close(std.heap.smp_allocator);
+        try self.checkOverlayLayeringLocked(reader.manifest, priority);
         const owned_path = try std.heap.smp_allocator.dupe(u8, pack_path);
         errdefer std.heap.smp_allocator.free(owned_path);
         const node = try std.heap.smp_allocator.create(MountedPack);
@@ -159,6 +161,46 @@ pub const Volume = struct {
         self.next_mount_order += 1;
         std.mem.sort(*MountedPack, self.mounts.items, {}, mountedHigherPriority);
         try self.publishMountsLocked();
+    }
+
+    /// Overlay layering rules for mounts sharing a pack_id: an overlay must sit
+    /// above exactly one non-overlay base whose pack_version equals the
+    /// overlay's recorded base version; two overlays of one pack are rejected.
+    /// Plain (non-overlay) packs that happen to share a pack_id are left to
+    /// the existing priority semantics.
+    fn checkOverlayLayeringLocked(self: *Volume, incoming: pack_manifest_fmt.PackManifest, priority: u32) !void {
+        for (self.mounts.items) |mounted| {
+            if (mounted.meta.pack_id != incoming.pack_id) continue;
+            const existing = mounted.reader.manifest;
+            if (incoming.isOverlay() and existing.isOverlay()) return error.InvalidArgument;
+            if (incoming.isOverlay()) {
+                if (incoming.base_pack_version != existing.pack_version) return error.InvalidArgument;
+                if (priority <= mounted.meta.priority) return error.InvalidArgument;
+            } else if (existing.isOverlay()) {
+                if (existing.base_pack_version != incoming.pack_version) return error.InvalidArgument;
+                if (priority >= mounted.meta.priority) return error.InvalidArgument;
+            }
+        }
+    }
+
+    /// The base layer under an overlay mount (same pack_id, lower priority).
+    pub fn baseLayerOf(self: *Volume, mounted: *MountedPack) ?*MountedPack {
+        if (!mounted.reader.manifest.isOverlay()) return null;
+        for (self.currentMounts()) |candidate| {
+            if (candidate == mounted) continue;
+            if (candidate.meta.pack_id == mounted.meta.pack_id and !candidate.reader.manifest.isOverlay()) return candidate;
+        }
+        return null;
+    }
+
+    /// The overlay layer above a base mount, if one is mounted.
+    pub fn overlayLayerOf(self: *Volume, mounted: *MountedPack) ?*MountedPack {
+        if (mounted.reader.manifest.isOverlay()) return null;
+        for (self.currentMounts()) |candidate| {
+            if (candidate == mounted) continue;
+            if (candidate.meta.pack_id == mounted.meta.pack_id and candidate.reader.manifest.isOverlay()) return candidate;
+        }
+        return null;
     }
 
     /// Snapshot `self.mounts` into a fresh immutable list and publish it.
@@ -413,10 +455,19 @@ pub const Volume = struct {
                 .page_key = key,
             };
         };
-        const mounted = self.findMountedPackContainingGeneration(page_ref.pack_id, page_ref.pack_generation) orelse return error.NotFound;
+        var mounted = self.findMountedPackContainingGeneration(page_ref.pack_id, page_ref.pack_generation) orelse return error.NotFound;
         try mounted.reader.ensureReady();
-        const page_bytes = try mounted.reader.readObjectAlloc(std.heap.smp_allocator, page_ref.page_key);
+        const page_bytes = mounted.reader.readObjectAlloc(std.heap.smp_allocator, page_ref.page_key) catch |e| switch (e) {
+            error.NotFound => blk: {
+                // Overlay layer without this page: fall through to its base.
+                mounted = self.baseLayerOf(mounted) orelse return error.NotFound;
+                try mounted.reader.ensureReady();
+                break :blk try mounted.reader.readObjectAlloc(std.heap.smp_allocator, page_ref.page_key);
+            },
+            else => |err| return err,
+        };
         defer std.heap.smp_allocator.free(page_bytes);
+        if (page_placeholder_fmt.isPlaceholder(page_bytes)) return error.NotFound;
         const page = try page_value_fmt.decodePageValue(page_bytes, .{ .file_entry = page_ref.file_entry, .block_index = page_ref.block_index, .page_index = page_ref.page_index });
         const raw = try registry.decompressPage(std.heap.smp_allocator, page.codec, page.payload, page.raw_size, page.raw_crc);
         errdefer std.heap.smp_allocator.free(raw);
@@ -628,13 +679,26 @@ pub const Volume = struct {
                 error.NotFound => continue,
                 else => |err| return err,
             };
+            // Page resolution always starts at the overlay layer (if any) and
+            // falls through to the base, regardless of which layer held the
+            // FileManifest: an overlay may override pages of a file whose
+            // manifest it did not touch.
+            var top = mounted;
+            var base: ?*MountedPack = null;
+            if (mounted.reader.manifest.isOverlay()) {
+                base = self.baseLayerOf(mounted);
+            } else if (self.overlayLayerOf(mounted)) |ov| {
+                top = ov;
+                base = mounted;
+            }
             _ = self.open_file_count.fetchAdd(1, .seq_cst);
             return .{
                 .volume_handle = volume_handle,
                 .volume = self,
-                .mounted = mounted,
-                .pack_id = mounted.meta.pack_id,
-                .pack_generation = mounted.mount_order.load(.acquire),
+                .mounted = top,
+                .base = base,
+                .pack_id = top.meta.pack_id,
+                .pack_generation = top.mount_order.load(.acquire),
                 .file_entry = file_entry,
                 .size = manifest.header.file_size,
                 .manifest = manifest,

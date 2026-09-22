@@ -93,6 +93,9 @@ typedef struct db_open_options {
     uint32_t reserved0;
     uint64_t max_delta_entries;
     uint64_t data_file_target_size;
+    /* Number of data_NNN.db shards to create (db_create only). 0 = 1. */
+    uint32_t data_file_count;
+    uint32_t reserved1;
 } db_open_options_t;
 
 typedef struct db_info {

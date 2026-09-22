@@ -8,14 +8,26 @@ const file_manifest = @import("../format/file_manifest.zig");
 ///
 ///   pack_path=zig-cache-vfs-pack
 ///   pack_id=1
+///   pack_version=1
 ///   pack_name=assets
 ///   default_page_size=65536
 ///   default_codec=none
 ///   default_codec_level=0
+///   shards=4
+///   default_diff_strategy=auto
 ///   file=/virtual.txt|1001|source/path.txt
-///   file=/other.bin|1002|source.bin|4096|none|0
+///   file=/other.bin|1002|source.bin|4096|none|0|page
 ///
 /// Empty lines and lines starting with '#' are ignored. Paths must not contain '|'.
+/// The optional 7th file field is the diff strategy override
+/// (auto | logical | page | replace).
+pub const DiffStrategy = enum(u8) {
+    auto = 0,
+    logical = 1,
+    page = 2,
+    replace = 3,
+};
+
 pub const FileConfig = struct {
     virtual_path: []u8,
     source_path: []u8,
@@ -23,15 +35,19 @@ pub const FileConfig = struct {
     page_size: ?u32 = null,
     codec: ?file_manifest.Codec = null,
     codec_level: ?i16 = null,
+    diff_strategy: ?DiffStrategy = null,
 };
 
 pub const BuildCfg = struct {
     pack_path: []u8,
     pack_id: u64 = 1,
+    pack_version: u64 = 1,
     pack_name: []u8,
     default_page_size: u32 = 64 * 1024,
     default_codec: file_manifest.Codec = .none,
     default_codec_level: i16 = 0,
+    default_diff_strategy: DiffStrategy = .auto,
+    shards: u32 = 1,
     files: []FileConfig,
     raw_hash: [32]u8,
 
@@ -59,9 +75,12 @@ pub fn parseBytes(allocator: std.mem.Allocator, bytes: []const u8) !BuildCfg {
     var pack_name = try allocator.dupe(u8, "pack");
     errdefer allocator.free(pack_name);
     var pack_id: u64 = 1;
+    var pack_version: u64 = 1;
     var default_page_size: u32 = 64 * 1024;
     var default_codec: file_manifest.Codec = .none;
     var default_codec_level: i16 = 0;
+    var default_diff_strategy: DiffStrategy = .auto;
+    var shards: u32 = 1;
     var files = std.ArrayList(FileConfig).empty;
     errdefer {
         for (files.items) |file| {
@@ -83,6 +102,8 @@ pub fn parseBytes(allocator: std.mem.Allocator, bytes: []const u8) !BuildCfg {
             pack_path = try allocator.dupe(u8, value);
         } else if (std.mem.eql(u8, key, "pack_id")) {
             pack_id = try std.fmt.parseUnsigned(u64, value, 0);
+        } else if (std.mem.eql(u8, key, "pack_version")) {
+            pack_version = try std.fmt.parseUnsigned(u64, value, 0);
         } else if (std.mem.eql(u8, key, "pack_name")) {
             allocator.free(pack_name);
             pack_name = try allocator.dupe(u8, value);
@@ -92,6 +113,11 @@ pub fn parseBytes(allocator: std.mem.Allocator, bytes: []const u8) !BuildCfg {
             default_codec = try parseCodec(value);
         } else if (std.mem.eql(u8, key, "default_codec_level")) {
             default_codec_level = try std.fmt.parseInt(i16, value, 0);
+        } else if (std.mem.eql(u8, key, "default_diff_strategy")) {
+            default_diff_strategy = try parseDiffStrategy(value);
+        } else if (std.mem.eql(u8, key, "shards")) {
+            shards = try std.fmt.parseUnsigned(u32, value, 0);
+            if (shards == 0) return error.InvalidArgument;
         } else if (std.mem.eql(u8, key, "file")) {
             try files.append(allocator, try parseFileConfig(allocator, value));
         } else {
@@ -102,10 +128,13 @@ pub fn parseBytes(allocator: std.mem.Allocator, bytes: []const u8) !BuildCfg {
     return .{
         .pack_path = pack_path.?,
         .pack_id = pack_id,
+        .pack_version = pack_version,
         .pack_name = pack_name,
         .default_page_size = default_page_size,
         .default_codec = default_codec,
         .default_codec_level = default_codec_level,
+        .default_diff_strategy = default_diff_strategy,
+        .shards = shards,
         .files = try files.toOwnedSlice(allocator),
         .raw_hash = hash.contentHash(bytes),
     };
@@ -119,14 +148,20 @@ fn parseFileConfig(allocator: std.mem.Allocator, value: []const u8) !FileConfig 
     const page_size_s = parts.next();
     const codec_s = parts.next();
     const level_s = parts.next();
+    const strategy_s = parts.next();
     if (parts.next() != null) return error.InvalidArgument;
+    const vp = try allocator.dupe(u8, virtual_path);
+    errdefer allocator.free(vp);
+    const sp = try allocator.dupe(u8, source_path);
+    errdefer allocator.free(sp);
     return .{
-        .virtual_path = try allocator.dupe(u8, virtual_path),
+        .virtual_path = vp,
         .file_entry = try std.fmt.parseUnsigned(u64, file_entry_s, 0),
-        .source_path = try allocator.dupe(u8, source_path),
+        .source_path = sp,
         .page_size = if (page_size_s) |s| if (s.len == 0) null else try std.fmt.parseUnsigned(u32, s, 0) else null,
         .codec = if (codec_s) |s| if (s.len == 0) null else try parseCodec(s) else null,
         .codec_level = if (level_s) |s| if (s.len == 0) null else try std.fmt.parseInt(i16, s, 0) else null,
+        .diff_strategy = if (strategy_s) |s| if (s.len == 0) null else try parseDiffStrategy(s) else null,
     };
 }
 
@@ -134,6 +169,14 @@ pub fn parseCodec(value: []const u8) !file_manifest.Codec {
     if (std.mem.eql(u8, value, "none")) return .none;
     if (std.mem.eql(u8, value, "lz4")) return .lz4;
     if (std.mem.eql(u8, value, "zstd")) return .zstd;
+    return error.InvalidArgument;
+}
+
+pub fn parseDiffStrategy(value: []const u8) !DiffStrategy {
+    if (std.mem.eql(u8, value, "auto")) return .auto;
+    if (std.mem.eql(u8, value, "logical")) return .logical;
+    if (std.mem.eql(u8, value, "page")) return .page;
+    if (std.mem.eql(u8, value, "replace")) return .replace;
     return error.InvalidArgument;
 }
 

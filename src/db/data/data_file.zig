@@ -203,6 +203,16 @@ pub const DataFile = struct {
     pub fn verifyRecord(self: *DataFile, offset: u64) !RecordMeta {
         return dataVerifyRecord(self, offset);
     }
+
+    /// Reads the raw key bytes stored in the record at `offset` into `dst`.
+    /// Returns the key size; `error.BufferTooSmall` if `dst` cannot hold it.
+    pub fn readKeyBytes(self: *DataFile, offset: u64, dst: []u8) !usize {
+        const fh = self.readHandle();
+        const parsed = try readAndValidateHeader(fh, offset);
+        if (dst.len < parsed.meta.key_size) return error.BufferTooSmall;
+        if (parsed.meta.key_size != 0) try readExact(fh, offset + RECORD_HEADER_SIZE, dst[0..parsed.meta.key_size]);
+        return parsed.meta.key_size;
+    }
 };
 
 pub const AllocatorSuper = struct {

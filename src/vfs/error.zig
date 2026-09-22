@@ -13,14 +13,22 @@ pub const Status = enum(c_int) {
     key_collision = 9,
     db_error = 10,
     busy = 11,
+    /// A patch was cancelled by the caller; the target is unchanged or at a
+    /// resumable intermediate state.
+    cancelled = 12,
+    /// The target does not match what a patch expects (content hash, pending
+    /// PatchIntent of another chain, overlay/base mismatch).
+    precondition_failed = 13,
     internal_error = 100,
 };
 
 pub fn fromError(err: anyerror) Status {
     return switch (err) {
         error.NotFound, error.FileNotFound => .not_found,
-        error.InvalidArgument => .invalid_argument,
-        error.AccessDenied => .permission_denied,
+        error.InvalidArgument, error.NoPatchPath, error.InvalidFileEntry => .invalid_argument,
+        error.Cancelled => .cancelled,
+        error.PreconditionFailed, error.PatchIntentMismatch, error.OverlayBaseMismatch, error.CodecMismatch => .precondition_failed,
+        error.AccessDenied, error.PermissionDenied => .permission_denied,
         error.UnsupportedVersion => .unsupported_version,
         error.Unsupported, error.UnsupportedFeature => .unsupported_feature,
         error.Corruption => .corruption,
