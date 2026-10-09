@@ -205,8 +205,11 @@ const RunState = struct {
             // Capacity was reserved at submit time; this cannot fail in practice.
             unreachable;
         };
-        self.mutex.unlock();
+        // Completion makes this stack-local RunState eligible for retirement.
+        // Signal while still holding its mutex: after unlock the dispatcher
+        // may consume the last completion and return from run immediately.
         self.cond.signal();
+        self.mutex.unlock();
     }
 };
 
@@ -272,6 +275,10 @@ pub const Scheduler = struct {
 
         state.mutex.lock();
         defer state.mutex.unlock();
+        // Dispatcher bookkeeping can fail after jobs have been submitted.
+        // Keep their stack-local context alive until every completion arrives;
+        // this cleanup must not allocate or execute further dependent work.
+        errdefer drainAfterErrorLocked(&state);
         while (true) {
             // Drain completions first so freed resources are visible to dispatch.
             while (state.completions.items.len != 0) {
@@ -304,6 +311,29 @@ pub const Scheduler = struct {
         state.report.wall_ns = @intCast(@max(nowNs() - wall_start, 0));
         if (state.report.first_error) |err| return err;
         return state.report;
+    }
+
+    fn drainAfterErrorLocked(state: *RunState) void {
+        state.stop_dispatch = true;
+        while (state.running != 0) {
+            if (state.completions.pop()) |completion| {
+                state.running -= 1;
+                state.graph.lock.lock();
+                const t = &state.graph.tasks.items[completion.id];
+                t.state = if (completion.err != null) .failed else if (completion.result == .done) .finished else .cancelled;
+                state.graph.lock.unlock();
+            } else {
+                state.cond.wait(&state.mutex);
+            }
+        }
+        state.graph.lock.lock();
+        defer state.graph.lock.unlock();
+        for (state.graph.tasks.items) |*t| switch (t.state) {
+            .pending, .ready, .running => t.state = .cancelled,
+            else => {},
+        };
+        // Token/ready/report storage is disposed by run's existing defers.
+        // Do not traverse dependencies or grow arrays on this error path.
     }
 
     fn nonTerminalLocked(_: *Scheduler, state: *RunState) !u32 {
@@ -360,6 +390,10 @@ pub const Scheduler = struct {
                     skipped_n += 1;
                     continue;
                 }
+                // Reserve completion/report capacity before a job can start.
+                // Every submitted job must be able to report without allocation.
+                try state.report.dispatch_order.ensureUnusedCapacity(self.allocator, 1);
+                try state.completions.ensureUnusedCapacity(self.allocator, state.running + 1);
                 try state.pool.acquire(need);
                 {
                     state.graph.lock.lock();
@@ -369,11 +403,19 @@ pub const Scheduler = struct {
                     t.dispatched_ns = nowNs();
                 }
                 state.running += 1;
+                self.workers.submit(.{ .context = state, .run = RunState.workerRun, .arg = item.id }) catch |err| {
+                    // submit transfers ownership only on success. Never wait
+                    // for a phantom completion when queue allocation fails.
+                    state.running -= 1;
+                    state.pool.release(need);
+                    state.graph.lock.lock();
+                    state.graph.tasks.items[item.id].state = .cancelled;
+                    state.graph.lock.unlock();
+                    return err;
+                };
                 state.report.max_running = @max(state.report.max_running, state.running);
                 state.report.max_mem_bytes = @max(state.report.max_mem_bytes, state.pool.mem_bytes);
-                try state.report.dispatch_order.append(self.allocator, item.id);
-                try state.completions.ensureUnusedCapacity(self.allocator, state.running);
-                try self.workers.submit(.{ .context = state, .run = RunState.workerRun, .arg = item.id });
+                state.report.dispatch_order.appendAssumeCapacity(item.id);
                 dispatched = true;
             }
             for (skipped[0..skipped_n]) |item| try q.push(self.allocator, item);
@@ -645,4 +687,97 @@ test "scheduler reports deadlock when need exceeds budget" {
     var s = try Scheduler.init(std.testing.allocator, .{ .cpu = 1, .worker_threads = 1 });
     defer s.deinit();
     try std.testing.expectError(error.NeedExceedsBudget, s.run(&g, .{ .context = &exec, .run = TestExec.run }, .{}));
+}
+
+test "scheduler safely retires completion signals across repeated windows" {
+    const Noop = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        fn run(ctx: *anyopaque, _: *Graph, _: TaskId, _: TaskDesc) anyerror!RunResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            return .done;
+        }
+    };
+    for ([_]u8{ 1, 4 }) |workers| {
+        var scheduler = try Scheduler.init(std.testing.allocator, .{ .cpu = workers, .worker_threads = workers });
+        defer scheduler.deinit();
+        var exec: Noop = .{};
+        for (0..1000) |window| {
+            var graph = Graph.init(std.testing.allocator);
+            defer graph.deinit();
+            const count = 1 + window % 8;
+            for (0..count) |_| _ = try graph.addTask(.{ .kind = 1, .need = .{ .cpu = 1 } });
+            const fail = window % 17 == 0;
+            if (fail) {
+                try std.testing.expectError(error.InjectedFailure, scheduler.run(&graph, .{ .context = &exec, .run = Noop.run }, .{ .fail_task = 0 }));
+            } else {
+                var report = try scheduler.run(&graph, .{ .context = &exec, .run = Noop.run }, .{});
+                defer report.deinit(std.testing.allocator);
+                try std.testing.expectEqual(@as(u32, @intCast(count)), report.finished);
+            }
+            // The next iteration immediately reuses the same run stack,
+            // releases graph/report allocations and admits another window.
+        }
+        try std.testing.expect(exec.calls.load(.monotonic) > 1000);
+    }
+}
+
+const AllocationFailureObservation = struct { started: u32 = 0 };
+
+fn exerciseSchedulerAllocationFailure(allocator: std.mem.Allocator, observation: *AllocationFailureObservation) !void {
+    const Exec = struct {
+        active: std.atomic.Value(u32) = .init(0),
+        started: std.atomic.Value(u32) = .init(0),
+        fn run(ctx: *anyopaque, _: *Graph, _: TaskId, _: TaskDesc) anyerror!RunResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.active.fetchAdd(1, .acq_rel);
+            _ = self.started.fetchAdd(1, .monotonic);
+            defer _ = self.active.fetchSub(1, .acq_rel);
+            // Keep submitted jobs in flight while later dispatcher bookkeeping
+            // allocations fail. Executor itself makes no allocator calls.
+            sleepNs(1_000_000);
+            return .done;
+        }
+    };
+    var graph = Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    for (0..8) |_| {
+        const first = try graph.addTask(.{ .kind = 1, .need = .{ .cpu = 1 } });
+        _ = try graph.addTaskWithDeps(.{ .kind = 2, .need = .{ .cpu = 1 } }, &.{first});
+    }
+    var scheduler = try Scheduler.init(allocator, .{ .cpu = 4, .worker_threads = 4 });
+    defer scheduler.deinit();
+    var exec: Exec = .{};
+    defer observation.started = exec.started.load(.acquire);
+    var report = scheduler.run(&graph, .{ .context = &exec, .run = Exec.run }, .{}) catch |err| {
+        try std.testing.expectEqual(@as(u32, 0), exec.active.load(.acquire));
+        return err;
+    };
+    defer report.deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 0), exec.active.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 16), report.finished);
+}
+
+test "scheduler allocation failures drain submitted jobs before returning" {
+    var baseline = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var observation: AllocationFailureObservation = .{};
+    try exerciseSchedulerAllocationFailure(baseline.allocator(), &observation);
+    try std.testing.expectEqual(baseline.allocated_bytes, baseline.freed_bytes);
+    var failed_after_start = false;
+    // Worker dequeue timing can change queue-capacity allocation counts.
+    // Sweep the observed count plus headroom, allowing non-induced success;
+    // this is failure-index coverage, not a deterministic allocation trace.
+    for (0..baseline.alloc_index + 16) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        observation = .{};
+        if (exerciseSchedulerAllocationFailure(failing.allocator(), &observation)) |_| {
+            try std.testing.expect(!failing.has_induced_failure);
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            if (observation.started != 0) failed_after_start = true;
+        }
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+    try std.testing.expect(failed_after_start);
 }

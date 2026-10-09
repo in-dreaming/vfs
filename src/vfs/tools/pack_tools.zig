@@ -726,7 +726,11 @@ fn corruptPathHashRecrc(pack_path: []const u8) !void {
     try mutateObject(pack_path, object_key.pathIndexKey(), struct {
         fn f(bytes: []u8) !void {
             const entries_off = fmt.getU32(bytes, 24);
-            fmt.putU64(bytes, entries_off, fmt.getU64(bytes, entries_off) ^ 0x55);
+            // Preserve structural bucket membership so this specifically
+            // exercises the semantic path-hash diagnostic. A changed bucket
+            // bit is now rejected earlier as path_index_invalid at mount.
+            const bucket_count: u64 = fmt.getU32(bytes, 8);
+            fmt.putU64(bytes, entries_off, fmt.getU64(bytes, entries_off) ^ bucket_count);
             fmt.putU32(bytes, 44, fmt.crc32cWithZeroU32(bytes, 44));
         }
     }.f);

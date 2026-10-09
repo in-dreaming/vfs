@@ -52,6 +52,25 @@ pub const Compressed = struct {
     bytes: []u8,
 };
 
+/// Conservative peak codec allocation, including an allocator moving a shrink
+/// realloc (old capacity plus new output). Does not include the caller's raw
+/// input or final VPAG allocation. Keep in sync with codec implementations.
+pub fn compressionMemoryBound(n: usize, codec: file_manifest.Codec, level: i16) !u64 {
+    return switch (codec) {
+        .none => @intCast(n),
+        .lz4 => blk: {
+            if (n > lz4.MAX_INPUT_SIZE) return error.InvalidArgument;
+            var bytes: u64 = @as(u64, lz4.compressBound(n)) * 2;
+            if (n >= 13) {
+                bytes += 65536 * @sizeOf(u32);
+                if (level > 0) bytes += @as(u64, n) * @sizeOf(u16);
+            }
+            break :blk bytes;
+        },
+        else => error.UnsupportedFeature,
+    };
+}
+
 /// Compresses a raw page. When the compressed output would not be smaller
 /// than the input the page is stored raw with `codec = .none` so a reader
 /// never pays for a useless decode.
@@ -93,4 +112,59 @@ test "registry compress page falls back to raw when not smaller" {
     const back = try decompressPage(allocator, .lz4, d.bytes, @intCast(text.len), @import("../format/common.zig").crc32c(text));
     defer allocator.free(back);
     try std.testing.expectEqualSlices(u8, text, back);
+}
+
+// Deliberately refuses resize/remap so realloc must allocate its new buffer
+// before freeing the old one. This exercises the less favorable real lifetime.
+const PeakAllocator = struct {
+    backing: std.mem.Allocator,
+    live: usize = 0,
+    peak: usize = 0,
+
+    fn allocator(self: *PeakAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        const ptr = self.backing.rawAlloc(len, alignment, ra) orelse return null;
+        self.live += len;
+        self.peak = @max(self.peak, self.live);
+        return ptr;
+    }
+
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+
+    fn free(ctx: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        self.live -= bytes.len;
+        self.backing.rawFree(bytes, alignment, ra);
+    }
+};
+
+test "registry memory bound covers codec scratch moving realloc and raw fallback" {
+    const raw = try std.testing.allocator.alloc(u8, 65536);
+    defer std.testing.allocator.free(raw);
+    var rng = std.Random.DefaultPrng.init(7105);
+    for ([_]usize{ 1, 12, 13, 4096, 65536 }) |n| {
+        for ([_]file_manifest.Codec{ .none, .lz4 }) |codec| {
+            for ([_]i16{ 0, 4 }) |level| {
+                for ([_]bool{ false, true }) |random| {
+                    if (random) rng.random().bytes(raw[0..n]) else @memset(raw[0..n], 'a');
+                    var measured = PeakAllocator{ .backing = std.testing.allocator };
+                    const allocator = measured.allocator();
+                    const result = try compressPage(allocator, codec, level, raw[0..n]);
+                    allocator.free(result.bytes);
+                    try std.testing.expectEqual(@as(usize, 0), measured.live);
+                    try std.testing.expect(measured.peak <= try compressionMemoryBound(n, codec, level));
+                }
+            }
+        }
+    }
 }

@@ -40,8 +40,13 @@ pub const PackWriter = struct {
         return .{ .db = db, .keys = std.AutoHashMap(u64, ObjectIdentity).init(allocator) };
     }
 
-    pub fn close(self: *PackWriter) !void {
+    /// Commit queued copies before the caller releases its bounded window.
+    pub fn flush(self: *PackWriter) !void {
         try self.db.commitPending(.sync);
+    }
+
+    pub fn close(self: *PackWriter) !void {
+        try self.flush();
         try self.db.close();
         self.keys.deinit();
     }

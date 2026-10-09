@@ -26,7 +26,10 @@ pub const DEFAULT_READ_HANDLES: u8 = 4;
 pub const PackReader = struct {
     db: kv.KvDb,
     manifest: pack_manifest_fmt.PackManifest,
-    path_index: []u8,
+    /// Owned immutable backing storage for path_index_view. Both are replaced
+    /// together when mounted metadata is refreshed after an admitted update.
+    path_index: []const u8,
+    path_index_view: path_index_fmt.VerifiedView,
 
     pub fn open(allocator: std.mem.Allocator, pack_path: []const u8) !PackReader {
         return openWithOptions(allocator, pack_path, .{});
@@ -40,13 +43,14 @@ pub const PackReader = struct {
         const manifest = try pack_manifest_fmt.decodePackManifest(manifest_bytes);
         const path_index = try readObjectFromDb(&db, allocator, manifest.path_index_key);
         errdefer allocator.free(path_index);
-        _ = try path_index_fmt.verify(path_index);
-        return .{ .db = db, .manifest = manifest, .path_index = path_index };
+        const path_index_view = try path_index_fmt.VerifiedView.init(path_index);
+        return .{ .db = db, .manifest = manifest, .path_index = path_index, .path_index_view = path_index_view };
     }
 
     pub fn close(self: *PackReader, allocator: std.mem.Allocator) void {
         allocator.free(self.path_index);
         self.path_index = &.{};
+        self.path_index_view = undefined;
         self.db.close() catch {};
     }
 
@@ -65,7 +69,7 @@ pub const PackReader = struct {
     pub fn resolvePath(self: *PackReader, allocator: std.mem.Allocator, virtual_path: []const u8) !u64 {
         const normalized = try path_mod.normalizeVirtualPath(allocator, virtual_path);
         defer allocator.free(normalized);
-        const found = try path_index_fmt.lookup(self.path_index, normalized);
+        const found = self.path_index_view.lookup(normalized);
         return if (found) |entry| entry.file_entry else error.NotFound;
     }
 
@@ -135,8 +139,44 @@ test "pack reader resolves path and entry from builder output" {
 
     var reader = try PackReader.open(allocator, pack_path);
     defer reader.close(allocator);
+    for (0..128) |_| {
+        try std.testing.expectEqual(@as(u64, 501), try reader.resolvePath(allocator, "/reader.bin"));
+        try std.testing.expectError(error.NotFound, reader.resolvePath(allocator, "/missing.bin"));
+    }
+    const index_bytes = reader.path_index.ptr;
+    try reader.park();
+    try reader.ensureReady();
+    try std.testing.expectEqual(index_bytes, reader.path_index.ptr);
+    try std.testing.expectEqual(index_bytes, reader.path_index_view.bytes.ptr);
     try std.testing.expectEqual(@as(u64, 501), try reader.resolvePath(allocator, "/reader.bin"));
     var manifest = try reader.readFileManifest(allocator, 501);
     defer manifest.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 11), manifest.header.file_size);
+}
+
+test "pack reader rejects CRC-valid malformed path index at open" {
+    const writer_mod = @import("pack_writer.zig");
+    const fmt = @import("../format/common.zig");
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pack_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(pack_path);
+    const encoded = try path_index_fmt.encodePathIndex(allocator, &.{.{ .normalized_path = "a.txt", .file_entry = 1 }});
+    defer allocator.free(encoded);
+    const entries_off: usize = fmt.getU32(encoded, 24);
+    fmt.putU32(encoded, entries_off + 28, 1);
+    // The link is a self-cycle, but the object checksum is intact.
+    const crc_offset = path_index_fmt.HEADER_SIZE - 4;
+    fmt.putU32(encoded, crc_offset, fmt.crc32cWithZeroU32(encoded, crc_offset));
+    const manifest = pack_manifest_fmt.encodePackManifest(.{ .pack_id = 1, .pack_version = 1, .build_id = 1, .file_count = 1, .tombstone_count = 0 });
+    {
+        var writer = try writer_mod.PackWriter.create(allocator, pack_path);
+        errdefer writer.abort();
+        try writer.putPathIndex(encoded);
+        try writer.putPackManifest(&manifest);
+        try writer.close();
+    }
+    try std.testing.expectError(error.Corruption, PackReader.open(allocator, pack_path));
 }

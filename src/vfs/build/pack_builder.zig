@@ -18,6 +18,7 @@ const pack_reader = @import("../pack/pack_reader.zig");
 const registry = @import("../compress/registry.zig");
 const task = @import("../task/root.zig");
 const publication = @import("publication.zig");
+const source_reader = @import("source_reader.zig");
 pub const recoverBuild = publication.recover;
 
 pub const DEFAULT_PAGE_SIZE: u32 = 64 * 1024;
@@ -50,98 +51,84 @@ pub const IncrementalBuildResult = struct {
     scheduled_tasks: u32 = 0,
 };
 
-const OwnedPathEntry = struct {
-    path: []u8,
-    input_index: usize,
+// Reservations cover the entire page lifetime, not only the encode task.
+// Object identity maps, path metadata and DB indexes are separate O(metadata)
+// costs; see improvement_progress.md. No source/page-count-sized task arrays.
+const BuildStats = struct {
+    tasks: u64 = 0,
+    windows: u64 = 0,
+    peak_reserved: u64 = 0,
+    peak_slots: usize = 0,
+    peak_graph_tasks: usize = 0,
+    peak_report_tasks: usize = 0,
+    peak_pending_ops: usize = 0,
+    peak_pending_payload: u64 = 0,
 };
 
-/// Encoded page ready to be written; produced by the page pipeline tasks.
-const EncodedPage = struct {
-    file_index: usize,
-    page_index: u32,
-    value: []u8,
+const BuildControl = struct {
+    expected: ?[]const build_plan_mod.PlanFile = null,
+    stats: ?*BuildStats = null,
+    fail_after_close: bool = false,
+    fail_after_windows: ?u64 = null,
+    page_allocator: std.mem.Allocator = std.heap.smp_allocator,
 };
 
 const FileBuild = struct {
     input: BuildFileInput,
     normalized_path: []u8,
-    data: []u8 = &.{},
-    content_hash: [32]u8 = [_]u8{0} ** 32,
-    page_count: u32 = 0,
-    pages: []?[]u8 = &.{},
 };
 
-/// Task kinds used by the builder's graph.
-const BuildKind = enum(u16) {
-    read_source = 1,
-    encode_page = 2,
-    file_done = 3,
+const PageSlot = struct {
+    raw: []u8,
+    value: ?[]u8 = null,
+    page_index: u32,
+    reservation: u64,
 };
+
+// Extra conservative admission margin, not an estimate of total heap usage.
+// Scheduler/queue/DB descriptor capacities are separately O(worker_threads),
+// retained up to the largest window. Worker stacks and persistent indexes
+// likewise belong to the disclosed non-payload baseline.
+const SLOT_ADMISSION_SLACK_BYTES: u64 = 4096;
+
+fn pageReservation(raw_len: usize, codec: file_manifest_fmt.Codec, level: i16) !u64 {
+    const n: u64 = raw_len;
+    const value = try std.math.add(u64, n, page_value_fmt.HEADER_SIZE);
+    if (value > std.math.maxInt(u32)) return error.InvalidArgument;
+    const compression = try registry.compressionMemoryBound(raw_len, codec, level);
+    // Raw + compressor scratch/output + VPAG + DB pending copy/key + aligned
+    // DB append copy. Retaining the sum is conservative across stage changes.
+    const append_record = try std.math.add(u64, value, 64 + 8 + 8 + 15);
+    var total = try std.math.add(u64, n, compression);
+    total = try std.math.add(u64, total, try std.math.mul(u64, value, 2));
+    total = try std.math.add(u64, total, append_record);
+    return std.math.add(u64, total, 8 + SLOT_ADMISSION_SLACK_BYTES);
+}
 
 const BuildContext = struct {
     allocator: std.mem.Allocator,
-    files: []FileBuild,
-    lock: db_internal.platform.sync.Mutex = .{},
+    input: BuildFileInput,
+    slots: []PageSlot,
 
-    fn run(ctx: *anyopaque, graph: *task.Graph, id: task.TaskId, desc: task.TaskDesc) anyerror!task.RunResult {
+    fn run(ctx: *anyopaque, _: *task.Graph, _: task.TaskId, desc: task.TaskDesc) anyerror!task.RunResult {
         const self: *BuildContext = @ptrCast(@alignCast(ctx));
-        const file_index: usize = @intCast(desc.label_file_entry);
-        const fb = &self.files[file_index];
-        switch (@as(BuildKind, @enumFromInt(desc.kind))) {
-            .read_source => {
-                const data = try readFileAlloc(self.allocator, fb.input.source_path);
-                const page_count: u32 = if (data.len == 0) 0 else std.math.cast(u32, ((data.len - 1) / fb.input.page_size) + 1) orelse return error.InvalidArgument;
-                const pages = try self.allocator.alloc(?[]u8, page_count);
-                @memset(pages, null);
-                {
-                    self.lock.lock();
-                    defer self.lock.unlock();
-                    fb.data = data;
-                    fb.content_hash = hash.contentHash(data);
-                    fb.page_count = page_count;
-                    fb.pages = pages;
-                }
-                // Fan out one encode task per page now that the size is known.
-                var page_index: u32 = 0;
-                var deps = std.ArrayList(task.TaskId).empty;
-                defer deps.deinit(self.allocator);
-                while (page_index < page_count) : (page_index += 1) {
-                    const need: task.Need = if (fb.input.codec == .none)
-                        .{ .cpu = 1, .mem_bytes = fb.input.page_size, .pack_shared = true, .pack_id = 1 }
-                    else
-                        .{ .cpu_codec = 1, .mem_bytes = @as(u64, fb.input.page_size) * 2, .pack_shared = true, .pack_id = 1 };
-                    const t = try graph.addTaskWithDeps(.{ .kind = @intFromEnum(BuildKind.encode_page), .need = need, .label_file_entry = desc.label_file_entry, .label_index = page_index, .priority = 10 }, &.{id});
-                    try deps.append(self.allocator, t);
-                }
-                _ = try graph.addTaskWithDeps(.{ .kind = @intFromEnum(BuildKind.file_done), .label_file_entry = desc.label_file_entry }, deps.items);
-                return .done;
-            },
-            .encode_page => {
-                const page_index = desc.label_index;
-                const start: usize = @as(usize, page_index) * @as(usize, fb.input.page_size);
-                const end = @min(fb.data.len, start + fb.input.page_size);
-                const raw = fb.data[start..end];
-                const compressed = try registry.compressPage(self.allocator, fb.input.codec, fb.input.codec_level, raw);
-                defer self.allocator.free(compressed.bytes);
-                const value = try page_value_fmt.encodePageValue(self.allocator, .{
-                    .file_entry = fb.input.file_entry,
-                    .block_index = 0,
-                    .page_index = page_index,
-                    .codec = compressed.codec,
-                    .raw_size = @intCast(raw.len),
-                    .stored_size = @intCast(compressed.bytes.len),
-                    .raw_crc = hash.crc32c(raw),
-                    .stored_crc = hash.crc32c(compressed.bytes),
-                    .content_hash = hash.contentHash(raw),
-                    .payload = compressed.bytes,
-                });
-                self.lock.lock();
-                defer self.lock.unlock();
-                fb.pages[page_index] = value;
-                return .done;
-            },
-            .file_done => return .done,
-        }
+        const slot = &self.slots[desc.label_index];
+        const raw = slot.raw;
+        const compressed = try registry.compressPage(self.allocator, self.input.codec, self.input.codec_level, raw);
+        defer self.allocator.free(compressed.bytes);
+        slot.value = try page_value_fmt.encodePageValue(self.allocator, .{
+            .file_entry = self.input.file_entry,
+            .block_index = 0,
+            .page_index = slot.page_index,
+            .codec = compressed.codec,
+            .raw_size = @intCast(raw.len),
+            .stored_size = @intCast(compressed.bytes.len),
+            .raw_crc = hash.crc32c(raw),
+            .stored_crc = hash.crc32c(compressed.bytes),
+            .content_hash = hash.contentHash(raw),
+            .payload = compressed.bytes,
+        });
+        return .done;
     }
 };
 
@@ -150,7 +137,17 @@ pub fn createPack(output_path: []const u8, files: []const BuildFileInput, option
 }
 
 fn createPackInternal(output_path: []const u8, files: []const BuildFileInput, options: PackBuildOptions, fail_after_close: bool) !void {
+    return createPackControlled(output_path, files, options, .{ .fail_after_close = fail_after_close });
+}
+
+fn createPackControlled(output_path: []const u8, files: []const BuildFileInput, options: PackBuildOptions, control: BuildControl) !void {
     const allocator = std.heap.smp_allocator;
+    const page_allocator = control.page_allocator;
+    if (control.expected) |expected| if (expected.len != files.len) return error.InvalidArgument;
+    var stats: BuildStats = .{};
+    defer if (control.stats) |out| {
+        out.* = stats;
+    };
     var publish = try publication.Publication.init(allocator, output_path);
     defer publish.deinit();
     try publish.begin();
@@ -160,15 +157,10 @@ fn createPackInternal(output_path: []const u8, files: []const BuildFileInput, op
     var paths = std.StringHashMap(void).init(allocator);
     defer paths.deinit();
 
-    var builds = try allocator.alloc(FileBuild, files.len);
+    const builds = try allocator.alloc(FileBuild, files.len);
     var builds_init: usize = 0;
     defer {
-        for (builds[0..builds_init]) |*fb| {
-            allocator.free(fb.normalized_path);
-            allocator.free(fb.data);
-            for (fb.pages) |p| if (p) |v| allocator.free(v);
-            allocator.free(fb.pages);
-        }
+        for (builds[0..builds_init]) |fb| allocator.free(fb.normalized_path);
         allocator.free(builds);
     }
     for (files) |input| {
@@ -184,82 +176,139 @@ fn createPackInternal(output_path: []const u8, files: []const BuildFileInput, op
         builds_init += 1;
     }
 
-    // Phase 1: read + encode every page through the task graph.
-    var graph = task.Graph.init(allocator);
-    defer graph.deinit();
-    for (builds, 0..) |fb, i| {
-        _ = fb;
-        _ = try graph.addTask(.{ .kind = @intFromEnum(BuildKind.read_source), .need = .{ .io_read = 1 }, .label_file_entry = @intCast(i), .priority = 20 });
-    }
-    var ctx = BuildContext{ .allocator = allocator, .files = builds };
     var sched = try task.Scheduler.init(allocator, options.budget);
     defer sched.deinit();
-    var report = try sched.run(&graph, .{ .context = &ctx, .run = BuildContext.run }, .{});
-    report.deinit(allocator);
-
-    // Build a fresh, private generation. The old output is never mutated.
+    // Avoid millions of tiny descriptors even with a very large byte budget.
+    const max_slots: usize = @as(usize, sched.budget.worker_threads) * 2;
     var writer = try pack_writer.PackWriter.createWithOptions(allocator, publish.stage, .{ .shards = options.shards });
     var writer_closed = false;
     errdefer if (!writer_closed) writer.abort();
-
     var path_entries = std.ArrayList(path_index_fmt.EntryInput).empty;
     defer path_entries.deinit(allocator);
-    var pack_hash_input = std.ArrayList(u8).empty;
-    defer pack_hash_input.deinit(allocator);
+    var pack_hasher = std.crypto.hash.sha2.Sha256.init(.{});
 
-    for (builds) |fb| {
-        var blocks = std.ArrayList(file_manifest_fmt.BlockDesc).empty;
-        defer blocks.deinit(allocator);
-        if (fb.data.len != 0) {
-            try blocks.append(allocator, .{
-                .raw_offset = 0,
-                .raw_size = fb.data.len,
-                .page_size = fb.input.page_size,
-                .page_count = fb.page_count,
-                .codec = fb.input.codec,
-                .codec_level = fb.input.codec_level,
-                .block_hash = fb.content_hash,
-            });
+    for (builds, 0..) |fb, file_index| {
+        var source = try pf.open(fb.input.source_path, .{ .mode = .read_only });
+        defer pf.close(&source);
+        const source_size = try pf.len(source);
+        const page_count = try source_reader.pageCount(source_size, fb.input.page_size);
+        if (control.expected) |expected| {
+            if (expected[file_index].source_size != source_size) return error.SourceChanged;
         }
-        for (fb.pages, 0..) |maybe_value, page_index| {
-            const value = maybe_value orelse return error.Corruption;
-            try writer.putPage(fb.input.file_entry, 0, @intCast(page_index), value);
+        var file_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        var offset: u64 = 0;
+        var page_index: u32 = 0;
+        while (offset < source_size) {
+            var slots = std.ArrayList(PageSlot).empty;
+            defer {
+                for (slots.items) |slot| {
+                    page_allocator.free(slot.raw);
+                    if (slot.value) |value| page_allocator.free(value);
+                }
+                slots.deinit(allocator);
+            }
+            var reserved: u64 = 0;
+            while (offset < source_size and slots.items.len < max_slots) {
+                const n: usize = @intCast(@min(source_size - offset, fb.input.page_size));
+                const need = try pageReservation(n, fb.input.codec, fb.input.codec_level);
+                if (need > sched.budget.mem_bytes) return error.NeedExceedsBudget;
+                if (need > sched.budget.mem_bytes - reserved) break;
+                const raw = try page_allocator.alloc(u8, n);
+                errdefer page_allocator.free(raw);
+                if (try pf.preadAll(source, offset, raw) != n) return error.SourceChanged;
+                file_hasher.update(raw);
+                try slots.append(allocator, .{ .raw = raw, .page_index = page_index, .reservation = need });
+                reserved += need;
+                offset += n;
+                page_index += 1;
+            }
+            stats.peak_reserved = @max(stats.peak_reserved, reserved);
+            stats.peak_slots = @max(stats.peak_slots, slots.items.len);
+            // All retained raw/encoded/DB copies remain charged to this
+            // window until commit; scheduler task completion does not refund
+            // this ledger. Sum of every admitted slot <= resolved mem_bytes.
+            var graph = task.Graph.init(allocator);
+            defer graph.deinit();
+            for (slots.items, 0..) |slot, i| {
+                _ = try graph.addTask(.{
+                    .kind = 1,
+                    .label_file_entry = fb.input.file_entry,
+                    .label_index = @intCast(i),
+                    .need = if (fb.input.codec == .none)
+                        .{ .cpu = 1, .mem_bytes = slot.reservation }
+                    else
+                        .{ .cpu_codec = 1, .mem_bytes = slot.reservation },
+                });
+            }
+            stats.peak_graph_tasks = @max(stats.peak_graph_tasks, graph.tasks.items.len);
+            var ctx = BuildContext{ .allocator = page_allocator, .input = fb.input, .slots = slots.items };
+            var report = try sched.run(&graph, .{ .context = &ctx, .run = BuildContext.run }, .{});
+            stats.tasks += report.finished;
+            stats.peak_report_tasks = @max(stats.peak_report_tasks, report.dispatch_order.items.len);
+            report.deinit(allocator);
+            var pending_bytes: u64 = 0;
+            for (slots.items) |slot| {
+                const value = slot.value orelse return error.Corruption;
+                try writer.putPage(fb.input.file_entry, 0, slot.page_index, value);
+                pending_bytes += value.len;
+            }
+            stats.peak_pending_payload = @max(stats.peak_pending_payload, pending_bytes);
+            stats.peak_pending_ops = @max(stats.peak_pending_ops, writer.db.pending.items.len);
+            try writer.flush();
+            stats.windows += 1;
+            if (control.fail_after_windows) |limit| if (stats.windows >= limit) return error.InjectedBuildFailure;
         }
+        var extra: [1]u8 = undefined;
+        if (try pf.preadAll(source, source_size, &extra) != 0 or try pf.len(source) != source_size) return error.SourceChanged;
+        var content_hash: [32]u8 = undefined;
+        file_hasher.final(&content_hash);
+        if (control.expected) |expected| {
+            if (!std.mem.eql(u8, &content_hash, &expected[file_index].source_hash)) return error.SourceChanged;
+        }
+        const block = [_]file_manifest_fmt.BlockDesc{.{
+            .raw_offset = 0,
+            .raw_size = source_size,
+            .page_size = fb.input.page_size,
+            .page_count = page_count,
+            .codec = fb.input.codec,
+            .codec_level = fb.input.codec_level,
+            .block_hash = content_hash,
+        }};
         const manifest_value = try file_manifest_fmt.encodeFileManifest(allocator, .{
             .file_entry = fb.input.file_entry,
             .file_version = 1,
-            .file_size = fb.data.len,
-            .content_hash = fb.content_hash,
-            .blocks = blocks.items,
+            .file_size = source_size,
+            .content_hash = content_hash,
+            .blocks = if (source_size == 0) &.{} else &block,
         });
         defer allocator.free(manifest_value);
         try writer.putFileManifest(fb.input.file_entry, manifest_value);
+        // Keep metadata pending bounded too, even with many empty files.
+        try writer.flush();
         try path_entries.append(allocator, .{ .normalized_path = fb.normalized_path, .file_entry = fb.input.file_entry });
-
-        var key_buf = [_]u8{0} ** 8;
-        @memcpy(&key_buf, &object_key.encodeDbKey(fb.input.file_entry));
-        try pack_hash_input.appendSlice(allocator, &key_buf);
-        try pack_hash_input.appendSlice(allocator, fb.normalized_path);
-        try pack_hash_input.append(allocator, 0);
-        try pack_hash_input.appendSlice(allocator, &fb.content_hash);
+        pack_hasher.update(&object_key.encodeDbKey(fb.input.file_entry));
+        pack_hasher.update(fb.normalized_path);
+        pack_hasher.update(&.{0});
+        pack_hasher.update(&content_hash);
     }
-
     const path_index = try path_index_fmt.encodePathIndex(allocator, path_entries.items);
     defer allocator.free(path_index);
     try writer.putPathIndex(path_index);
-
+    try writer.flush();
+    var pack_hash: [32]u8 = undefined;
+    pack_hasher.final(&pack_hash);
     const manifest = pack_manifest_fmt.encodePackManifest(.{
         .pack_id = options.pack_id,
         .pack_version = options.pack_version,
         .build_id = options.build_id,
         .file_count = files.len,
         .tombstone_count = 0,
-        .content_hash = hash.contentHash(pack_hash_input.items),
+        .content_hash = pack_hash,
     });
     try writer.putPackManifest(&manifest);
     try writer.close();
     writer_closed = true;
-    if (fail_after_close) return error.InjectedBuildFailure;
+    if (control.fail_after_close) return error.InjectedBuildFailure;
     try verifyPackDb(publish.stage, allocator);
     try publish.publish();
 }
@@ -305,6 +354,7 @@ pub fn buildFromConfig(cfg_path: []const u8, allocator: std.mem.Allocator) !Incr
 }
 
 pub fn buildPlanIncremental(plan: build_plan_mod.BuildPlan, allocator: std.mem.Allocator) !IncrementalBuildResult {
+    _ = std.math.cast(u32, plan.files.len) orelse return error.InvalidArgument;
     var result: IncrementalBuildResult = .{};
     var cache = build_cache_mod.load(allocator, plan.pack_path) catch |e| switch (e) {
         error.FileNotFound, error.Corruption => blk: {
@@ -315,24 +365,31 @@ pub fn buildPlanIncremental(plan: build_plan_mod.BuildPlan, allocator: std.mem.A
     };
     defer if (cache) |*c| c.deinit(allocator);
 
-    var changed: u32 = 0;
+    var changed: usize = 0;
     if (cache) |c| {
         for (plan.files) |file| {
-            const entry = c.findBySource(file.source_path);
+            const entry = c.findByFileEntry(file.file_entry);
             if (entry == null or !build_cache_mod.matchesPlan(entry.?, file)) changed += 1;
         }
+        if (c.entries.len != plan.files.len) changed += 1;
     } else {
-        changed = @intCast(plan.files.len);
+        changed = plan.files.len;
     }
 
-    if (changed == 0 and try packExists(plan.pack_path) and try packIdentityMatches(plan)) {
+    if (changed == 0 and cache != null and try packExists(plan.pack_path) and try packIdentityMatches(plan) and cacheMatchesOutput(plan, cache.?, allocator)) {
+        // A caller can retain a plan after its snapshot becomes obsolete. A
+        // no-op is safe only while its sources still match that snapshot.
+        for (plan.files) |file| {
+            const current = try source_reader.snapshot(file.source_path);
+            if (current.size != file.source_size or !std.mem.eql(u8, &current.content_hash, &file.source_hash)) return error.SourceChanged;
+        }
         result.skipped_files = @intCast(plan.files.len);
         return result;
     }
 
     var inputs = std.ArrayList(BuildFileInput).empty;
     defer inputs.deinit(allocator);
-    var estimated_tasks: u32 = 0;
+    var planned_tasks: u32 = 0;
     for (plan.files) |file| {
         try inputs.append(allocator, .{
             .source_path = file.source_path,
@@ -342,10 +399,11 @@ pub fn buildPlanIncremental(plan: build_plan_mod.BuildPlan, allocator: std.mem.A
             .codec = file.codec,
             .codec_level = file.codec_level,
         });
-        estimated_tasks += 2 + file.estimated_page_count;
+        planned_tasks = std.math.add(u32, planned_tasks, try source_reader.pageCount(file.source_size, file.page_size)) catch return error.InvalidArgument;
     }
-    try createPack(plan.pack_path, inputs.items, .{ .pack_id = plan.pack_id, .pack_version = plan.pack_version, .build_id = plan.pack_version, .shards = plan.shards });
-    result.scheduled_tasks = estimated_tasks;
+    var stats: BuildStats = .{};
+    try createPackControlled(plan.pack_path, inputs.items, .{ .pack_id = plan.pack_id, .pack_version = plan.pack_version, .build_id = plan.pack_version, .shards = plan.shards }, .{ .expected = plan.files, .stats = &stats });
+    result.scheduled_tasks = @intCast(stats.tasks);
     result.rebuilt_files = @intCast(plan.files.len);
     result.wrote_pack = true;
 
@@ -355,6 +413,27 @@ pub fn buildPlanIncremental(plan: build_plan_mod.BuildPlan, allocator: std.mem.A
         result.cache_write_failed = true;
     };
     return result;
+}
+
+// A source cache is only a hint. Bind every no-op to the published generation's
+// actual manifest bytes and path mapping, not just matching source metadata.
+fn cacheMatchesOutput(plan: build_plan_mod.BuildPlan, cache: build_cache_mod.BuildCache, allocator: std.mem.Allocator) bool {
+    var reader = pack_reader.PackReader.open(allocator, plan.pack_path) catch return false;
+    defer reader.close(allocator);
+    if (reader.manifest.file_count != plan.files.len or cache.entries.len != plan.files.len) return false;
+    for (plan.files) |file| {
+        const entry = cache.findByFileEntry(file.file_entry) orelse return false;
+        const actual_entry = reader.resolvePath(allocator, file.virtual_path) catch return false;
+        if (actual_entry != file.file_entry) return false;
+        const bytes = reader.readObjectAlloc(allocator, file.file_manifest_key) catch return false;
+        defer allocator.free(bytes);
+        const actual_hash = hash.contentHash(bytes);
+        if (!std.mem.eql(u8, &actual_hash, &entry.output_manifest_hash)) return false;
+        var manifest = file_manifest_fmt.decodeFileManifest(allocator, bytes, file.file_entry) catch return false;
+        defer manifest.deinit(allocator);
+        if (manifest.header.file_size != file.source_size or !std.mem.eql(u8, &manifest.header.content_hash, &file.source_hash)) return false;
+    }
+    return true;
 }
 
 fn writeBuildCache(plan: build_plan_mod.BuildPlan, allocator: std.mem.Allocator) !void {
@@ -398,16 +477,6 @@ fn packExists(pack_path: []const u8) !bool {
     };
     pf.close(&f);
     return true;
-}
-
-fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    var f = try pf.open(path, .{ .mode = .read_only });
-    defer pf.close(&f);
-    const size = try pf.len(f);
-    const buf = try allocator.alloc(u8, size);
-    errdefer allocator.free(buf);
-    if (try pf.preadAll(f, 0, buf) != buf.len) return error.Corruption;
-    return buf;
 }
 
 fn readDbObject(allocator: std.mem.Allocator, pack_path: []const u8, key: u64) ![]u8 {
@@ -668,4 +737,180 @@ test "failed replacement retains old valid pack" {
     var reader = try pack_reader.PackReader.open(std.testing.allocator, out);
     defer reader.close(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 7), reader.manifest.pack_version);
+}
+
+test "incremental build invalidates removed inputs and stale planning hashes" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const source = try std.fs.path.join(allocator, &.{ root, "source" });
+    defer allocator.free(source);
+    const output = try std.fs.path.join(allocator, &.{ root, "pack" });
+    defer allocator.free(output);
+    const config = try std.fs.path.join(allocator, &.{ root, "build.cfg" });
+    defer allocator.free(config);
+    try writeSourceFileForTest(source, "original");
+    const cfg_text = try std.fmt.allocPrint(allocator, "pack_path={s}\nfile=/one|7101|{s}\nfile=/two|7102|{s}\n", .{ output, source, source });
+    defer allocator.free(cfg_text);
+    try writeSourceFileForTest(config, cfg_text);
+    _ = try buildFromConfig(config, allocator);
+    const cfg_one = try std.fmt.allocPrint(allocator, "pack_path={s}\nfile=/one|7101|{s}\n", .{ output, source });
+    defer allocator.free(cfg_one);
+    try writeSourceFileForTest(config, cfg_one);
+    const removed = try buildFromConfig(config, allocator);
+    try std.testing.expect(removed.wrote_pack);
+    var reader = try pack_reader.PackReader.open(allocator, output);
+    try std.testing.expectError(error.NotFound, reader.resolvePath(allocator, "/two"));
+    reader.close(allocator);
+    var cfg = try build_cfg_mod.parseFile(allocator, config);
+    defer cfg.deinit(allocator);
+    var plan = try build_plan_mod.create(allocator, cfg);
+    defer plan.deinit(allocator);
+    // Force construction while preserving the obsolete planned source hash.
+    plan.pack_version += 1;
+    try writeSourceFileForTest(source, "modified");
+    try std.testing.expectError(error.SourceChanged, buildPlanIncremental(plan, allocator));
+}
+
+test "bounded pack windows retain reservations through DB commit" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const source = try std.fs.path.join(allocator, &.{ root, "source" });
+    defer allocator.free(source);
+    const output = try std.fs.path.join(allocator, &.{ root, "pack" });
+    defer allocator.free(output);
+    const page_size = 4096;
+    var page: [page_size]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(771);
+    prng.random().bytes(&page);
+    for ([_]file_manifest_fmt.Codec{ .none, .lz4 }) |codec| {
+        const reservation = try pageReservation(page_size, codec, 4);
+        const budget = reservation * 2;
+        var first_peak: usize = 0;
+        for ([_]usize{ 8, 80, 800 }) |pages| {
+            var f = try pf.open(source, .{ .mode = .create_read_write });
+            try pf.setLen(f, 0);
+            for (0..pages) |i| try pf.pwriteAll(f, i * page_size, &page);
+            try pf.pwriteAll(f, pages * page_size, "tail");
+            pf.close(&f);
+            var stats: BuildStats = .{};
+            const inputs = [_]BuildFileInput{.{ .source_path = source, .virtual_path = "/bounded", .file_entry = 0xffff_ffff_0000_7103, .page_size = page_size, .codec = codec, .codec_level = 4 }};
+            const options: PackBuildOptions = .{ .shards = 3, .budget = .{ .mem_bytes = budget, .worker_threads = 2 } };
+            try createPackControlled(output, &inputs, options, .{ .stats = &stats });
+            try std.testing.expectEqual(@as(u64, pages + 1), stats.tasks);
+            try std.testing.expect(stats.windows > 1);
+            try std.testing.expect(stats.peak_reserved <= budget);
+            try std.testing.expectEqual(@as(usize, 2), stats.peak_slots);
+            try std.testing.expectEqual(stats.peak_slots, stats.peak_graph_tasks);
+            try std.testing.expectEqual(stats.peak_slots, stats.peak_report_tasks);
+            try std.testing.expectEqual(stats.peak_slots, stats.peak_pending_ops);
+            try std.testing.expect(stats.peak_pending_payload <= 2 * (page_size + page_value_fmt.HEADER_SIZE));
+            if (pages == 8) first_peak = stats.peak_slots else try std.testing.expectEqual(first_peak, stats.peak_slots);
+            try verifyPackDb(output, allocator);
+            {
+                var reader = try pack_reader.PackReader.open(allocator, output);
+                defer reader.close(allocator);
+                for (0..pages + 1) |i| {
+                    const bytes = try reader.readObjectAlloc(allocator, try object_key.pageKey(inputs[0].file_entry, 0, @intCast(i)));
+                    defer allocator.free(bytes);
+                    const decoded = try page_value_fmt.decodePageValue(bytes, .{ .file_entry = inputs[0].file_entry, .block_index = 0, .page_index = @intCast(i) });
+                    const raw = try registry.decompressPage(allocator, decoded.codec, decoded.payload, decoded.raw_size, decoded.raw_crc);
+                    defer allocator.free(raw);
+                    try std.testing.expectEqualSlices(u8, if (i == pages) "tail" else &page, raw);
+                }
+            }
+            // An encoded window has reached durable staging. Failure must
+            // release all pending copies and leave the previous pack intact.
+            try std.testing.expectError(error.InjectedBuildFailure, createPackControlled(output, &inputs, options, .{ .fail_after_windows = 2 }));
+            try verifyPackDb(output, allocator);
+            const before = try readDbObject(allocator, output, object_key.packManifestKey());
+            defer allocator.free(before);
+            try std.testing.expectError(error.NeedExceedsBudget, createPackControlled(output, &inputs, .{ .budget = .{ .mem_bytes = reservation - 1 } }, .{}));
+            const after = try readDbObject(allocator, output, object_key.packManifestKey());
+            defer allocator.free(after);
+            try std.testing.expectEqualSlices(u8, before, after);
+        }
+    }
+}
+
+test "incremental cache binds published manifests and stale no-op plans" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const source = try std.fs.path.join(allocator, &.{ root, "source" });
+    defer allocator.free(source);
+    const output = try std.fs.path.join(allocator, &.{ root, "pack" });
+    defer allocator.free(output);
+    const config = try std.fs.path.join(allocator, &.{ root, "build.cfg" });
+    defer allocator.free(config);
+    const cfg_text = try std.fmt.allocPrint(allocator, "pack_path={s}\nfile=/one|7104|{s}\n", .{ output, source });
+    defer allocator.free(cfg_text);
+    try writeSourceFileForTest(config, cfg_text);
+    try writeSourceFileForTest(source, "original");
+    _ = try buildFromConfig(config, allocator);
+    try std.testing.expect(!(try buildFromConfig(config, allocator)).wrote_pack);
+    // Replace output externally but retain the cache. Sources return to their
+    // cached state, so only binding to the actual manifest catches this.
+    try writeSourceFileForTest(source, "modified");
+    try createPack(output, &.{.{ .source_path = source, .virtual_path = "/one", .file_entry = 7104 }}, .{});
+    try writeSourceFileForTest(source, "original");
+    const rebuilt = try buildFromConfig(config, allocator);
+    try std.testing.expect(rebuilt.wrote_pack);
+    try std.testing.expectEqual(@as(u32, 1), rebuilt.scheduled_tasks);
+    try std.testing.expectEqual(@as(u32, 1), rebuilt.rebuilt_files);
+    var cfg = try build_cfg_mod.parseFile(allocator, config);
+    defer cfg.deinit(allocator);
+    var plan = try build_plan_mod.create(allocator, cfg);
+    defer plan.deinit(allocator);
+    try writeSourceFileForTest(source, "modified");
+    try std.testing.expectError(error.SourceChanged, buildPlanIncremental(plan, allocator));
+}
+
+test "bounded page admission accounts codec scratch and giant pages" {
+    const none_need = try pageReservation(65536, .none, 0);
+    const lz4_fast = try pageReservation(65536, .lz4, 0);
+    const lz4_chain = try pageReservation(65536, .lz4, 4);
+    try std.testing.expect(none_need > 4 * 65536);
+    try std.testing.expect(lz4_fast > none_need + 262144);
+    try std.testing.expectEqual(@as(u64, 2 * 65536), lz4_chain - lz4_fast);
+    try std.testing.expectError(error.InvalidArgument, pageReservation(std.math.maxInt(u32), .none, 0));
+    try std.testing.expectError(error.InvalidArgument, pageReservation(0x7e000001, .lz4, 0));
+}
+
+test "bounded pack source and encoder allocation failures release every window" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const source = try std.fs.path.join(allocator, &.{ root, "source" });
+    defer allocator.free(source);
+    const output = try std.fs.path.join(allocator, &.{ root, "pack" });
+    defer allocator.free(output);
+    try writeSourceFileForTest(source, "0123456789abcdef");
+    const inputs = [_]BuildFileInput{.{ .source_path = source, .virtual_path = "/fail", .file_entry = 7106, .page_size = 4 }};
+    const options: PackBuildOptions = .{ .budget = .{ .worker_threads = 1, .mem_bytes = 2 * try pageReservation(4, .none, 0) } };
+    try createPack(output, &inputs, .{ .pack_version = 99 });
+    // Four pages each allocate raw, codec output and VPAG. This covers read
+    // allocation, partial encode results, and failures after a flushed window.
+    for (0..12) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        try std.testing.expectError(error.OutOfMemory, createPackControlled(output, &inputs, options, .{ .page_allocator = failing.allocator() }));
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        var reader = try pack_reader.PackReader.open(allocator, output);
+        defer reader.close(allocator);
+        try std.testing.expectEqual(@as(u64, 99), reader.manifest.pack_version);
+    }
 }

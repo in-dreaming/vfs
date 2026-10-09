@@ -143,3 +143,61 @@ Against the final product tree after all review fixes:
 - Real process-death matrix: **20/20 cases**, **4/4 test-heavy steps**. Rebuilt the harness against the final tree; every interrupted child was owned by the harness and every resume was a fresh process.
 - ReleaseSafe build: **18/18 steps**. `git diff --check` passed.
 - Final independent admission/ABI and patch-recovery/harness reviews reported no remaining blockers in their respective reviewed scopes. No push performed.
+
+## Stage 4: bounded construction and verified path-index views (2026-10-08)
+
+### Implemented
+
+- Replace whole-source/all-encoded-page retention with bounded windows: read source pages in order, update SHA256, encode through the existing task scheduler, queue encoded values, write through the existing shard-routing PackWriter, commit the window, and release it. A scheduler/worker pool is reused; each window destroys its graph and report. No page-count-sized task graph, dependency list, source allocation or output array remains.
+- Reserve each admitted page's full lifetime against the existing resolved `Budget.mem_bytes`, including raw source, codec output/scratch and moving-realloc capacity, VPAG bytes, the DB-owned pending copy/key, and the aligned DB append buffer copy. Scheduler completion does not release the enclosing window reservation. Reject a page that cannot fit before allocating it; never silently exceed the configured payload budget for a giant page. Check codec and DB value-width limits.
+- Make repeated scheduler-run retirement safe: workers signal their completion condition before releasing the run-state mutex, so no trailing signal can mutate a retired/reused stack frame. On dispatcher allocation/submission errors, stop admission and drain all actually submitted jobs without allocating before destroying RunState. Reserve completion/report storage before submission and roll back rejected submissions, preventing phantom completions and cleanup hangs. Existing task failure/continuation behavior is preserved.
+- Derive the slot limit from existing worker count (at most twice `worker_threads`), so tiny pages cannot create arbitrarily many descriptors. Flush DB pending values after every page window and individual file manifest. Keep all writes private until close/verify/publish, preserving the stage 1 offline publication/recovery protocol.
+- Stream planning hashes through a fixed 64 KiB buffer. Construction compares the actual written source size/hash against its plan before publication; no-op plans recheck the source snapshot. Short reads, growth or final length changes fail closed. Stream the pack content hash using the identical previous byte sequence.
+- Config incremental behavior remains **whole-generation rebuild on any change**, with a no-op for unchanged inputs; this is not selective encoded-file reuse. Validate the complete input set (including removals), match cache entries by FileEntry64 rather than source path, and bind a no-op to actual published file-manifest hashes/content metadata/path mappings and pack identity. Report actual encode-task counts rather than estimates; empty files require no encode tasks.
+- Retain immutable path-index bytes plus a verified view in PackReader. Validate once at open/mount, then resolve paths without repeated CRC/full-index scans. Public byte-oriented lookup wrappers still validate untrusted input. Validation now includes checked layout arithmetic, nonempty bounded strings, heads/links, stored-hash bucket membership, cycle detection and exact reachability in O(buckets + entries), without an extra visited allocation. Full-path comparison under hash collisions, valid forward links, FileEntry64, and format bytes remain unchanged. Stage 3 metadata replacement naturally rebuilds the view; parking preserves the owned bytes.
+
+### Memory and source-stability contract
+
+The limit is a **payload-pipeline working-set bound**, not a total process RSS limit. For raw page size `n`, VPAG value bound `V=n+104`, codec allocation bound `C`, admission conservatively reserves:
+
+`n + C + 3*V + 95 + 8 + 4096` bytes.
+
+The 95 covers DB record header/key/footer/alignment; the additional 8 covers the pending DB key. The 4096 is extra admission slack, not a proof that every descriptor allocation fits that amount. None codec has `C=n`. LZ4 has `C=2*(n+n/255+16)`, plus 262144 bytes of matcher heads for n>=13, plus 2*n chain bytes at positive compression levels. The double compressed capacity covers moving shrink realloc. For 64 KiB pages, reservations are 332191 bytes (none), 660417 bytes (LZ4 level 0), and 791489 bytes (LZ4 level 4). Raw fallback remains bounded by the source page size. Actual last-page length determines admission.
+
+Scheduler/queue/report/DB descriptor capacities are separately bounded O(worker_threads), including capacities retained from the largest window. Fixed worker stacks, allocator overhead, mmap/address space and OS page cache are outside this payload accounting. The recorded window high water is reserved payload capacity, not aggregate allocator/RSS measurement; the codec regression separately measures actual peak requested allocations, including forced moving realloc.
+
+Metadata is intentionally not constant-sized: file/path/cache metadata is O(files + path bytes), PackWriter collision identities and DB checkpoint/verification indexes are O(objects/pages). The path-index object is exactly `48 + 4*bucketCount(F) + 40*F + S` bytes (bucketCount is the power of two at least 2*F, or 1 for no files). Encoding/writing that singleton temporarily retains multiple metadata copies. Final verification also uses metadata-sized indexes and one record-sized payload. No external-memory index redesign, bounded whole-verifier RSS, parallel DB commit redesign, new I/O runtime, public callback, or format change is claimed.
+
+Sources must remain stable during planning/build. Hash comparisons reject observed differences, including same-size changes between passes; they are not a filesystem snapshot or lock against arbitrary concurrent mutation. Direct createPack describes the bytes it actually read. Config builds bind cache facts to the matching planned/written bytes, and an observed mismatch leaves the prior published pack intact.
+
+### Verification
+
+Test-first regressions reproduced removed-input no-op invalidation, whole-file planning allocation under a 16 KiB metadata allocator, and CRC-valid invalid path links. Added coverage includes bounded source reads, size changes, page-count arithmetic, window/graph/report/pending high waters across growing inputs, none/LZ4 and multiple shards, complete decoded page comparisons, admission failure and failure after committed private windows, source/encoder allocation failures, published-manifest/cache binding, stale no-op plans, actual codec peak allocations, mount-time malformed-index rejection, and repeated verified lookups across park/reopen.
+
+The existing semantic path-hash corruption fixture now flips a non-bucket hash bit: changing bucket membership is correctly rejected earlier as structural path-index corruption, while this fixture continues testing the separate path_hash_mismatch diagnostic.
+
+A deliberately injected scheduler-allocation regression first observed an active worker after run returned, then crashed; it passes after nonallocating error drain was added. Repeated-run stress covers 1000 windows each with 1/4 workers, including task-error windows. One earlier overlapping aggregate invocation had an allocator fault in the capacity regression; its owned transaction was recovered through recover-build. Three clean serial suites subsequently passed before the additional scheduler fixes. The original allocator fault's precise cause is not proven; it is not dismissed as fixture interference. Final commands and results are recorded below after final-tree verification. Platform coverage remains Linux x86_64 ReleaseSafe; Debug CRC portability remains for stage 5.
+
+### Final Stage 4 verification
+
+Against the final product and stabilized test tree, strictly serial execution:
+
+- Full ReleaseSafe aggregate passed **198/198 Zig tests** (47 DB, 150 VFS, 1 roundtrip), **30/30 steps**, including static and shared C smoke. Repeated three consecutive times after the final test-only change; all passed.
+- Final `test-heavy`: **20/20 real process-death recovery cases**, **4/4 steps**. Final ReleaseSafe build: **18/18 steps**.
+- Final CLI binaries: a tiny pack replaced by a 64 MiB / 1024-page source, and a fresh pack from that source. Both verify-pack runs reported **zero issues**; extraction plus full-byte `cmp` passed. Combined maximum RSS of the two builder children was **27428 KiB** on this host, an observation rather than a process-memory guarantee.
+- Window regressions compare 8, 80 and 800 full pages plus a tail under a two-slot budget; actual graph/report/pending operation counts stay at two for none/LZ4. Payload-allocation failures cover partially encoded and previously committed private windows. Codec peak-allocation tests force moving realloc. Scheduler tests use a bounded failure-index sweep that tolerates worker-timing-dependent allocation counts while rejecting swallowed OOM, leaks and early return with active executors; this is not exhaustive allocation-path coverage.
+- Independent read-only reviews of the bounded builder, verified index/lifetimes and final scheduler drain reported no remaining blockers. All changed Zig files were formatted; `git diff --check` passed. No push.
+
+```sh
+ZIG=/tmp/vfs-review-tools/zig-x86_64-linux-0.16.0/zig
+export ZIG_GLOBAL_CACHE_DIR=/tmp/vfs-review-tools/global-cache
+# Run sequentially; fixed historical test fixtures are not concurrency-safe.
+$ZIG build test -Doptimize=ReleaseSafe -j2 --summary all  # three final runs
+$ZIG build test-heavy -Doptimize=ReleaseSafe -j2 --summary all
+$ZIG build -Doptimize=ReleaseSafe -j2 --summary all
+# Isolated mktemp root: put-file tiny -> 64 MiB, fresh 64 MiB,
+# verify-pack both, extract-file both, cmp all bytes.
+git diff --check
+```
+
+Residual limits are the payload/metadata/source-stability/offline contracts above, non-exhaustive failure injection, no race-detector or cross-platform runtime validation, and the pre-existing Debug CRC portability issue deferred to stage 5. The earlier allocator fault's exact cause remains unproven; the independently demonstrated scheduler lifetime and allocation-unwind defects were fixed and the final serial gates passed.

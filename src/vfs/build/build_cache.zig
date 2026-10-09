@@ -30,6 +30,11 @@ pub const BuildCache = struct {
         self.* = undefined;
     }
 
+    pub fn findByFileEntry(self: BuildCache, file_entry: u64) ?Entry {
+        for (self.entries) |entry| if (entry.file_entry == file_entry) return entry;
+        return null;
+    }
+
     pub fn findBySource(self: BuildCache, source_path: []const u8) ?Entry {
         for (self.entries) |entry| if (std.mem.eql(u8, entry.source_path, source_path)) return entry;
         return null;

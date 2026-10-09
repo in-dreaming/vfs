@@ -7,6 +7,7 @@ const hash = @import("../hash.zig");
 const fmt = @import("../format/common.zig");
 const file_manifest = @import("../format/file_manifest.zig");
 const registry = @import("../compress/registry.zig");
+const source_reader = @import("source_reader.zig");
 
 pub const PlanFile = struct {
     virtual_path: []u8,
@@ -61,10 +62,8 @@ pub fn create(allocator: std.mem.Allocator, cfg: build_cfg.BuildCfg) !BuildPlan 
         const codec_level = file.codec_level orelse cfg.default_codec_level;
         if (file.file_entry == 0 or page_size == 0) return error.InvalidArgument;
         const codec_id = try registry.codecIdentity(codec);
-        const source = try readFileAlloc(allocator, file.source_path);
-        defer allocator.free(source);
-        const source_size: u64 = source.len;
-        const page_count: u32 = if (source.len == 0) 0 else std.math.cast(u32, ((source.len - 1) / page_size) + 1) orelse return error.InvalidArgument;
+        const source = try source_reader.snapshot(file.source_path);
+        const page_count = try source_reader.pageCount(source.size, page_size);
         const fm_key = try object_key.fileManifestKey(file.file_entry);
         const first_page_key = if (page_count == 0) 0 else try object_key.pageKey(file.file_entry, 0, 0);
         try files.append(allocator, .{
@@ -74,9 +73,9 @@ pub fn create(allocator: std.mem.Allocator, cfg: build_cfg.BuildCfg) !BuildPlan 
             .page_size = page_size,
             .codec = codec,
             .codec_level = codec_level,
-            .source_size = source_size,
+            .source_size = source.size,
             .source_mtime = 0,
-            .source_hash = hash.contentHash(source),
+            .source_hash = source.content_hash,
             .build_cfg_hash = try fileCfgHash(allocator, file, page_size, codec, codec_level),
             .compressor_version_hash = codec_id.version_hash,
             .estimated_page_count = page_count,
@@ -116,16 +115,6 @@ fn fileCfgHash(allocator: std.mem.Allocator, file: build_cfg.FileConfig, page_si
     return hash.contentHash(bytes.items);
 }
 
-fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    var f = try pf.open(path, .{ .mode = .read_only });
-    defer pf.close(&f);
-    const size = try pf.len(f);
-    const buf = try allocator.alloc(u8, size);
-    errdefer allocator.free(buf);
-    if (try pf.preadAll(f, 0, buf) != buf.len) return error.Corruption;
-    return buf;
-}
-
 test "build plan resolves metadata keys and rejects unsupported codec" {
     const allocator = std.testing.allocator;
     const builder = @import("pack_builder.zig");
@@ -134,7 +123,8 @@ test "build plan resolves metadata keys and rejects unsupported codec" {
     _ = std.Io.Dir.cwd().deleteFile(io, source) catch {};
     defer _ = std.Io.Dir.cwd().deleteFile(io, source) catch {};
     try builder.writeSourceFileForTest(source, "abc");
-    const cfg_bytes = try std.fmt.allocPrint(allocator,
+    const cfg_bytes = try std.fmt.allocPrint(
+        allocator,
         "pack_path=zig-cache-vfs-plan-pack\nfile=/a.txt|10|{s}|2|none|0\n",
         .{source},
     );
@@ -144,4 +134,42 @@ test "build plan resolves metadata keys and rejects unsupported codec" {
     var plan = try create(allocator, cfg);
     defer plan.deinit(allocator);
     try std.testing.expectEqual(@as(u32, 2), plan.files[0].estimated_page_count);
+}
+
+test "build plan hashes large source with bounded metadata allocation" {
+    const source_path = "zig-cache-vfs-plan-streamed-source.bin";
+    const io = std.Io.Threaded.global_single_threaded.io();
+    _ = std.Io.Dir.cwd().deleteFile(io, source_path) catch {};
+    defer _ = std.Io.Dir.cwd().deleteFile(io, source_path) catch {};
+
+    const chunk = [_]u8{0xa5} ** (64 * 1024);
+    const chunk_count = 65;
+    var expected_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var source = try pf.open(source_path, .{ .mode = .create_read_write });
+    {
+        defer pf.close(&source);
+        for (0..chunk_count) |i| {
+            try pf.pwriteAll(source, i * chunk.len, &chunk);
+            expected_hasher.update(&chunk);
+        }
+        try pf.pwriteAll(source, chunk_count * chunk.len, "tail");
+        expected_hasher.update("tail");
+    }
+    var expected_hash: [32]u8 = undefined;
+    expected_hasher.final(&expected_hash);
+
+    var cfg = try build_cfg.parseBytes(
+        std.testing.allocator,
+        "pack_path=zig-cache-vfs-plan-streamed-pack\n" ++
+            "file=/large.bin|100|zig-cache-vfs-plan-streamed-source.bin|65536|none|0\n",
+    );
+    defer cfg.deinit(std.testing.allocator);
+    // This can hold the plan metadata, but cannot hold the source contents.
+    var metadata: [16 * 1024]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&metadata);
+    var plan = try create(bounded.allocator(), cfg);
+    defer plan.deinit(bounded.allocator());
+    try std.testing.expectEqual(@as(u64, chunk_count * chunk.len + 4), plan.files[0].source_size);
+    try std.testing.expectEqual(@as(u32, chunk_count + 1), plan.files[0].estimated_page_count);
+    try std.testing.expectEqualSlices(u8, &expected_hash, &plan.files[0].source_hash);
 }
