@@ -162,7 +162,17 @@ int main(int argc, char** argv) {
     if (read_all(volume, bytes, sizeof(bytes), &n) != VFS_OK) return 52;
     if (n != sizeof(k_payload_v2) - 1) return 53;
     if (memcmp(bytes, k_payload_v2, sizeof(k_payload_v2) - 1) != 0) return 54;
+    /* Additive mounted entry point is linked and exercised in both libraries. */
+    if (vfs_open_path(volume, k_vpath, 0, &file) != VFS_OK) return 70;
+    if (vfs_patch_begin_in_volume(volume, 1, diffs, 1, &popts, &patch) != VFS_BUSY) return 71;
+    if (vfs_close_file(file) != VFS_OK) return 72;
+    if (vfs_patch_begin_in_volume(volume, 1, diffs, 1, &popts, &patch) != VFS_OK) return 73;
+    if (vfs_patch_wait(patch, 30000) != VFS_OK) return 74;
+    memset(&prog, 0, sizeof(prog));
+    prog.struct_size = (uint32_t)sizeof(prog);
+    if (vfs_patch_poll(patch, &prog) != VFS_OK || prog.state != VFS_PATCH_DONE) return 75;
     if (vfs_close_volume(volume) != VFS_OK) return 55;
+    if (vfs_patch_end(patch) != VFS_OK) return 76;
 
     /* Re-applying is a no-op that still completes. */
     patch = 0;

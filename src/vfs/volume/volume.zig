@@ -16,6 +16,7 @@ const object_key = @import("../object_key.zig");
 const registry = @import("../compress/registry.zig");
 const fmt = @import("../format/common.zig");
 const sync = @import("db_internal").platform.sync;
+const admission = @import("pack_admission.zig");
 
 pub const DEFAULT_MAX_OPEN_STORES: u32 = 16;
 
@@ -41,6 +42,7 @@ pub const Volume = struct {
         reader: *pack_reader.PackReader,
         path: []u8,
         writable: bool = false,
+        recovery_required: std.atomic.Value(bool) = .init(false),
         /// Readers currently using `reader`. Modified without the volume lock
         /// on the fast path; see `pinFast` / `drainPinsLocked`.
         pin_count: std.atomic.Value(u32) = .init(0),
@@ -83,6 +85,7 @@ pub const Volume = struct {
     next_mount_order: u64 = 1,
     open_file_count: std.atomic.Value(usize) = .init(0),
     writable_path: []u8 = &.{},
+    update_active: std.atomic.Value(bool) = .init(false),
     /// Serializes mount / write / park / refresh. Readers never take it; they
     /// use `published` and per-mount atomic pins.
     lock: sync.Mutex = .{},
@@ -105,7 +108,7 @@ pub const Volume = struct {
         for (self.mounts.items) |mounted| {
             mounted.reader.close(std.heap.smp_allocator);
             std.heap.smp_allocator.destroy(mounted.reader);
-            std.heap.smp_allocator.free(mounted.path);
+            admission.unmount(mounted.path);
             std.heap.smp_allocator.destroy(mounted);
         }
         self.mounts.deinit(std.heap.smp_allocator);
@@ -135,15 +138,17 @@ pub const Volume = struct {
     }
 
     fn mountPackWithPriorityLocked(self: *Volume, pack_path: []const u8, priority: u32, flags: u32) !void {
+        if (self.update_active.load(.acquire)) return error.Busy;
         if (pack_path.len == 0) return error.InvalidArgument;
         for (self.mounts.items) |mounted| if (mounted.meta.priority == priority) return error.InvalidArgument;
+        const owned_path = try admission.mount(pack_path);
+        errdefer admission.unmount(owned_path);
         const reader = try std.heap.smp_allocator.create(pack_reader.PackReader);
         errdefer std.heap.smp_allocator.destroy(reader);
         reader.* = try pack_reader.PackReader.openWithOptions(std.heap.smp_allocator, pack_path, .{ .read_handles = self.options.read_handles });
         errdefer reader.close(std.heap.smp_allocator);
         try self.checkOverlayLayeringLocked(reader.manifest, priority);
-        const owned_path = try std.heap.smp_allocator.dupe(u8, pack_path);
-        errdefer std.heap.smp_allocator.free(owned_path);
+
         const node = try std.heap.smp_allocator.create(MountedPack);
         errdefer std.heap.smp_allocator.destroy(node);
         self.store_clock += 1;
@@ -151,6 +156,7 @@ pub const Volume = struct {
             .meta = .{ .pack_id = reader.manifest.pack_id, .priority = priority, .mount_order = self.next_mount_order, .pack_version = reader.manifest.pack_version, .flags = flags },
             .reader = reader,
             .path = owned_path,
+            .recovery_required = .init(try readerHasIntent(reader)),
             .last_used = self.store_clock,
             .pack_version = .init(reader.manifest.pack_version),
             .mount_order = .init(self.next_mount_order),
@@ -238,25 +244,27 @@ pub const Volume = struct {
     pub fn setWritablePack(self: *Volume, pack_path: []const u8) !void {
         self.lock.lock();
         defer self.lock.unlock();
+        if (self.update_active.load(.acquire)) return error.Busy;
         if (self.writable_path.len != 0) return error.InvalidArgument;
-        var existing = pack_reader.PackReader.open(std.heap.smp_allocator, pack_path) catch |e| switch (e) {
-            error.NotFound, error.FileNotFound => null,
+        const owned_writable = try std.heap.smp_allocator.dupe(u8, pack_path);
+        errdefer std.heap.smp_allocator.free(owned_writable);
+        const priority = std.math.maxInt(u32);
+        // Reserve canonical admission before any PackReader open. Probing an
+        // existing path first would bypass another Volume's active lease.
+        self.mountPackWithPriorityLocked(pack_path, priority, 1) catch |e| switch (e) {
+            error.NotFound, error.FileNotFound => {
+                try createEmptyPack(pack_path);
+                try self.mountPackWithPriorityLocked(pack_path, priority, 1);
+            },
             else => |err| return err,
         };
-        if (existing) |*reader| {
-            reader.close(std.heap.smp_allocator);
-        } else {
-            try createEmptyPack(pack_path);
-        }
-        const priority = std.math.maxInt(u32);
-        try self.mountPackWithPriorityLocked(pack_path, priority, 1);
         for (self.mounts.items) |mounted| {
             if (mounted.meta.priority == priority) {
                 mounted.writable = true;
                 break;
             }
         }
-        self.writable_path = try std.heap.smp_allocator.dupe(u8, pack_path);
+        self.writable_path = owned_writable;
     }
 
     pub fn findMountedPack(self: *Volume, pack_id: u64, pack_generation: u64) ?*MountedPack {
@@ -277,23 +285,42 @@ pub const Volume = struct {
     pub fn writeFileByEntry(self: *Volume, file_entry: u64, data: []const u8, options: WriteOptions) !void {
         self.lock.lock();
         defer self.lock.unlock();
+        const write_mount = self.writableMount() orelse return error.PermissionDenied;
+        for (self.mounts.items) |m| if (m.recovery_required.load(.acquire)) return error.Busy;
+        try self.beginExclusiveLocked();
+        defer self.endExclusiveLocked();
+        try admission.begin(&.{write_mount.path});
+        defer admission.end(&.{write_mount.path});
         try self.writeFileInternal(null, file_entry, data, options);
     }
 
     pub fn writeFileByPath(self: *Volume, virtual_path: []const u8, file_entry: u64, data: []const u8, options: WriteOptions) !void {
         self.lock.lock();
         defer self.lock.unlock();
+        const write_mount = self.writableMount() orelse return error.PermissionDenied;
+        for (self.mounts.items) |m| if (m.recovery_required.load(.acquire)) return error.Busy;
+        try self.beginExclusiveLocked();
+        defer self.endExclusiveLocked();
+        try admission.begin(&.{write_mount.path});
+        defer admission.end(&.{write_mount.path});
         try self.writeFileInternal(virtual_path, file_entry, data, options);
     }
 
     pub fn deleteEntry(self: *Volume, file_entry: u64) !void {
         self.lock.lock();
         defer self.lock.unlock();
+        const write_mount = self.writableMount() orelse return error.PermissionDenied;
+        for (self.mounts.items) |m| if (m.recovery_required.load(.acquire)) return error.Busy;
+        try self.beginExclusiveLocked();
+        defer self.endExclusiveLocked();
+        try admission.begin(&.{write_mount.path});
+        defer admission.end(&.{write_mount.path});
         if (file_entry == 0) return error.InvalidArgument;
         const mounted = self.writableMount() orelse return error.PermissionDenied;
+        mounted.recovery_required.store(true, .release);
         var writer = try pack_writer.PackWriter.create(std.heap.smp_allocator, mounted.path);
         var closed = false;
-        errdefer if (!closed) writer.close() catch {};
+        errdefer if (!closed) writer.abort();
         const tombstone = try tombstone_fmt.encodeEntryTombstone(.{ .file_entry = file_entry, .tombstone_version = 1, .reason_flags = 1 });
         try writer.putEntryTombstone(file_entry, &tombstone);
         const manifest = pack_manifest_fmt.encodePackManifest(.{ .pack_id = mounted.meta.pack_id, .pack_version = mounted.reader.manifest.pack_version + 1, .build_id = mounted.reader.manifest.build_id + 1, .file_count = mounted.reader.manifest.file_count, .tombstone_count = mounted.reader.manifest.tombstone_count + 1, .content_hash = hash.contentHash(&tombstone) });
@@ -316,9 +343,10 @@ pub const Volume = struct {
         // Existing explicit PageRef records encode only u32 IDs. Preserve
         // wider pack identities by writing ordinary implicit pages instead.
         const ref_pack_id = std.math.cast(u32, mounted.meta.pack_id);
+        mounted.recovery_required.store(true, .release);
         var writer = try pack_writer.PackWriter.create(std.heap.smp_allocator, mounted.path);
         var closed = false;
-        errdefer if (!closed) writer.close() catch {};
+        errdefer if (!closed) writer.abort();
         const page_count: u32 = if (data.len == 0) 0 else std.math.cast(u32, ((data.len - 1) / options.page_size) + 1) orelse return error.InvalidArgument;
         const new_generation = mounted.reader.manifest.pack_version + 1;
         var page_refs = std.ArrayList(file_manifest_fmt.PageRef).empty;
@@ -511,9 +539,22 @@ pub const Volume = struct {
     /// idle, rather than spending a fixed spin budget against busy readers.
     /// Callers must not retain an unrelated read-only store while acquiring.
     pub fn pinMounted(self: *Volume, mounted: *MountedPack) !void {
-        if (mounted.pinFast() != null) return;
+        if (self.update_active.load(.acquire) or mounted.recovery_required.load(.acquire)) return error.Busy;
+        if (mounted.pinFast() != null) {
+            // Admission may have completed between the first flag checks and
+            // acquiring the pin. Never revive a recovery-required reader.
+            if (self.update_active.load(.acquire) or mounted.recovery_required.load(.acquire)) {
+                self.unpinMounted(mounted);
+                return error.Busy;
+            }
+            return;
+        }
         while (true) {
             self.lock.lock();
+            if (self.update_active.load(.acquire) or mounted.recovery_required.load(.acquire)) {
+                self.lock.unlock();
+                return error.Busy;
+            }
             self.store_notify_lock.lock();
             const observed = self.store_epoch;
             self.store_notify_lock.unlock();
@@ -623,32 +664,174 @@ pub const Volume = struct {
         }
     }
 
-    /// Block until no fast-path reader is using `mounted`, then hold it in the
-    /// PARKING state so none can start. Exclusive lock must be held.
-    fn drainPinsLocked(mounted: *MountedPack) void {
-        var spins: u32 = 0;
-        while (mounted.pin_count.cmpxchgWeak(0, PIN_PARKING, .acq_rel, .acquire) != null) {
-            spins += 1;
-            if (spins < 64) std.atomic.spinLoopHint() else std.Thread.yield() catch {};
+    /// Never wait for readers under Volume.lock. A reader may itself need
+    /// that lock to open a foreign page source. Admission returns Busy instead.
+    fn beginExclusiveLocked(self: *Volume) !void {
+        if (self.update_active.load(.acquire) or self.open_file_count.load(.seq_cst) != 0) return error.Busy;
+        self.update_active.store(true, .release);
+        var held: usize = 0;
+        errdefer {
+            for (self.mounts.items[0..held]) |m| _ = m.pin_count.fetchSub(PIN_PARKING, .release);
+            self.update_active.store(false, .release);
         }
+        for (self.mounts.items) |m| {
+            if (m.pin_count.cmpxchgStrong(0, PIN_PARKING, .acq_rel, .acquire) != null) return error.Busy;
+            held += 1;
+        }
+        // An opener can publish its handle between the first count check and
+        // releasing its pin. The sentinels now prevent further admissions.
+        if (self.open_file_count.load(.seq_cst) != 0) return error.Busy;
     }
 
-    fn releaseDrainedLocked(mounted: *MountedPack) void {
-        _ = mounted.pin_count.fetchSub(PIN_PARKING, .release);
+    fn endExclusiveLocked(self: *Volume) void {
+        for (self.mounts.items) |m| _ = m.pin_count.fetchSub(PIN_PARKING, .release);
+        // Internal mutation reads can reopen foreign stores; trim only after
+        // exclusive sentinels are removed, while admission remains closed.
+        self.evictReadonlyLocked() catch {};
+        self.update_active.store(false, .release);
+        self.store_notify_lock.lock();
+        defer self.store_notify_lock.unlock();
+        self.store_epoch +%= 1;
+        self.store_available.broadcast();
     }
 
-    fn refreshWritableMount(self: *Volume) !void {
-        const mounted = self.writableMount() orelse return error.PermissionDenied;
-        drainPinsLocked(mounted);
-        defer releaseDrainedLocked(mounted);
+    fn refreshMountedLocked(self: *Volume, mounted: *MountedPack) !void {
+        // Keep a valid parked reader on failed reopen; never leave undefined
+        // reader storage reachable by close or a later recovery attempt.
+        try mounted.reader.park();
+        var replacement = try pack_reader.PackReader.openWithOptions(std.heap.smp_allocator, mounted.path, .{ .read_handles = self.options.read_handles });
+        errdefer replacement.close(std.heap.smp_allocator);
+        if (replacement.manifest.pack_id != mounted.meta.pack_id) return error.PreconditionFailed;
+        if (try readerHasIntent(&replacement)) return error.Busy;
         mounted.reader.close(std.heap.smp_allocator);
-        mounted.reader.* = try pack_reader.PackReader.openWithOptions(std.heap.smp_allocator, mounted.path, .{ .read_handles = self.options.read_handles });
-        mounted.meta.pack_version = mounted.reader.manifest.pack_version;
+        mounted.reader.* = replacement;
+        mounted.meta.pack_version = replacement.manifest.pack_version;
         mounted.meta.mount_order = self.next_mount_order;
         mounted.pack_version.store(mounted.meta.pack_version, .release);
         mounted.mount_order.store(mounted.meta.mount_order, .release);
         self.next_mount_order += 1;
+        mounted.recovery_required.store(false, .release);
+    }
+
+    fn verifyUpdatedMountLocked(self: *Volume, target: *MountedPack) !void {
+        const a = std.heap.smp_allocator;
+        var verification = try @import("../tools/pack_tools.zig").verifyPack(target.path, a);
+        defer verification.deinit(a);
+        // Standalone verification cannot resolve foreign PageRefs. Validate
+        // those against this admitted volume below rather than reject valid
+        // writable packs that reuse immutable source pages.
+        for (verification.issues.items) |issue| if (issue.kind != .page_ref_pack_missing) return error.Corruption;
+        var image = try @import("../diff/pack_scan.zig").PackImage.load(a, target.path);
+        defer image.deinit();
+        var files = image.files.valueIterator();
+        while (files.next()) |file| {
+            const manifest = &file.manifest;
+            for (manifest.blocks, 0..) |block, bi| {
+                var pi: u32 = 0;
+                while (pi < block.page_count) : (pi += 1) {
+                    if ((block.flags & file_manifest_fmt.BLOCK_FLAG_EXPLICIT_PAGE_REFS) != 0) {
+                        const ref = try manifest.pageRef(block, pi);
+                        if (ref.page_key != try object_key.pageKey(ref.file_entry, ref.block_index, ref.page_index)) return error.Corruption;
+                        const source = self.findMountedPackContainingGeneration(ref.pack_id, ref.pack_generation) orelse return error.Corruption;
+                        if (source.recovery_required.load(.acquire)) return error.Busy;
+                    }
+                    if ((block.flags & file_manifest_fmt.BLOCK_FLAG_EXPLICIT_PAGE_REFS) != 0) {
+                        var page = try self.loadPageFromManifest(target, manifest, @intCast(bi), pi);
+                        page.deinit();
+                    } else {
+                        // Implicit pages support full-width pack IDs; do not
+                        // manufacture the legacy u32 PageRef just to verify.
+                        const identity: page_value_fmt.PageIdentity = .{ .file_entry = manifest.header.file_entry, .block_index = @intCast(bi), .page_index = pi };
+                        const key = try object_key.pageKey(identity.file_entry, identity.block_index, identity.page_index);
+                        const bytes = target.reader.readObjectAlloc(a, key) catch |e| switch (e) {
+                            error.NotFound => blk: {
+                                const base = self.baseLayerOf(target) orelse return error.Corruption;
+                                if (base.recovery_required.load(.acquire)) return error.Busy;
+                                try base.reader.ensureReady();
+                                break :blk try base.reader.readObjectAlloc(a, key);
+                            },
+                            else => |err| return err,
+                        };
+                        defer a.free(bytes);
+                        const raw = try @import("../diff/block_codec.zig").rawFromPageBytes(a, bytes, identity);
+                        a.free(raw);
+                    }
+                }
+            }
+        }
+    }
+
+    fn refreshWritableMount(self: *Volume) !void {
+        const mounted = self.writableMount() orelse return error.PermissionDenied;
+        mounted.recovery_required.store(true, .release);
+        try self.refreshMountedLocked(mounted);
         self.page_cache.deinit(std.heap.smp_allocator);
+    }
+
+    /// An update owns admission, not caller handles. All read/open/stat and
+    /// other mutations in this Volume return Busy until release. A partial
+    /// patch leaves its target recovery-required; reacquire to resume it.
+    /// Move-only by convention: release exactly one owner before Volume.close.
+    pub const UpdateLease = struct {
+        volume: *Volume,
+        target: *MountedPack,
+        base: ?*MountedPack,
+        active: bool = true,
+
+        pub fn targetPath(self: *const UpdateLease) []const u8 {
+            return if (self.base) |b| b.path else self.target.path;
+        }
+        pub fn overlayPath(self: *const UpdateLease) ?[]const u8 {
+            return if (self.base != null) self.target.path else null;
+        }
+        pub fn release(self: *UpdateLease, changed: bool, complete: bool) !void {
+            if (!self.active) return;
+            const v = self.volume;
+            v.lock.lock();
+            defer v.lock.unlock();
+            defer {
+                const paths = [_][]const u8{ self.target.path, if (self.base) |b| b.path else self.target.path };
+                admission.end(paths[0..if (self.base != null) @as(usize, 2) else 1]);
+                v.endExclusiveLocked();
+                self.active = false;
+            }
+            if (changed) self.target.recovery_required.store(true, .release);
+            if (complete) {
+                // Also verify no-op recovery after a post-finalize failure:
+                // version equality alone is not evidence of healthy data.
+                self.target.recovery_required.store(true, .release);
+                errdefer self.target.recovery_required.store(true, .release);
+                try v.refreshMountedLocked(self.target);
+                try v.verifyUpdatedMountLocked(self.target);
+                v.page_cache.deinit(std.heap.smp_allocator);
+                // Keep excess stores parked without disturbing protected pins.
+                try self.target.reader.park();
+            }
+        }
+    };
+
+    pub fn acquireUpdateLease(self: *Volume, pack_id: u64) !UpdateLease {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const target = self.findMountedPackById(pack_id) orelse return error.NotFound;
+        const base = self.baseLayerOf(target);
+        if (base) |b| if (b.recovery_required.load(.acquire)) return error.Busy;
+        // Same-ID plain duplicates have ambiguous update semantics.
+        for (self.mounts.items) |m| {
+            // Target recovery is the purpose of resume. Other unhealthy mounts
+            // could be foreign PageRef sources or their overlay fallback bases.
+            if (m != target and m.recovery_required.load(.acquire)) return error.Busy;
+            if (m.meta.pack_id == pack_id and m != target and (base == null or m != base.?)) return error.Busy;
+        }
+        try self.beginExclusiveLocked();
+        errdefer self.endExclusiveLocked();
+        const paths = [_][]const u8{ target.path, if (base) |b| b.path else target.path };
+        const selected = paths[0..if (base != null) @as(usize, 2) else 1];
+        try admission.begin(selected);
+        errdefer admission.end(selected);
+        try target.reader.park();
+        if (base) |b| try b.reader.park();
+        return .{ .volume = self, .target = target, .base = base };
     }
 
     // ------------------------------------------------------------------
@@ -743,6 +926,15 @@ pub const Volume = struct {
         return error.NotFound;
     }
 };
+
+fn readerHasIntent(reader: *pack_reader.PackReader) !bool {
+    const key = object_key.encodeDbKey(object_key.patchIntentKey());
+    _ = reader.db.getSizeBytes(&key) catch |e| switch (e) {
+        error.NotFound => return false,
+        else => |err| return err,
+    };
+    return true;
+}
 
 fn mountedHigherPriority(_: void, a: *Volume.MountedPack, b: *Volume.MountedPack) bool {
     return a.meta.priority > b.meta.priority;
@@ -1151,7 +1343,8 @@ test "u64 pack identities remain distinct and unencodable foreign refs are copie
     try builder.writeSourceFileForTest(source, "low!");
     try builder.createPack(low_path, &.{.{ .source_path = source, .virtual_path = "/low", .file_entry = 8904, .page_size = 4 }}, .{ .pack_id = 7 });
     var volume = try Volume.open("wide", .{ .max_open_stores = 1 });
-    defer volume.close();
+    var volume_open = true;
+    defer if (volume_open) volume.close();
     try volume.mountPackWithPriority(high_path, 1, 0);
     try volume.mountPackWithPriority(low_path, 2, 0);
     const high = volume.findMountedPack(high_id, 1).?;
@@ -1165,7 +1358,7 @@ test "u64 pack identities remain distinct and unencodable foreign refs are copie
     try volume.setWritablePack(writable_path);
     try volume.writeFileByEntry(8903, "high", .{ .page_size = 4 });
     file = try volume.openEntry(0, 8903);
-    defer file.close();
+
     try std.testing.expectEqual(@as(u32, 1), file.manifest.page_refs[0].pack_id);
     _ = try file.readAt(0, &bytes);
     try std.testing.expectEqualStrings("high", &bytes);
@@ -1174,6 +1367,10 @@ test "u64 pack identities remain distinct and unencodable foreign refs are copie
     var destination = try Volume.open("wide-destination", .{});
     defer destination.close();
     try destination.setWritablePack(high_path);
+    try std.testing.expectError(error.Busy, destination.writeFileByEntry(8903, "edit", .{ .page_size = 4 }));
+    file.close();
+    volume.close();
+    volume_open = false;
     try destination.writeFileByEntry(8903, "edit", .{ .page_size = 4 });
     try std.testing.expectEqual(high_id, destination.writableMount().?.reader.manifest.pack_id);
     var edited = try destination.openEntry(0, 8903);
@@ -1221,8 +1418,11 @@ test "store availability wake never takes the updater lock under an outer writab
             ctx.volume.lock.lock();
             defer ctx.volume.lock.unlock();
             ctx.locked.store(true, .release);
-            Volume.drainPinsLocked(ctx.mounted);
-            Volume.releaseDrainedLocked(ctx.mounted);
+            ctx.volume.beginExclusiveLocked() catch |e| {
+                std.debug.assert(e == error.Busy);
+                return;
+            };
+            unreachable; // the caller still holds writable and readonly pins
         }
     };
     var waiting = Ctx{ .volume = &volume, .mounted = s };
@@ -1232,11 +1432,176 @@ test "store availability wake never takes the updater lock under an outer writab
     const updater = try std.Thread.spawn(.{}, Ctx.updater, .{&updating});
     while (!updating.locked.load(.acquire)) std.Thread.yield() catch {};
     // This is the exact nesting of a writable file's foreign-page read. The
-    // updater owns Volume.lock and awaits our outer pin, so notifying an idle
-    // foreign store must not acquire that lock before we can drop the outer.
+    // updater rejects the held pins without waiting under Volume.lock.
+    // Foreign-store notification and the remaining read can therefore finish.
     volume.unpinMounted(r);
     volume.unpinMounted(writable);
     updater.join();
     waiter.join();
     try std.testing.expect(volume.readonlyReadyCount() <= 1);
+}
+
+test "update lease gates readers parks stores refreshes cache and resumes partial patch" {
+    const builder = @import("../build/pack_builder.zig");
+    const patch = @import("../patch/patch_session.zig");
+    const diff = @import("../diff/diff_pack_writer.zig");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const a = std.testing.allocator;
+    const pack_id: u64 = (@as(u64, 1) << 40) | 910;
+    const old = "zig-cache-vfs-update-old";
+    const new = "zig-cache-vfs-update-new";
+    const dp = "zig-cache-vfs-update-diff";
+    const src = "zig-cache-vfs-update.bin";
+    defer std.Io.Dir.cwd().deleteTree(io, old) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, new) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dp) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, src) catch {};
+    try builder.writeSourceFileForTest(src, "old-data");
+    try builder.createPack(old, &.{.{ .source_path = src, .virtual_path = "/f", .file_entry = 91001, .page_size = 4 }}, .{ .pack_id = pack_id, .pack_version = 1 });
+    try builder.writeSourceFileForTest(src, "new-data-long");
+    try builder.createPack(new, &.{.{ .source_path = src, .virtual_path = "/f", .file_entry = 91001, .page_size = 4 }}, .{ .pack_id = pack_id, .pack_version = 2 });
+    _ = try diff.createDiffPack(a, old, new, dp, .{});
+    var v = try Volume.open("update", .{ .max_open_stores = 1 });
+    defer v.close();
+    try v.mountPackWithPriority(old, 10, 0);
+    var file = try v.openPath(0, "/f");
+    var buf: [20]u8 = undefined;
+    _ = try file.readAt(0, buf[0..3]); // populate old cache generation
+    try std.testing.expectError(error.Busy, v.acquireUpdateLease(pack_id));
+    file.close();
+    const mount = v.mounts.items[0];
+    try v.pinMounted(mount);
+    try std.testing.expectError(error.Busy, v.acquireUpdateLease(pack_id));
+    v.unpinMounted(mount);
+    var lease = try v.acquireUpdateLease(pack_id);
+    try std.testing.expect(!mount.reader.isReady());
+    try std.testing.expectError(error.Busy, v.openPath(0, "/f"));
+    try std.testing.expectError(error.Busy, v.statEntry(91001));
+    try std.testing.expectError(error.Busy, v.pinMounted(mount));
+    var other = try Volume.open("other", .{});
+    defer other.close();
+    try std.testing.expectError(error.Busy, other.mountPackWithPriority(old ++ "/.", 1, 0));
+    try std.testing.expectError(error.Busy, other.setWritablePack(old));
+    var progress: patch.Progress = .{};
+    try std.testing.expectError(error.InjectedFailure, patch.run(a, lease.targetPath(), lease.overlayPath(), &.{dp}, null, .{ .fault = .after_intent, .progress = &progress }));
+    try lease.release(progress.mutation_started.load(.acquire), false);
+    try std.testing.expectError(error.Busy, v.openPath(0, "/f"));
+    try std.testing.expect(!v.update_active.load(.acquire));
+    lease = try v.acquireUpdateLease(pack_id);
+    const report = try patch.run(a, lease.targetPath(), lease.overlayPath(), &.{dp}, null, .{});
+    try std.testing.expect(report.resumed);
+    try lease.release(true, true);
+    try lease.release(true, true); // release is idempotent
+    try std.testing.expectEqual(@as(u64, 2), mount.pack_version.load(.acquire));
+    file = try v.openPath(0, "/f");
+    const n = try file.readAt(0, &buf);
+    try std.testing.expectEqualStrings("new-data-long", buf[0..n]);
+    file.close();
+    lease = try v.acquireUpdateLease(pack_id);
+    try lease.release(false, false);
+    try std.testing.expectEqual(@as(u64, 13), (try v.statPath("/f")).size);
+    // Canonical aliases mounted elsewhere reject admission before parking.
+    const alias = "zig-cache-vfs-update-alias";
+    if (@import("builtin").os.tag != .windows) {
+        try std.Io.Dir.cwd().symLink(io, old, alias, .{ .is_directory = true });
+        defer std.Io.Dir.cwd().deleteFile(io, alias) catch {};
+        try other.mountPackWithPriority(alias, 1, 0);
+    } else {
+        try other.mountPackWithPriority(old ++ "/.", 1, 0);
+    }
+    try std.testing.expectError(error.Busy, v.acquireUpdateLease(pack_id));
+    file = try v.openPath(0, "/f");
+    file.close();
+}
+
+test "update lease reserves both overlay and base and rejects duplicate owners" {
+    const builder = @import("../build/pack_builder.zig");
+    const overlay = @import("../patch/overlay.zig");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const base = "zig-cache-vfs-update-base";
+    const top = "zig-cache-vfs-update-top";
+    const src = "zig-cache-vfs-update-overlay.bin";
+    const next = "zig-cache-vfs-update-overlay-next";
+    const dp = "zig-cache-vfs-update-overlay-diff";
+    defer std.Io.Dir.cwd().deleteTree(io, next) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dp) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, top) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, src) catch {};
+    try builder.writeSourceFileForTest(src, "base");
+    try builder.createPack(base, &.{.{ .source_path = src, .virtual_path = "/f", .file_entry = 92001, .page_size = 4 }}, .{ .pack_id = 920 });
+    try overlay.create(std.testing.allocator, base, top, .{});
+    try builder.writeSourceFileForTest(src, "new!");
+    try builder.createPack(next, &.{.{ .source_path = src, .virtual_path = "/f", .file_entry = 92001, .page_size = 4 }}, .{ .pack_id = 920, .pack_version = 2 });
+    _ = try @import("../diff/diff_pack_writer.zig").createDiffPack(std.testing.allocator, base, next, dp, .{});
+    var v = try Volume.open("layered-update", .{ .max_open_stores = 1 });
+    defer v.close();
+    try v.mountPackWithPriority(base, 1, 0);
+    try v.mountPackWithPriority(top, 2, 0);
+    var other = try Volume.open("other-layer", .{});
+    defer other.close();
+    v.findMountedPackById(920).?.recovery_required.store(false, .release);
+    const base_mount = v.mounts.items[1];
+    base_mount.recovery_required.store(true, .release);
+    try std.testing.expectError(error.Busy, v.acquireUpdateLease(920));
+    base_mount.recovery_required.store(false, .release);
+    var lease = try v.acquireUpdateLease(920);
+    try std.testing.expect(lease.base != null);
+    try std.testing.expect(!lease.target.reader.isReady());
+    try std.testing.expect(!lease.base.?.reader.isReady());
+    try std.testing.expectError(error.Busy, other.mountPackWithPriority(base, 1, 0));
+    try std.testing.expectError(error.Busy, other.mountPackWithPriority(top, 2, 0));
+    _ = try @import("../patch/patch_session.zig").run(std.testing.allocator, lease.targetPath(), lease.overlayPath(), &.{dp}, null, .{});
+    try lease.release(true, true);
+    try other.mountPackWithPriority(base, 1, 0);
+    try std.testing.expectError(error.Busy, v.acquireUpdateLease(920));
+    var h = try v.openPath(0, "/f");
+    defer h.close();
+    var bytes: [4]u8 = undefined;
+    _ = try h.readAt(0, &bytes);
+    try std.testing.expectEqualStrings("new!", &bytes);
+}
+
+test "direct mutation rejects active writable foreign-source reads without waiting" {
+    const builder = @import("../build/pack_builder.zig");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const base = "zig-cache-vfs-direct-admission-base";
+    const writable = "zig-cache-vfs-direct-admission-write";
+    const src = "zig-cache-vfs-direct-admission.bin";
+    defer std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, writable) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, src) catch {};
+    try builder.writeSourceFileForTest(src, "AAAABBBB");
+    try builder.createPack(base, &.{.{ .source_path = src, .virtual_path = "/f", .file_entry = 93001, .page_size = 4 }}, .{ .pack_id = 930 });
+    var v = try Volume.open("direct-admission", .{ .max_open_stores = 1 });
+    defer v.close();
+    try v.mountPackWithPriority(base, 1, 0);
+    try v.setWritablePack(writable);
+    try v.writeFileByEntry(93001, "AAAACCCC", .{ .page_size = 4 });
+    var validation_lease = try v.acquireUpdateLease(1);
+    try validation_lease.release(false, true); // mounted foreign PageRefs remain valid
+    try std.testing.expect(v.readonlyReadyCount() <= 1);
+    var file = try v.openEntry(0, 93001);
+    try std.testing.expect(file.manifest.page_refs.len > 0);
+    const foreign = v.findMountedPackById(930).?;
+    try foreign.reader.park();
+    const Worker = struct {
+        file: *file_handle.FileHandle,
+        ok: bool = false,
+        fn run(self: *@This()) void {
+            var bytes: [8]u8 = undefined;
+            const n = self.file.readAt(0, &bytes) catch return;
+            self.ok = n == 8 and std.mem.eql(u8, &bytes, "AAAACCCC");
+        }
+    };
+    var worker = Worker{ .file = &file };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    try std.testing.expectError(error.Busy, v.writeFileByEntry(93001, "changed", .{}));
+    try std.testing.expectError(error.Busy, v.writeFileByPath("/f", 93001, "changed", .{}));
+    try std.testing.expectError(error.Busy, v.deleteEntry(93001));
+    thread.join();
+    try std.testing.expect(worker.ok);
+    file.close();
+    try v.writeFileByEntry(93001, "changed", .{});
+    try v.deleteEntry(93001);
 }

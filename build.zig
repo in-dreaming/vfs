@@ -148,6 +148,20 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const run_vfs_tests = b.addRunArtifact(vfs_tests);
     const run_vfs_pack_roundtrip = b.addRunArtifact(vfs_pack_roundtrip);
+    const process_recovery = b.addExecutable(.{
+        .name = "vfs_patch_process",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/vfs_patch_process.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "vfs", .module = vfs_mod }},
+        }),
+    });
+    const run_process_recovery = b.addRunArtifact(process_recovery);
+    run_process_recovery.has_side_effects = true;
+    const test_heavy = b.step("test-heavy", "Run isolated real process-death recovery tests");
+    test_heavy.dependOn(&run_process_recovery.step);
+
     const test_step = b.step("test", "Run DB unit and integration tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_vfs_tests.step);

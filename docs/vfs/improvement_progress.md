@@ -102,3 +102,44 @@ $ZIG build -Doptimize=ReleaseSafe --summary all
 # Repeated the full test command three more times against the final code.
 git diff --check
 ```
+
+## Stage 3: patch recovery and mounted update admission (2026-10-08)
+
+### Implemented
+
+- Persistent OS advisory `.vfs_patch.lock`: no unlink race, harmless unlocked leftovers, and automatic release after process death. Acquire before overlay initialization. This coordinates cooperating patchers; old exclusive-create binaries must be stopped rather than mixed with the new protocol.
+- Additive callback-free `vfs_patch_begin_in_volume(volume, pack_id, ...)` retains the Volume through worker cleanup, acquires admission synchronously, derives paths from mounts, and parks both overlay and base. Terminal state is published only after update cleanup and Volume retain release. Existing offline path API and on-disk formats are unchanged.
+- Small process-local canonical-path mount/admission registry reserves paths before reader open, refuses updates of multiply mounted paths, and blocks new aliases during an update. Ordinary symlink and normalized aliases are covered. Independent processes, raw DB readers, bind-mount aliases, and separately linked library instances remain the caller's offline responsibility.
+- Conservatively reject live files/retained requests or pins with Busy. No force-closing or waiting under Volume.lock. All Volume read/open/stat/mutation admission is blocked during the update; successful release reopens metadata, advances cache generation, clears cached pages, and validates target objects plus target-manifest page references against mounted sources. This is not a whole-Volume content scan.
+- Failed/cancelled updates whose intent commit was attempted stay recovery-required and unreadable; admission and job retains still release. Both partial and post-finalize failures can be retried. A version-equal no-op still validates before restoring reads. Mounting a pack with an unfinished intent starts in recovery-required state. An unhealthy overlay base cannot be used to resume its overlay.
+- Direct writable APIs use the same nonblocking local admission and canonical target reservation. This removes the historical cycle where a writable request held its target pin while waiting for a parked foreign source and an updater waited for that pin under Volume.lock. Direct write errors are conservatively gated after the writer is opened/attempted; abort discards pending work, not already durable writes. Direct-write failure has no PatchIntent rollback protocol and requires offline inspection/repair before remount.
+- Resume reconstructs the durable intent's exact diff IDs even if a cheaper candidate is newly available. Missing, duplicate, or discontinuous saved IDs fail closed. Explicit FORCE alone selects a fresh cheapest chain to the same requested final version; precondition checks still apply.
+- ShardWriter ownership is explicit: error/would_block leave values with the caller; staged transfers ownership. A later commit error is sticky and surfaces through subsequent stage/drain. Pending/local staging arrays transfer ownership once, and byte accounting releases consumed failed batches.
+
+### Verification and limits
+
+- Normal regressions cover advisory lock conflict/reacquisition, stale filenames, overlay lock-before-initialization, allocator/write rejection ownership, saved-chain choice, live handle/pin Busy, base+overlay parking, canonical aliases, pre-write cancellation/failure release, partial/post-finalize recovery gating, wide pack IDs, foreign PageRefs, and direct writable foreign-source reads.
+- `test-heavy` creates isolated random `/tmp/vfs-patch-process-*` roots and owns every child it terminates. Its matrix is 5 boundaries × in-place/overlay × 1/4 workers. A fresh child resumes and verifies object/visible-byte equivalence, deletion visibility and zero-work rerun; overlay base files are compared byte-for-byte. At a multiworker stop, other workers may progress before termination; one-worker cases provide precise intermediate boundaries.
+- Initial full ReleaseSafe aggregate after the main implementation passed 178/178 Zig tests and both static/shared C ABI smoke programs (30/30 steps). Subsequent independent review corrections and expanded regressions require the final rerun recorded below.
+- Independent review of patch lock, saved-chain recovery, staging ownership, and subprocess tests found no blockers. Admission review drove fixes for pre-admission probing, eviction under exclusive pins, recovery-state bypasses, post-finalize validation, full-width implicit identities, and unhealthy overlay bases.
+- This verifies process interruption and normal tested failures, not power-loss safety. Windows runtime/OS handle behavior is unverified here. Existing underlying DB close/park errors and ambiguous fsync outcomes are not a comprehensive poisoned-handle or rollback solution. General allocation/error-path completeness, common task refactor, bounded hpatch memory, and later async/performance work remain out of scope.
+
+Commands (official Zig 0.16.0, Linux x86_64):
+
+```sh
+ZIG=/tmp/vfs-review-tools/zig-x86_64-linux-0.16.0/zig
+export ZIG_GLOBAL_CACHE_DIR=/tmp/vfs-review-tools/global-cache
+$ZIG build test -Doptimize=ReleaseSafe -j2 --summary all
+$ZIG build test-heavy -Doptimize=ReleaseSafe -j2 --summary all
+$ZIG build -Doptimize=ReleaseSafe -j2 --summary all
+```
+
+### Final Stage 3 verification
+
+Against the final product tree after all review fixes:
+
+- Full ReleaseSafe aggregate: **178/178 Zig tests** (47 DB, 130 VFS, 1 roundtrip), **30/30 steps**, including static and shared C smoke exercising the additive mounted API.
+- Three further cached full-suite runs passed **178/178**, including admission/read concurrency and both C smoke variants.
+- Real process-death matrix: **20/20 cases**, **4/4 test-heavy steps**. Rebuilt the harness against the final tree; every interrupted child was owned by the harness and every resume was a fresh process.
+- ReleaseSafe build: **18/18 steps**. `git diff --check` passed.
+- Final independent admission/ABI and patch-recovery/harness reviews reported no remaining blockers in their respective reviewed scopes. No push performed.

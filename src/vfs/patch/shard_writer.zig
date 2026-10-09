@@ -58,6 +58,20 @@ pub const ShardWriter = struct {
     total_staged: std.atomic.Value(u64) = .init(0),
     stats_lock: sync.Mutex = .{},
     stats: Stats = .{},
+    /// First commit failure; ownership is still consumed on `.staged`.
+    failure: ?anyerror = null,
+
+    fn checkFailure(self: *ShardWriter) !void {
+        self.stats_lock.lock();
+        defer self.stats_lock.unlock();
+        if (self.failure) |err| return err;
+    }
+
+    fn rememberFailure(self: *ShardWriter, err: anyerror) void {
+        self.stats_lock.lock();
+        defer self.stats_lock.unlock();
+        if (self.failure == null) self.failure = err;
+    }
 
     pub fn init(allocator: std.mem.Allocator, db: *kv.KvDb, options: Options) !ShardWriter {
         const shards = try allocator.alloc(Shard, db.shardCount());
@@ -84,8 +98,12 @@ pub const ShardWriter = struct {
 
     /// Stages every op of a unit into shard `si` atomically. On `.staged`
     /// ownership of the values moves to the writer; on `.would_block`
-    /// nothing is consumed and the caller should yield and retry.
+    /// nothing is consumed and the caller should yield and retry. Errors also
+    /// leave ownership with the caller. Once consumed, a commit failure is
+    /// sticky and reported by the next stage/drain, never as an ambiguous
+    /// ownership transfer on this call.
     pub fn stageAll(self: *ShardWriter, si: u32, ops: []const StagedOp) !StageResult {
+        try self.checkFailure();
         if (ops.len == 0) return .staged;
         const shard = &self.shards[si];
         var add: u64 = 0;
@@ -120,7 +138,7 @@ pub const ShardWriter = struct {
             shard.committing = false;
             shard.lock.unlock();
         }
-        try self.commitOps(si, taken, taken_bytes, null);
+        self.commitOps(si, taken, taken_bytes, null) catch |err| self.rememberFailure(err);
         return .staged;
     }
 
@@ -132,6 +150,7 @@ pub const ShardWriter = struct {
     /// Commits whatever is staged on every shard. `durability` overrides the
     /// intermediate policy (used for the final drain).
     pub fn drain(self: *ShardWriter, durability: ?fmt_db.Durability) !void {
+        try self.checkFailure();
         for (self.shards, 0..) |*shard, si| {
             shard.lock.lock();
             const taken = shard.ops;
@@ -144,12 +163,16 @@ pub const ShardWriter = struct {
                 t.deinit(self.allocator);
                 continue;
             }
-            try self.commitOps(@intCast(si), taken, taken_bytes, durability);
+            self.commitOps(@intCast(si), taken, taken_bytes, durability) catch |err| {
+                self.rememberFailure(err);
+                return err;
+            };
         }
     }
 
     fn commitOps(self: *ShardWriter, si: u32, ops_in: std.ArrayList(StagedOp), bytes: u64, durability_override: ?fmt_db.Durability) !void {
         var ops = ops_in;
+        defer _ = self.total_staged.fetchSub(bytes, .monotonic);
         defer {
             for (ops.items) |op| if (op.value) |v| self.allocator.free(v);
             ops.deinit(self.allocator);
@@ -178,7 +201,6 @@ pub const ShardWriter = struct {
             break :blk self.options.intermediate_durability;
         };
         try batch.commit(durability);
-        _ = self.total_staged.fetchSub(bytes, .monotonic);
         self.stats_lock.lock();
         defer self.stats_lock.unlock();
         self.stats.puts += puts;
@@ -211,4 +233,66 @@ test "shard writer stages commits per shard and drains" {
     const k5 = object_key.encodeDbKey(1005);
     try std.testing.expectError(error.NotFound, db.getSizeBytes(&k5));
     try std.testing.expectEqual(@as(u64, 0), w.total_staged.load(.acquire));
+}
+
+test "shard writer commit allocation failure consumes once and stays sticky" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try kv.KvDb.openAt(tmp.dir, .{ .max_delta_entries = 4096 });
+    defer db.close() catch {};
+    var failing = std.testing.FailingAllocator.init(a, .{});
+    const fa = failing.allocator();
+    var w = try ShardWriter.init(fa, &db, .{ .batch_ops = 1 });
+    defer w.deinit();
+    try w.shards[0].ops.ensureUnusedCapacity(fa, 1);
+    const value = try fa.dupe(u8, "value");
+    failing.fail_index = failing.alloc_index;
+    // Appending succeeds without allocation, so ownership transfers. The
+    // subsequent commit allocation fails and frees the transferred value.
+    try std.testing.expectEqual(StageResult.staged, try w.stageAll(0, &.{.{ .key = 1000, .value = value }}));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(u64, 0), w.total_staged.load(.acquire));
+    try std.testing.expectError(error.OutOfMemory, w.drain(.sync));
+    try std.testing.expectError(error.OutOfMemory, w.stageAll(0, &.{}));
+    failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expectError(error.OutOfMemory, w.drain(.sync));
+}
+
+test "shard writer staging allocation failure retains caller ownership" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try kv.KvDb.openAt(tmp.dir, .{});
+    defer db.close() catch {};
+    var failing = std.testing.FailingAllocator.init(a, .{});
+    const fa = failing.allocator();
+    var w = try ShardWriter.init(fa, &db, .{});
+    defer w.deinit();
+    const value = try fa.dupe(u8, "value");
+    defer fa.free(value);
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, w.stageAll(0, &.{.{ .key = 1000, .value = value }}));
+    try std.testing.expectEqual(@as(u64, 0), w.total_staged.load(.acquire));
+    try std.testing.expectEqualStrings("value", value);
+    try w.drain(.sync);
+}
+
+test "shard writer write rejection consumes once and remains sticky" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var writable = try kv.KvDb.openAt(tmp.dir, .{});
+        try writable.close();
+    }
+    var db = try kv.KvDb.openAt(tmp.dir, .{ .mode = .read_only });
+    defer db.close() catch {};
+    var w = try ShardWriter.init(a, &db, .{ .batch_ops = 1 });
+    defer w.deinit();
+    const value = try a.dupe(u8, "value");
+    try std.testing.expectEqual(StageResult.staged, try w.stageAll(0, &.{.{ .key = 1000, .value = value }}));
+    try std.testing.expectEqual(@as(u64, 0), w.total_staged.load(.acquire));
+    try std.testing.expectError(error.NotOpenForWriting, w.drain(.sync));
+    try std.testing.expectError(error.NotOpenForWriting, w.stageAll(0, &.{}));
 }

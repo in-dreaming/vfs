@@ -673,6 +673,17 @@ meta 已 commit:
 
 ---
 
+## Phase 16：恢复与运行时准入（部分完成）
+
+迭代依据：`diff_patch_iteration.md`；实际交付与验证：`improvement_progress.md`。
+
+- 已实现：OS advisory patch lock、真实 owned-child kill/restart 20-case matrix、保守 Volume update lease、canonical mounted-path 冲突检测、刷新 reader/cache generation、失败后 recovery-required、saved-chain resume、staging error ownership。
+- additive `vfs_patch_begin_in_volume` 保持 callback-free ABI；已有 path API 明确 offline 约束；磁盘格式未改。
+- direct writable APIs 遇 live handle/pin/source recovery conflict 返回 Busy，不在 Volume.lock 内等待 reader。
+- 未完成：Windows runtime 验证、通用 DB I/O error poisoned-handle、后续 task/common 重构、bounded hpatch memory 与性能实验。不得将本阶段描述成关闭全部 P0/P1。
+
+---
+
 ## 推荐最小发布边界
 
 第一个可用版本建议包含：

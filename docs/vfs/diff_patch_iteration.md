@@ -6,6 +6,10 @@
 
 ---
 
+## 2026-10-08 更新
+
+Stage 3 已实现 P0-1 的 advisory lock、P0-2 的保守 Volume 更新准入、P0-4 的真实子进程终止矩阵，并修复 staging 错误 ownership 和 saved-chain resume。下列“现象”保留为历史问题记录；当前边界/限制见 `diff_patch.md` §15 实现状态与 `improvement_progress.md`。P0-2 不提供 live snapshot migration：有 live handle/request 或 pin 即 Busy，跨 Volume canonical alias 也拒绝。Windows 运行验证、通用 DB I/O poisoned-handle 策略及后续架构/性能项仍未完成。
+
 ## 0. 现状结论
 
 ~~~text

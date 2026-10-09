@@ -150,10 +150,23 @@ typedef struct vfs_patch_progress {
 
 /* Starts a patch on a background thread. `target_pack` is patched in place,
  * or, when `overlay_pack_or_null` is given, stays read-only and the changes
- * are written to the overlay (created if missing). */
+ * are written to the overlay (created if missing). OFFLINE API: callers must
+ * stop all readers/writers, including other processes, for these paths. The
+ * advisory lock excludes cooperating patchers only. */
 VFS_API int vfs_patch_begin(const char* target_pack, const char* overlay_pack_or_null,
                             const char* const* diff_dirs, uint32_t diff_count,
                             const vfs_patch_options_t* options, vfs_patch_t* out_patch);
+/* Admits an update of an existing mounted pack (its overlay when present).
+ * Busy if this volume has open files/requests, another update, or any target
+ * path is mounted more than once in this process. Canonical paths include
+ * ordinary symlink aliases. Independent processes/raw DB readers must still
+ * be stopped by the caller. Opens/stats in this volume are Busy during the
+ * job; partial failure leaves the target Busy until a successful resume.
+ * Completion releases the volume lease and refreshes reader/cache generation.
+ * No caller handles are force-closed; no live snapshot migration is promised. */
+VFS_API int vfs_patch_begin_in_volume(vfs_volume_t volume, uint64_t pack_id,
+                                    const char* const* diff_dirs, uint32_t diff_count,
+                                    const vfs_patch_options_t* options, vfs_patch_t* out_patch);
 /* Non-blocking snapshot of the progress counters. */
 VFS_API int vfs_patch_poll(vfs_patch_t patch, vfs_patch_progress_t* out_progress);
 /* Blocks until the patch finished or `timeout_ms` elapsed; returns VFS_BUSY on timeout. */

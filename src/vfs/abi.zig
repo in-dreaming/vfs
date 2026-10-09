@@ -251,6 +251,8 @@ const PatchJob = struct {
     diffs: [][]u8,
     to_version: ?u64,
     options: patch_mod.PatchOptions,
+    volume_lease: ?registry.Lease(volume_mod.Volume) = null,
+    update_lease: ?volume_mod.Volume.UpdateLease = null,
     progress: patch_mod.patch_session.Progress = .{},
     state: std.atomic.Value(u32) = .init(@intFromEnum(PatchState.running)),
     last_status: std.atomic.Value(i32) = .init(0),
@@ -259,18 +261,40 @@ const PatchJob = struct {
     thread: ?std.Thread = null,
 
     fn deinit(self: *PatchJob) void {
+        self.releaseUpdate(false, false) catch {};
         self.allocator.free(self.target);
         if (self.overlay) |o| self.allocator.free(o);
         for (self.diffs) |d| self.allocator.free(d);
         self.allocator.free(self.diffs);
     }
 
+    fn releaseUpdate(self: *PatchJob, changed: bool, complete: bool) !void {
+        defer {
+            self.update_lease = null;
+            if (self.volume_lease) |lease| lease.release();
+            self.volume_lease = null;
+        }
+        if (self.update_lease) |*lease| try lease.release(changed, complete);
+    }
+
     fn main(self: *PatchJob) void {
         const diffs_const: []const []const u8 = @ptrCast(self.diffs);
         const report = patch_mod.run(self.allocator, self.target, self.overlay, diffs_const, self.to_version, self.options) catch |e| {
+            // Cleanup precedes terminal publication. A partially written pack
+            // stays blocked but its job and process admission are released.
+            self.releaseUpdate(self.progress.mutation_started.load(.acquire), false) catch |refresh_error| {
+                self.last_status.store(err.code(err.fromError(refresh_error)), .release);
+                self.state.store(@intFromEnum(PatchState.failed), .release);
+                return;
+            };
             self.last_status.store(err.code(err.fromError(e)), .release);
             const st: PatchState = if (e == error.Cancelled) .cancelled else .failed;
             self.state.store(@intFromEnum(st), .release);
+            return;
+        };
+        self.releaseUpdate(self.progress.mutation_started.load(.acquire), true) catch |e| {
+            self.last_status.store(err.code(err.fromError(e)), .release);
+            self.state.store(@intFromEnum(PatchState.failed), .release);
             return;
         };
         self.from_version.store(report.from_version, .release);
@@ -320,24 +344,49 @@ fn patchOptionsFromC(options: ?*const vfs_patch_options_t) !struct { opts: patch
 }
 
 pub export fn vfs_patch_begin(target_pack: ?[*:0]const u8, overlay_pack_or_null: ?[*:0]const u8, diff_dirs: ?[*]const ?[*:0]const u8, diff_count: u32, options: ?*const vfs_patch_options_t, out_patch: ?*u64) c_int {
+    return patchBegin(target_pack, overlay_pack_or_null, diff_dirs, diff_count, options, out_patch, null, null);
+}
+
+/// Mounted update: paths come from the admitted mount, never from caller
+/// aliases. The job retains its volume until terminal cleanup has completed.
+pub export fn vfs_patch_begin_in_volume(volume: u64, pack_id: u64, diff_dirs: ?[*]const ?[*:0]const u8, diff_count: u32, options: ?*const vfs_patch_options_t, out_patch: ?*u64) c_int {
+    const out = out_patch orelse return setStatus(.invalid_argument, "out_patch is null");
+    out.* = 0;
+    const retained = registry.acquire(volume_mod.Volume, volume, .volume) catch |e| return setError(e);
+    const lease = retained.ptr.acquireUpdateLease(pack_id) catch |e| {
+        retained.release();
+        return setError(e);
+    };
+    // patchBegin takes ownership on every path, including allocation errors.
+    return patchBegin(null, null, diff_dirs, diff_count, options, out_patch, retained, lease);
+}
+
+fn patchBegin(target_pack: ?[*:0]const u8, overlay_pack_or_null: ?[*:0]const u8, diff_dirs: ?[*]const ?[*:0]const u8, diff_count: u32, options: ?*const vfs_patch_options_t, out_patch: ?*u64, volume_lease: ?registry.Lease(volume_mod.Volume), update_lease: ?volume_mod.Volume.UpdateLease) c_int {
+    var transferred = false;
+    var incoming_update = update_lease;
+    defer if (!transferred) {
+        if (incoming_update) |*lease| lease.release(false, false) catch {};
+        if (volume_lease) |lease| lease.release();
+    };
     const out = out_patch orelse return setStatus(.invalid_argument, "out_patch is null");
     out.* = 0;
     const allocator = std.heap.smp_allocator;
-    const target = spanZ(target_pack) catch |e| return setError(e);
+    const target = if (incoming_update) |*lease| lease.targetPath() else spanZ(target_pack) catch |e| return setError(e);
     if (diff_count == 0) return setStatus(.invalid_argument, "diff_count is zero");
     const dirs = diff_dirs orelse return setStatus(.invalid_argument, "diff_dirs is null");
     const parsed = patchOptionsFromC(options) catch |e| return setError(e);
 
     const job = allocator.create(PatchJob) catch return setStatus(.internal_error, "allocation failed");
-    job.* = .{ .allocator = allocator, .target = &.{}, .overlay = null, .diffs = &.{}, .to_version = parsed.to, .options = parsed.opts };
+    job.* = .{ .allocator = allocator, .target = &.{}, .overlay = null, .diffs = &.{}, .to_version = parsed.to, .options = parsed.opts, .volume_lease = volume_lease, .update_lease = incoming_update };
+    transferred = true;
     var ok = false;
     defer if (!ok) {
         job.deinit();
         allocator.destroy(job);
     };
     job.target = allocator.dupe(u8, target) catch return setStatus(.internal_error, "allocation failed");
-    if (overlay_pack_or_null) |ov| {
-        const s = spanZ(ov) catch |e| return setError(e);
+    const overlay = if (incoming_update) |*lease| lease.overlayPath() else if (overlay_pack_or_null) |ov| spanZ(ov) catch |e| return setError(e) else null;
+    if (overlay) |s| {
         job.overlay = allocator.dupe(u8, s) catch return setStatus(.internal_error, "allocation failed");
     }
     job.diffs = allocator.alloc([]u8, diff_count) catch return setStatus(.internal_error, "allocation failed");
@@ -1112,4 +1161,85 @@ test "vfs patch progress versioned prefixes preserve caller canaries" {
         try std.testing.expectEqualSlices(u8, before[end..], storage[end..]);
         try std.testing.expectEqual(size, out.struct_size);
     }
+}
+
+test "volume patch ABI rejects live handles and releases lease before end on success failure cancel" {
+    const builder = @import("build/pack_builder.zig");
+    const diff = @import("diff/diff_pack_writer.zig");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const a = std.testing.allocator;
+    const old = "zig-cache-vfs-abi-volume-old";
+    const new = "zig-cache-vfs-abi-volume-new";
+    const dp = "zig-cache-vfs-abi-volume-diff";
+    const src = "zig-cache-vfs-abi-volume.bin";
+    defer std.Io.Dir.cwd().deleteTree(io, old) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, new) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dp) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, src) catch {};
+    try builder.writeSourceFileForTest(src, "before");
+    try builder.createPack(old, &.{.{ .source_path = src, .virtual_path = "/f", .file_entry = 94001, .page_size = 4 }}, .{ .pack_id = 940, .pack_version = 1 });
+    try builder.writeSourceFileForTest(src, "after-update");
+    try builder.createPack(new, &.{.{ .source_path = src, .virtual_path = "/f", .file_entry = 94001, .page_size = 4 }}, .{ .pack_id = 940, .pack_version = 2 });
+    _ = try diff.createDiffPack(a, old, new, dp, .{});
+    var volume: u64 = 0;
+    try std.testing.expectEqual(err.code(.ok), vfs_open_volume("abi-update", null, &volume));
+    var volume_open = true;
+    defer if (volume_open) {
+        _ = vfs_close_volume(volume);
+    };
+    try std.testing.expectEqual(err.code(.ok), vfs_mount_pack(volume, old, 1, 0));
+    const diffs = [_]?[*:0]const u8{dp};
+    var job_handle: u64 = 42;
+    try std.testing.expectEqual(err.code(.invalid_argument), vfs_patch_begin_in_volume(volume, 940, &diffs, 0, null, &job_handle));
+    try std.testing.expectEqual(@as(u64, 0), job_handle);
+    var file: u64 = 0;
+    try std.testing.expectEqual(err.code(.ok), vfs_open_path(volume, "/f", 0, &file));
+    try std.testing.expectEqual(err.code(.busy), vfs_patch_begin_in_volume(volume, 940, &diffs, 1, null, &job_handle));
+    try std.testing.expectEqual(err.code(.ok), vfs_close_file(file));
+    // Deterministic pre-start cancel exercises cleanup without a thread race.
+    const retained = try registry.acquire(volume_mod.Volume, volume, .volume);
+    const lease = try retained.ptr.acquireUpdateLease(940);
+    var manual = PatchJob{ .allocator = std.heap.smp_allocator, .target = try std.heap.smp_allocator.dupe(u8, lease.targetPath()), .overlay = null, .diffs = try std.heap.smp_allocator.alloc([]u8, 1), .to_version = null, .options = .{}, .volume_lease = retained, .update_lease = lease };
+    manual.diffs[0] = try std.heap.smp_allocator.dupe(u8, dp);
+    defer manual.deinit();
+    manual.options.progress = &manual.progress;
+    manual.progress.cancel.store(true, .release);
+    try std.testing.expectEqual(err.code(.busy), vfs_close_volume(volume));
+    manual.main();
+    try std.testing.expectEqual(@intFromEnum(PatchState.cancelled), manual.state.load(.acquire));
+    try std.testing.expectEqual(err.code(.ok), vfs_open_path(volume, "/f", 0, &file));
+    try std.testing.expectEqual(err.code(.ok), vfs_close_file(file));
+    const missing = [_]?[*:0]const u8{"zig-cache-vfs-abi-volume-absent"};
+    try std.testing.expectEqual(err.code(.ok), vfs_patch_begin_in_volume(volume, 940, &missing, 1, null, &job_handle));
+    try std.testing.expectEqual(err.code(.ok), vfs_patch_wait(job_handle, 30000));
+    try std.testing.expectEqual(err.code(.not_found), vfs_patch_end(job_handle));
+    try std.testing.expectEqual(err.code(.ok), vfs_open_path(volume, "/f", 0, &file));
+    try std.testing.expectEqual(err.code(.ok), vfs_close_file(file));
+    // Deterministic failures before and after finalization both release job
+    // ownership while keeping the mutated target unreadable until resume.
+    for ([_]patch_mod.patch_session.FaultPoint{ .after_intent, .after_finalize_before_optimize }) |fault| {
+        const retry_retain = try registry.acquire(volume_mod.Volume, volume, .volume);
+        manual.volume_lease = retry_retain;
+        manual.update_lease = try retry_retain.ptr.acquireUpdateLease(940);
+        manual.progress = .{};
+        manual.options.fault = fault;
+        manual.state.store(@intFromEnum(PatchState.running), .release);
+        manual.main();
+        try std.testing.expectEqual(@intFromEnum(PatchState.failed), manual.state.load(.acquire));
+        try std.testing.expectEqual(err.code(.busy), vfs_open_path(volume, "/f", 0, &file));
+        try std.testing.expect(manual.volume_lease == null and manual.update_lease == null);
+    }
+    try std.testing.expectEqual(err.code(.ok), vfs_patch_begin_in_volume(volume, 940, &diffs, 1, null, &job_handle));
+    try std.testing.expectEqual(err.code(.ok), vfs_patch_wait(job_handle, 30000));
+    try std.testing.expectEqual(err.code(.ok), vfs_open_path(volume, "/f", 0, &file));
+    var bytes: [20]u8 = undefined;
+    var n: u64 = 0;
+    try std.testing.expectEqual(err.code(.ok), vfs_read_at(file, 0, &bytes, bytes.len, &n));
+    try std.testing.expectEqualStrings("after-update", bytes[0..@intCast(n)]);
+    try std.testing.expectEqual(err.code(.ok), vfs_close_file(file));
+    // A terminal job no longer retains the Volume, even before patch_end.
+    try std.testing.expectEqual(err.code(.ok), vfs_close_volume(volume));
+    volume_open = false;
+    try std.testing.expectEqual(err.code(.ok), vfs_patch_end(job_handle));
+    try std.testing.expectEqual(err.code(.invalid_argument), vfs_patch_end(job_handle));
 }

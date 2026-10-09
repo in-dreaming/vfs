@@ -206,9 +206,9 @@ test "patch crash matrix: interrupted runs resume idempotently and converge" {
         try std.testing.expectError(error.PatchIntentMismatch, session.run(a, p.v1, null, &.{p.d13}, null, opts));
         // Different target version is refused.
         try std.testing.expectError(error.PatchIntentMismatch, session.run(a, p.v1, null, &.{p.d12}, 2, opts));
-        // Resume with the same chain converges.
+        // Resume the saved chain even with a new direct candidate present.
         opts.optimize_after = true;
-        const r = try session.run(a, p.v1, null, &.{ p.d12, p.d23 }, null, opts);
+        const r = try session.run(a, p.v1, null, &.{ p.d13, p.d23, p.d12 }, null, opts);
         try std.testing.expect(r.resumed);
         try expectEquivalent(a, p.v1, p.v3);
     }
@@ -333,26 +333,29 @@ test "patch lock file excludes a second patcher; full verify and trace dump work
     try buildAll(a, &ds, p, "lock", 1);
     const io = std.Io.Threaded.global_single_threaded.io();
 
-    // A stale/foreign lock file makes the run fail with Busy before touching the pack.
+    // Only a live advisory owner blocks a patcher; the inode persists.
     const lock_path = "zig-cache-vfs-pt-lock-v1/" ++ session.LOCK_FILE_NAME;
     {
         const f = try std.Io.Dir.cwd().createFile(io, lock_path, .{});
-        f.close(io);
+        defer f.close(io);
+        try std.testing.expect(try f.tryLock(io, .exclusive));
+        try std.testing.expectError(error.Busy, session.run(a, p.v1, null, &.{p.d12}, null, .{ .budget = .{ .cpu = 1, .worker_threads = 1 } }));
     }
-    try std.testing.expectError(error.Busy, session.run(a, p.v1, null, &.{p.d12}, null, .{ .budget = .{ .cpu = 1, .worker_threads = 1 } }));
     {
         var img = try pack_scan.PackImage.load(a, p.v1);
         defer img.deinit();
         try std.testing.expectEqual(@as(u64, 1), img.manifest.pack_version);
     }
-    try std.Io.Dir.cwd().deleteFile(io, lock_path);
+    // Closing the owner releases the lock without deleting the file.
 
     // Normal run: lock released afterwards, full verify passes, trace written.
     const trace_path = "zig-cache-vfs-pt-lock-trace.json";
     defer _ = std.Io.Dir.cwd().deleteFile(io, trace_path) catch {};
     const r = try session.run(a, p.v1, null, &.{p.d12}, null, .{ .budget = .{ .cpu = 1, .worker_threads = 1 }, .verify_after = .full, .trace_path = trace_path });
     try std.testing.expectEqual(@as(u64, 2), r.to_version);
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, lock_path, .{}));
+    const persistent_lock = try std.Io.Dir.cwd().openFile(io, lock_path, .{});
+    defer persistent_lock.close(io);
+    try std.testing.expect(try persistent_lock.tryLock(io, .exclusive));
     const trace = try std.Io.Dir.cwd().readFileAlloc(io, trace_path, a, .limited(1 << 20));
     defer a.free(trace);
     try std.testing.expect(std.mem.startsWith(u8, trace, "{\"finished\":"));
@@ -378,4 +381,45 @@ test "patch rejects tampered base (precondition) and missing chain" {
         try fixture.buildPack(a, "zig-cache-vfs-pt-reject-forge", p.v3, ds.v2, 77, 1, 1);
         break :blk session.run(a, p.v3, null, &.{p.d12}, null, opts);
     });
+}
+
+test "patch progress separates untouched interrupted and finalized failures" {
+    const a = std.testing.allocator;
+    var ds = try fixture.dataset(a);
+    defer ds.deinit();
+    const p = paths("progress");
+    defer cleanAll(p);
+    try buildAll(a, &ds, p, "progress", 1);
+    var untouched: session.Progress = .{};
+    try std.testing.expectError(error.NoPatchPath, session.run(a, p.v1, null, &.{p.d12}, 999, .{ .progress = &untouched }));
+    try std.testing.expect(!untouched.mutation_started.load(.acquire));
+    try std.testing.expect(!untouched.finalized.load(.acquire));
+    var interrupted: session.Progress = .{};
+    try std.testing.expectError(error.InjectedFailure, session.run(a, p.v1, null, &.{p.d12}, 2, .{ .progress = &interrupted, .fault = .after_intent }));
+    try std.testing.expect(interrupted.mutation_started.load(.acquire));
+    try std.testing.expect(!interrupted.finalized.load(.acquire));
+    var finalized: session.Progress = .{};
+    try std.testing.expectError(error.InjectedFailure, session.run(a, p.v1, null, &.{p.d12}, 2, .{ .progress = &finalized, .fault = .after_finalize_before_optimize, .budget = .{ .cpu = 1, .worker_threads = 1 } }));
+    try std.testing.expect(finalized.mutation_started.load(.acquire));
+    try std.testing.expect(finalized.finalized.load(.acquire));
+    try expectEquivalent(a, p.v1, p.v2);
+    const again = try session.run(a, p.v1, null, &.{p.d12}, 2, .{});
+    try std.testing.expect(again.no_op);
+    try std.testing.expect(!again.resumed);
+}
+
+test "patch overlay initialization waits for advisory ownership" {
+    const a = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const overlay_path = "zig-cache-vfs-pt-lock-new-overlay";
+    fixture.cleanup(overlay_path);
+    defer fixture.cleanup(overlay_path);
+    try std.Io.Dir.cwd().createDirPath(io, overlay_path);
+    const f = try std.Io.Dir.cwd().createFile(io, overlay_path ++ "/" ++ session.LOCK_FILE_NAME, .{});
+    defer f.close(io);
+    try std.testing.expect(try f.tryLock(io, .exclusive));
+    // Invalid base deliberately proves the overlay is not opened or initialized
+    // before ownership is acquired; the only admissible result is Busy.
+    try std.testing.expectError(error.Busy, session.run(a, "missing-base", overlay_path, &.{}, null, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, overlay_path ++ "/manifest.db", .{}));
 }

@@ -73,6 +73,33 @@ pub fn select(allocator: std.mem.Allocator, manifests: []const diff_pack.DiffMan
     return path.toOwnedSlice(allocator);
 }
 
+/// Reconstruct exactly the chain recorded by a durable PatchIntent. Unrelated
+/// candidates (even cheaper ones) cannot replace it during ordinary recovery.
+pub fn selectSaved(allocator: std.mem.Allocator, manifests: []const diff_pack.DiffManifest, from: u64, to: u64, diff_ids: []const u64) ![]usize {
+    const order = try allocator.alloc(usize, diff_ids.len);
+    errdefer allocator.free(order);
+    var version = from;
+    var pack_id: ?u64 = null;
+    for (diff_ids, 0..) |id, step| {
+        var found: ?usize = null;
+        for (manifests, 0..) |dm, i| {
+            if (dm.diff_id != id) continue;
+            // Ambiguous IDs must never silently select an arbitrary artifact.
+            if (found != null) return error.PatchIntentMismatch;
+            found = i;
+        }
+        const index = found orelse return error.PatchIntentMismatch;
+        const dm = manifests[index];
+        if (dm.base_pack_version != version) return error.PatchIntentMismatch;
+        if (pack_id) |pid| if (dm.target_pack_id != pid) return error.PatchIntentMismatch;
+        pack_id = dm.target_pack_id;
+        version = dm.target_pack_version;
+        order[step] = index;
+    }
+    if (version != to) return error.PatchIntentMismatch;
+    return order;
+}
+
 fn m(from: u64, to: u64, bytes: u64) diff_pack.DiffManifest {
     return .{ .diff_id = from * 100 + to, .target_pack_id = 1, .base_pack_version = from, .target_pack_version = to, .target_build_id = to, .shard_hint_count = 1, .unit_count = 0, .chunk_count = 0, .chunk_nominal_bytes = 0, .file_op_count = 0, .target_file_count = 0, .target_tombstone_count = 0, .base_content_hash = [_]u8{0} ** 32, .target_content_hash = [_]u8{0} ** 32, .payload_total_bytes = bytes, .tool_version_hash = 0, .hdiff_options_hash = 0 };
 }
@@ -94,4 +121,19 @@ test "chain picks lightest path and reports missing path" {
     const same = try select(a, &ms, 2, 2);
     defer a.free(same);
     try std.testing.expectEqual(@as(usize, 0), same.len);
+}
+
+test "chain resume preserves saved IDs despite a cheaper candidate" {
+    const a = std.testing.allocator;
+    const ms = [_]diff_pack.DiffManifest{ m(1, 3, 1), m(2, 3, 100), m(1, 2, 100) };
+    const saved = try selectSaved(a, &ms, 1, 3, &.{ 102, 203 });
+    defer a.free(saved);
+    try std.testing.expectEqualSlices(usize, &.{ 2, 1 }, saved);
+    // Force deliberately uses ordinary selection instead of saved IDs.
+    const fresh = try select(a, &ms, 1, 3);
+    defer a.free(fresh);
+    try std.testing.expectEqualSlices(usize, &.{0}, fresh);
+    try std.testing.expectError(error.PatchIntentMismatch, selectSaved(a, &ms, 1, 3, &.{ 102, 999 }));
+    try std.testing.expectError(error.PatchIntentMismatch, selectSaved(a, &ms, 1, 3, &.{ 203, 102 }));
+    try std.testing.expectError(error.PatchIntentMismatch, selectSaved(a, &ms, 1, 4, &.{ 102, 203 }));
 }

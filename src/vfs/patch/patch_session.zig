@@ -43,7 +43,25 @@ pub const FaultPoint = union(enum) {
     after_units: u32,
     after_file_ops: u32,
     before_finalize,
+    after_finalize_before_optimize,
 };
+
+/// Internal subprocess-test hook. The caller owns the configuration strings
+/// until run returns. The marker is exclusively created and closed before the
+/// process sleeps, so observing it establishes that this exact hook was reached.
+pub const ProcessStop = struct {
+    point: FaultPoint,
+    ready_path: []const u8,
+};
+
+fn stopAt(options: PatchOptions, point: FaultPoint) !void {
+    const stop = options.process_stop orelse return;
+    if (!std.meta.eql(stop.point, point)) return;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const marker = try std.Io.Dir.cwd().createFile(io, stop.ready_path, .{ .exclusive = true });
+    marker.close(io);
+    while (true) try std.Io.sleep(io, .fromSeconds(3600), .awake);
+}
 
 pub const IdempotentCheck = enum { header, off };
 /// `touched` re-decodes every page this run wrote; `full` additionally runs
@@ -58,6 +76,10 @@ pub const Progress = struct {
     bytes_written: std.atomic.Value(u64) = .init(0),
     bytes_read: std.atomic.Value(u64) = .init(0),
     cancel: std.atomic.Value(bool) = .init(false),
+    /// Conservative boundary: the intent commit may have changed disk state.
+    mutation_started: std.atomic.Value(bool) = .init(false),
+    /// Final metadata and intent deletion have committed successfully.
+    finalized: std.atomic.Value(bool) = .init(false),
 };
 
 pub const PatchOptions = struct {
@@ -70,11 +92,13 @@ pub const PatchOptions = struct {
     /// Run `KvDb.optimize` on the target after finalize: reclaims the records
     /// superseded by the patch and rebuilds the base index.
     optimize_after: bool = false,
-    /// Accept a PatchIntent left by a different chain to the same version.
+    /// Explicitly select a fresh cheapest chain, accepting a saved intent for
+    /// another chain to the same version. Without force, resume saved diff IDs.
     force: bool = false,
     /// Shards for a newly created overlay.
     overlay_shards: u32 = 1,
     fault: FaultPoint = .none,
+    process_stop: ?ProcessStop = null,
     /// Record per-task dispatch timings; written as JSON to `trace_path`
     /// when set (bench / experiments).
     trace: bool = false,
@@ -129,6 +153,7 @@ const Session = struct {
         if (self.options.progress) |p| if (p.cancel.load(.acquire)) return error.Cancelled;
         switch (@as(Kind, @enumFromInt(desc.kind))) {
             .apply => {
+                try stopAt(self.options, .{ .after_units = 0 });
                 switch (self.options.fault) {
                     .after_units => |n| {
                         self.lock.lock();
@@ -142,12 +167,15 @@ const Session = struct {
                 if (r == .done) {
                     self.lock.lock();
                     self.units_done += 1;
+                    const completed = self.units_done;
                     self.lock.unlock();
+                    try stopAt(self.options, .{ .after_units = completed });
                     if (self.options.progress) |p| _ = p.units_done.fetchAdd(1, .monotonic);
                 }
                 return r;
             },
             .file_op => {
+                try stopAt(self.options, .{ .after_file_ops = 0 });
                 switch (self.options.fault) {
                     .after_file_ops => |n| {
                         self.lock.lock();
@@ -161,7 +189,9 @@ const Session = struct {
                 if (r == .done) {
                     self.lock.lock();
                     self.file_ops_done += 1;
+                    const completed = self.file_ops_done;
                     self.lock.unlock();
+                    try stopAt(self.options, .{ .after_file_ops = completed });
                 }
                 return r;
             },
@@ -240,6 +270,7 @@ const Session = struct {
         }
         self.bump("units_applied", 1);
         self.pending[index] = .{ .ops = ops, .file_entry = unit.file_entry };
+        ops = .empty; // Pending now owns both the array and its values.
         return self.flushPending(index);
     }
 
@@ -579,6 +610,7 @@ const Session = struct {
         // Singletons (directory manifest) live in shard 0 like the builder puts them.
         const route_entry: u64 = if (fo.op.op == .put_directory_manifest) 0 else fo.op.file_entry;
         self.pending[slot] = .{ .ops = ops, .file_entry = route_entry };
+        ops = .empty; // Pending owns cleanup even if flush fails.
         return self.flushPending(slot);
     }
 };
@@ -614,35 +646,27 @@ fn writeTraceJson(allocator: std.mem.Allocator, path: []const u8, sched_report: 
     try pf.flushData(f);
 }
 
-/// Name of the exclusive lock file created in the written pack directory
-/// for the duration of a run (docs §9.1 P0).
+/// Persistent advisory-lock inode in the written pack directory. Never unlink
+/// it: an unlink permits another process to lock a different inode at this path.
 pub const LOCK_FILE_NAME = ".vfs_patch.lock";
 
-/// Held while a pack is being patched so two patchers cannot interleave
-/// batches on the same store. Stale locks (crash) are removed on the next
-/// run because the on-disk state is fully described by the PatchIntent.
+/// OS releases the advisory lock on close or process death. A leftover filename
+/// is harmless; only an active owner makes another patcher Busy.
 const PatchLock = struct {
-    path: []u8,
     file: std.Io.File,
 
     fn acquire(allocator: std.mem.Allocator, dir: []const u8) !PatchLock {
         const io = std.Io.Threaded.global_single_threaded.io();
         const path = try std.fs.path.join(allocator, &.{ dir, LOCK_FILE_NAME });
-        errdefer allocator.free(path);
-        // Exclusive create is the atomic "test and set"; a second patcher on
-        // the same directory sees PathAlreadyExists.
-        const file = std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true }) catch |e| switch (e) {
-            error.PathAlreadyExists => return error.Busy,
-            else => |err| return err,
-        };
-        return .{ .path = path, .file = file };
+        defer allocator.free(path);
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
+        errdefer file.close(io);
+        if (!try file.tryLock(io, .exclusive)) return error.Busy;
+        return .{ .file = file };
     }
 
-    fn release(self: *PatchLock, allocator: std.mem.Allocator) void {
-        const io = std.Io.Threaded.global_single_threaded.io();
-        self.file.close(io);
-        std.Io.Dir.cwd().deleteFile(io, self.path) catch {};
-        allocator.free(self.path);
+    fn release(self: *PatchLock) void {
+        self.file.close(std.Io.Threaded.global_single_threaded.io());
         self.* = undefined;
     }
 };
@@ -652,9 +676,10 @@ const PatchLock = struct {
 /// `to_version == null` selects the highest reachable version.
 pub fn run(allocator: std.mem.Allocator, target_path: []const u8, overlay_path: ?[]const u8, diff_paths: []const []const u8, to_version: ?u64, options: PatchOptions) !Report {
     const written_dir = overlay_path orelse target_path;
-    if (overlay_path) |op| try overlay_mod.openOrCreate(allocator, target_path, op, .{ .shards = options.overlay_shards });
+    if (overlay_path) |op| try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), op);
     var lock = try PatchLock.acquire(allocator, written_dir);
-    defer lock.release(allocator);
+    defer lock.release();
+    if (overlay_path) |op| try overlay_mod.openOrCreate(allocator, target_path, op, .{ .shards = options.overlay_shards });
 
     const report = try runSession(allocator, target_path, overlay_path, diff_paths, to_version, options);
 
@@ -731,7 +756,10 @@ fn runSession(allocator: std.mem.Allocator, target_path: []const u8, overlay_pat
         report.wall_ns = @intCast(@max(task.scheduler.nowNs() - wall_start, 0));
         return report;
     }
-    const order = try chain_mod.select(allocator, manifests.items, current.pack_version, target_version);
+    const order = if (intent != null and !options.force)
+        try chain_mod.selectSaved(allocator, manifests.items, current.pack_version, target_version, intent.?.intent.diff_ids)
+    else
+        try chain_mod.select(allocator, manifests.items, current.pack_version, target_version);
     defer allocator.free(order);
     var chain = try allocator.alloc(*reader_mod.DiffPackReader, order.len);
     defer allocator.free(chain);
@@ -804,8 +832,10 @@ fn runSession(allocator: std.mem.Allocator, target_path: []const u8, overlay_pat
         var b = batch_mod.Batch.begin(&target_db, allocator);
         defer b.deinit();
         try b.putBytes(&object_key.encodeDbKey(object_key.patchIntentKey()), intent_bytes, 0);
+        if (options.progress) |p| p.mutation_started.store(true, .release);
         try b.commit(.sync);
     }
+    try stopAt(options, .after_intent);
     if (options.fault == .after_intent) return error.InjectedFailure;
 
     var sched = try task.Scheduler.init(allocator, options.budget);
@@ -818,6 +848,7 @@ fn runSession(allocator: std.mem.Allocator, target_path: []const u8, overlay_pat
     try writer.drain(.sync);
     report.batches = writer.stats.batches;
     report.yields = writer.stats.yields;
+    try stopAt(options, .before_finalize);
     if (options.fault == .before_finalize) return error.InjectedFailure;
     // A cancel that raced with the last tasks: everything staged so far is
     // committed and idempotent; just do not publish the new version.
@@ -862,6 +893,10 @@ fn runSession(allocator: std.mem.Allocator, target_path: []const u8, overlay_pat
         try b.commit(.sync);
     }
 
+    if (options.progress) |p| p.finalized.store(true, .release);
+    try stopAt(options, .after_finalize_before_optimize);
+    if (options.fault == .after_finalize_before_optimize) return error.InjectedFailure;
+
     // P6 optional optimize + verify touched pages (`full` adds a whole-pack
     // verification in `run`, after the store is closed).
     if (options.optimize_after) try target_db.optimize();
@@ -874,4 +909,68 @@ fn runSession(allocator: std.mem.Allocator, target_path: []const u8, overlay_pat
     }
     report.wall_ns = @intCast(@max(task.scheduler.nowNs() - wall_start, 0));
     return report;
+}
+
+test "patch pending cleanup after a consumed commit failure" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try kv.KvDb.openAt(tmp.dir, .{});
+    defer db.close() catch {};
+    var failing = std.testing.FailingAllocator.init(a, .{});
+    const fa = failing.allocator();
+    var writer = try shard_writer_mod.ShardWriter.init(fa, &db, .{ .batch_ops = 1 });
+    defer writer.deinit();
+    var pending = [_]?Pending{.{ .file_entry = 0 }};
+    try pending[0].?.ops.append(fa, .{ .key = 1000, .value = try fa.dupe(u8, "owned") });
+    var report: Report = .{};
+    var session = Session{
+        .allocator = fa,
+        .options = .{},
+        .view = .{ .target = &db, .base = null },
+        .writer = &writer,
+        .readers = &.{},
+        .plan = undefined, // flushPending only uses the pending slot and writer.
+        .to_version = 2,
+        .pending = &pending,
+        .report = &report,
+    };
+    defer session.discardPending(0);
+    try writer.shards[0].ops.ensureUnusedCapacity(fa, 1);
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectEqual(task.RunResult.done, try session.flushPending(0));
+    try std.testing.expect(pending[0] == null);
+    try std.testing.expectError(error.OutOfMemory, writer.drain(.sync));
+    try std.testing.expectEqual(@as(u64, 0), writer.total_staged.load(.acquire));
+
+    // A subsequent unit creates local ops, transfers them to Pending, then
+    // encounters the sticky error before staging. Only Pending may free them.
+    failing.fail_index = std.math.maxInt(usize);
+    var steps = [_]coalesce.Step{.{ .reader = 0, .unit = .{
+        .kind = .delete_page,
+        .strategy = .none,
+        .codec = .none,
+        .file_entry = 1,
+        .block_index = 0,
+    } }};
+    var units = [_]coalesce.ApplyUnit{.{
+        .file_entry = 1,
+        .block_index = 0,
+        .composite = false,
+        .steps = &steps,
+        .est_bytes = 0,
+        .needs_codec = false,
+    }};
+    var plan = coalesce.PatchPlan{
+        .allocator = fa,
+        .units = .{ .items = &units, .capacity = units.len },
+        .first = undefined,
+        .final = undefined,
+        .diff_ids = &.{},
+    };
+    session.plan = &plan;
+    session.options.idempotent_check = .off;
+    try std.testing.expectError(error.OutOfMemory, session.applyUnit(0));
+    try std.testing.expect(pending[0] != null);
+    try std.testing.expectEqual(@as(usize, 1), pending[0].?.ops.items.len);
 }
