@@ -27,7 +27,17 @@ pub const Publication = struct {
         defer allocator.free(cwd_path);
         const normalized = try std.fs.path.resolve(allocator, &.{ cwd_path, output });
         errdefer allocator.free(normalized);
-        if (std.fs.path.dirname(normalized) == null or std.mem.eql(u8, normalized, "/")) return error.InvalidArgument;
+        if (std.fs.path.dirname(normalized) == null or std.mem.eql(u8, normalized, "/") or std.mem.eql(u8, normalized, cwd_path)) return error.InvalidArgument;
+        // Existing paths may also reach cwd through a symlinked parent. Reject
+        // that alias without broadening which paths cleanup is allowed to touch.
+        const canonical = std.Io.Dir.cwd().realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), normalized, allocator) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        defer if (canonical) |path| allocator.free(path);
+        if (canonical) |path| {
+            if (std.mem.eql(u8, path, cwd_path)) return error.InvalidArgument;
+        }
         const tx = try std.fmt.allocPrint(allocator, "{s}.vfs-build", .{normalized});
         errdefer allocator.free(tx);
         const stage = try std.fs.path.join(allocator, &.{ tx, "stage" });
@@ -262,4 +272,36 @@ test "first build interruption removes only its private stage" {
     try recover(out, allocator);
     try std.testing.expect(!try exists(out));
     try std.testing.expect(!try exists(p.transaction));
+}
+
+test "publication rejects normalized current directory aliases" {
+    const allocator = std.testing.allocator;
+    const cwd_path = try std.Io.Dir.cwd().realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
+    defer allocator.free(cwd_path);
+    const parent_alias = try std.fmt.allocPrint(allocator, "../{s}", .{std.fs.path.basename(cwd_path)});
+    defer allocator.free(parent_alias);
+    const child_alias = try std.fmt.allocPrint(allocator, "{s}/unused/../", .{cwd_path});
+    defer allocator.free(child_alias);
+    for ([_][]const u8{ cwd_path, parent_alias, child_alias }) |alias| {
+        if (Publication.init(allocator, alias)) |value| {
+            var unexpected = value;
+            unexpected.deinit();
+            return error.TestExpectedError;
+        } else |err| try std.testing.expectEqual(error.InvalidArgument, err);
+    }
+}
+
+test "publication rejects current directory through a symlinked parent" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cwd = std.Io.Dir.cwd();
+    const cwd_path = try cwd.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(cwd_path);
+    const link = "zig-cache-vfs-publication-parent-link";
+    try cwd.symLink(io, std.fs.path.dirname(cwd_path).?, link, .{ .is_directory = true });
+    defer cwd.deleteFile(io, link) catch {};
+    const alias = try std.fs.path.join(allocator, &.{ link, std.fs.path.basename(cwd_path) });
+    defer allocator.free(alias);
+    try std.testing.expectError(error.InvalidArgument, Publication.init(allocator, alias));
 }

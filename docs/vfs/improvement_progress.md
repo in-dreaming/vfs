@@ -43,3 +43,19 @@ $ZIG build test -Doptimize=ReleaseSafe --summary all
 ### Next stages
 
 The pre-existing Debug CRC inline-assembly `q` constraint failure and C-ABI missing-DiffPack smoke assertion remain untouched. Address those next; do not treat the full suite as green until the C smoke passes.
+
+### Stage 1 review follow-up: current-directory aliases
+
+Independent review identified that absolute/normalized spellings of the current directory bypassed the literal `.` / `..` guard. Publication now rejects both normalized equality with canonical cwd and existing aliases through symlinked parents, before creating any transaction directory. Cleanup scope is unchanged.
+
+The new alias regression failed before the fix. Focused ReleaseSafe verification passed all 14 selected tests, including both alias regressions, every publication recovery test, and representative pack-builder tests. `git diff --check` passed. The symlink test is skipped on Windows, where creating symlinks can require additional privileges.
+
+```sh
+printf 'pub const enable_abi_exports = false;\n' > /tmp/vfs-stage1-db-options.zig
+ZIG_GLOBAL_CACHE_DIR=/tmp/vfs-review-tools/global-cache \
+  /tmp/vfs-review-tools/zig-x86_64-linux-0.16.0/zig test \
+  -O ReleaseSafe -I include --dep db_internal -Mroot=src/vfs/root.zig \
+  -O ReleaseSafe --dep db_build_options -Mdb_internal=src/db/internal.zig \
+  -Mdb_build_options=/tmp/vfs-stage1-db-options.zig \
+  --test-filter 'pack builder' --test-filter 'publication'
+```
