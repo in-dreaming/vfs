@@ -1,3 +1,11 @@
+> Implementation update (2026-10-08, stage 2): the historical analysis below
+> predates retained opaque IDs. ABI lookups now acquire object-local leases;
+> registry locks are never held across I/O or drain/join. Read-only stores pin
+> only the current page source, so overlay/foreign reads work with a strict
+> one-store budget. Writable mounts retain a request-wide generation pin.
+> Store contention uses a condition variable instead of the old bounded spin.
+> See `improvement_progress.md` for the current verified contracts.
+
 # VFS 只读多线程并发读调研与实施
 
 本文调研 `vfs_read_at` → `Volume/FileHandle` → `PageCache` → `PackReader` → `KvDb` → `DataFile` → 平台 IO 的完整读路径，量化每一层在多线程只读场景下的串行化点与冗余开销，并给出让"多线程读取整体速度随线程数扩展"的实现方案与分阶段路线。

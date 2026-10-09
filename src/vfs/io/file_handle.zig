@@ -6,7 +6,7 @@ const registry = @import("../compress/registry.zig");
 const object_key = @import("../object_key.zig");
 
 const PageSource = struct {
-    pack_id: u32,
+    pack_id: u64,
     pack_generation: u64,
     identity: page_value_fmt.PageIdentity,
     page_key: u64,
@@ -21,16 +21,17 @@ const PageSource = struct {
 pub const OPEN_FLAG_STREAMING: u32 = 1 << 0;
 
 pub const FileHandle = struct {
+    volume_lease: ?@import("../handle_registry.zig").Lease(volume_mod.Volume) = null,
     volume_handle: u64,
     volume: *volume_mod.Volume,
     /// Top layer for page resolution: the overlay when one is mounted for
     /// this pack, otherwise the mount the manifest came from. Stable for the
-    /// volume's lifetime; pinned once per `readAt` instead of once per page.
+    /// volume's lifetime; only the store serving a page is pinned for I/O.
     mounted: *volume_mod.Volume.MountedPack,
     /// Base layer that implicit page reads fall through to when `mounted`
     /// is an overlay and does not hold the page.
     base: ?*volume_mod.Volume.MountedPack = null,
-    pack_id: u32,
+    pack_id: u64,
     pack_generation: u64,
     file_entry: u64,
     manifest: file_manifest_fmt.DecodedFileManifest,
@@ -38,6 +39,7 @@ pub const FileHandle = struct {
     flags: u32 = 0,
 
     pub fn close(self: *FileHandle) void {
+        defer if (self.volume_lease) |lease| lease.release();
         self.manifest.deinit(std.heap.smp_allocator);
         _ = self.volume.open_file_count.fetchSub(1, .seq_cst);
     }
@@ -50,10 +52,11 @@ pub const FileHandle = struct {
         const request_start = offset;
         const request_end = offset + wanted;
 
-        // One pin on our own pack for the whole request. Explicit page refs
-        // that point into other packs pin those per page.
-        try self.volume.pinMounted(self.mounted);
-        defer self.volume.unpinMounted(self.mounted);
+        // Writable mounts need a generation guard for the request. Immutable
+        // read-only mounts only pin the page source actually being read, so a
+        // one-store budget can serve overlay fallbacks and foreign refs.
+        if (self.mounted.writable) try self.volume.pinMounted(self.mounted);
+        defer if (self.mounted.writable) self.volume.unpinMounted(self.mounted);
 
         for (self.manifest.blocks, 0..) |block, block_i| {
             if (block.page_size == 0 and block.page_count != 0) return error.Corruption;
@@ -117,8 +120,6 @@ pub const FileHandle = struct {
                     self.readImplicit(self.mounted, cache_key, source, block.codec, page_off, dst[copied..][0..copy_len], streaming) catch |e| switch (e) {
                         error.NotFound => {
                             const base = self.base orelse return error.NotFound;
-                            try self.volume.pinMounted(base);
-                            defer self.volume.unpinMounted(base);
                             var base_key = cache_key;
                             base_key.pack_generation = base.mount_order.load(.acquire);
                             self.readImplicit(base, base_key, source, block.codec, page_off, dst[copied..][0..copy_len], streaming) catch |e2| switch (e2) {
@@ -161,6 +162,8 @@ pub const FileHandle = struct {
         dst: []u8,
         streaming: bool,
     ) !void {
+        try self.volume.pinMounted(layer);
+        defer self.volume.unpinMounted(layer);
         if (streaming) {
             return self.volume.page_cache.readThrough(layer.reader, cache_key, source.identity, codec, source.page_key, dst);
         }

@@ -72,6 +72,16 @@ int main(int argc, char** argv) {
     rc = vfs_stat_entry(volume, k_entry, &st);
     if (rc != VFS_OK || st.size != sizeof(k_payload) - 1) return 14;
 
+    /* Versioned output writes stop at the advertised prefix. */
+    struct { uint32_t struct_size, flags; uint64_t guard[5]; } prefix;
+    memset(&prefix, 0xa5, sizeof(prefix));
+    prefix.struct_size = 8;
+    if (vfs_stat_path(volume, k_vpath, (vfs_stat_t*)&prefix) != VFS_OK) return 60;
+    for (unsigned i = 0; i < 5; ++i)
+        if (prefix.guard[i] != UINT64_C(0xa5a5a5a5a5a5a5a5)) return 61;
+    prefix.struct_size = 0;
+    if (vfs_stat_entry(volume, k_entry, (vfs_stat_t*)&prefix) != VFS_INVALID_ARGUMENT) return 62;
+
     rc = vfs_open_path(volume, k_vpath, 0, &file);
     if (rc != VFS_OK || file == 0) return 15;
 
@@ -98,7 +108,8 @@ int main(int argc, char** argv) {
 
     /* ---- patch: error paths ---- */
     vfs_patch_t patch = 0;
-    vfs_patch_progress_t prog;
+    vfs_patch_progress_t prog = {0};
+    prog.struct_size = (uint32_t)sizeof(prog);
     const char* diffs[1];
     diffs[0] = diff_path;
 

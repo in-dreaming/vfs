@@ -144,6 +144,13 @@ enum {
 
 DB_API db_handle_t db_create(const char* path, const db_open_options_t* options, const db_context_t* context);
 DB_API db_handle_t db_open(const char* path, const db_open_options_t* options, const db_context_t* context);
+/* Handles are opaque, process-local, never-reused IDs, not pointers.
+ * Close returns DB_BUSY and leaves the ID valid while admitted operations,
+ * batches or snapshots retain this DB. End all batches/snapshots first.
+ * Snapshots retain the DB because byte-key hashing uses its hash/context;
+ * caller-owned context remains valid until every dependent ends and DB close
+ * succeeds. Batch commit/rollback and snapshot end invalidate their IDs, then
+ * drain admitted operations without holding a process-global registry lock. */
 DB_API int db_close(db_handle_t db);
 
 DB_API int db_last_status(void);

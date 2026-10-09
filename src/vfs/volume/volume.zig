@@ -33,11 +33,6 @@ pub const OpenOptions = struct {
 /// backs off to the locked slow path.
 const PIN_PARKING: u32 = 1 << 31;
 
-/// Upper bound on slow-path pin retries while all open stores are busy. With
-/// yields after the first few spins this is on the order of seconds; hitting
-/// it means readers are stuck, not merely contended.
-const PIN_MAX_ATTEMPTS: u32 = 1_000_000;
-
 pub const Volume = struct {
     /// Heap node with a stable address for the lifetime of the volume, so file
     /// handles can cache a pointer instead of searching the mount table.
@@ -64,8 +59,8 @@ pub const Volume = struct {
             return null;
         }
 
-        fn unpin(self: *MountedPack) void {
-            _ = self.pin_count.fetchSub(1, .release);
+        fn unpin(self: *MountedPack) u32 {
+            return self.pin_count.fetchSub(1, .release);
         }
     };
 
@@ -92,6 +87,10 @@ pub const Volume = struct {
     /// use `published` and per-mount atomic pins.
     lock: sync.Mutex = .{},
     store_clock: u64 = 1,
+    store_available: sync.Condition = .{},
+    store_notify_lock: sync.Mutex = .{},
+    store_epoch: u64 = 0,
+    store_waiters: std.atomic.Value(u32) = .init(0),
 
     pub fn open(path: []const u8, options: OpenOptions) !Volume {
         if (path.len == 0) return error.InvalidArgument;
@@ -149,7 +148,7 @@ pub const Volume = struct {
         errdefer std.heap.smp_allocator.destroy(node);
         self.store_clock += 1;
         node.* = .{
-            .meta = .{ .pack_id = @intCast(reader.manifest.pack_id), .priority = priority, .mount_order = self.next_mount_order, .pack_version = reader.manifest.pack_version, .flags = flags },
+            .meta = .{ .pack_id = reader.manifest.pack_id, .priority = priority, .mount_order = self.next_mount_order, .pack_version = reader.manifest.pack_version, .flags = flags },
             .reader = reader,
             .path = owned_path,
             .last_used = self.store_clock,
@@ -219,7 +218,7 @@ pub const Volume = struct {
         return list.items;
     }
 
-    fn findInList(list: []const *MountedPack, pack_id: u32, pack_generation: u64) ?*MountedPack {
+    fn findInList(list: []const *MountedPack, pack_id: u64, pack_generation: u64) ?*MountedPack {
         for (list) |mounted| {
             if (mounted.meta.pack_id == pack_id and mounted.pack_version.load(.acquire) == pack_generation) return mounted;
         }
@@ -260,14 +259,14 @@ pub const Volume = struct {
         self.writable_path = try std.heap.smp_allocator.dupe(u8, pack_path);
     }
 
-    pub fn findMountedPack(self: *Volume, pack_id: u32, pack_generation: u64) ?*MountedPack {
+    pub fn findMountedPack(self: *Volume, pack_id: u64, pack_generation: u64) ?*MountedPack {
         for (self.mounts.items) |mounted| {
             if (mounted.meta.pack_id == pack_id and mounted.meta.pack_version == pack_generation) return mounted;
         }
         return null;
     }
 
-    pub fn findMountedPackContainingGeneration(self: *Volume, pack_id: u32, pack_generation: u64) ?*MountedPack {
+    pub fn findMountedPackContainingGeneration(self: *Volume, pack_id: u64, pack_generation: u64) ?*MountedPack {
         if (self.findMountedPack(pack_id, pack_generation)) |mounted| return mounted;
         for (self.mounts.items) |mounted| {
             if (mounted.meta.pack_id == pack_id and mounted.meta.pack_version >= pack_generation) return mounted;
@@ -297,7 +296,7 @@ pub const Volume = struct {
         errdefer if (!closed) writer.close() catch {};
         const tombstone = try tombstone_fmt.encodeEntryTombstone(.{ .file_entry = file_entry, .tombstone_version = 1, .reason_flags = 1 });
         try writer.putEntryTombstone(file_entry, &tombstone);
-        const manifest = pack_manifest_fmt.encodePackManifest(.{ .pack_id = 1, .pack_version = mounted.reader.manifest.pack_version + 1, .build_id = mounted.reader.manifest.build_id + 1, .file_count = mounted.reader.manifest.file_count, .tombstone_count = mounted.reader.manifest.tombstone_count + 1, .content_hash = hash.contentHash(&tombstone) });
+        const manifest = pack_manifest_fmt.encodePackManifest(.{ .pack_id = mounted.meta.pack_id, .pack_version = mounted.reader.manifest.pack_version + 1, .build_id = mounted.reader.manifest.build_id + 1, .file_count = mounted.reader.manifest.file_count, .tombstone_count = mounted.reader.manifest.tombstone_count + 1, .content_hash = hash.contentHash(&tombstone) });
         try writer.putPackManifest(&manifest);
         try writer.close();
         closed = true;
@@ -314,6 +313,9 @@ pub const Volume = struct {
         };
         defer if (old) |*resolved| resolved.deinit();
 
+        // Existing explicit PageRef records encode only u32 IDs. Preserve
+        // wider pack identities by writing ordinary implicit pages instead.
+        const ref_pack_id = std.math.cast(u32, mounted.meta.pack_id);
         var writer = try pack_writer.PackWriter.create(std.heap.smp_allocator, mounted.path);
         var closed = false;
         errdefer if (!closed) writer.close() catch {};
@@ -328,16 +330,18 @@ pub const Volume = struct {
             const payload = data[start..end];
             const payload_hash = hash.contentHash(payload);
             const payload_crc = hash.crc32c(payload);
-            if (try self.reusablePageRef(old, mounted, new_generation, page_index, payload, payload_hash, payload_crc)) |ref| {
-                try page_refs.append(std.heap.smp_allocator, ref);
-                continue;
+            if (ref_pack_id != null) {
+                if (try self.reusablePageRef(old, mounted, new_generation, page_index, payload, payload_hash, payload_crc)) |ref| {
+                    try page_refs.append(std.heap.smp_allocator, ref);
+                    continue;
+                }
             }
             const page_value = try page_value_fmt.encodePageValue(std.heap.smp_allocator, .{ .file_entry = file_entry, .block_index = 0, .page_index = page_index, .raw_size = @intCast(payload.len), .stored_size = @intCast(payload.len), .content_hash = payload_hash, .payload = payload });
             defer std.heap.smp_allocator.free(page_value);
             try writer.putPage(file_entry, 0, page_index, page_value);
             const key = try object_key.pageKey(file_entry, 0, page_index);
-            try page_refs.append(std.heap.smp_allocator, .{
-                .pack_id = mounted.meta.pack_id,
+            if (ref_pack_id) |id| try page_refs.append(std.heap.smp_allocator, .{
+                .pack_id = id,
                 .pack_generation = new_generation,
                 .file_entry = file_entry,
                 .block_index = 0,
@@ -355,7 +359,7 @@ pub const Volume = struct {
             .page_count = page_count,
             .codec = .none,
             .block_hash = hash.contentHash(data),
-            .flags = file_manifest_fmt.BLOCK_FLAG_EXPLICIT_PAGE_REFS,
+            .flags = if (ref_pack_id != null) file_manifest_fmt.BLOCK_FLAG_EXPLICIT_PAGE_REFS else 0,
             .page_ref_offset = 0,
         }};
         const file_manifest = try file_manifest_fmt.encodeFileManifest(std.heap.smp_allocator, .{ .file_entry = file_entry, .file_version = new_generation, .file_size = data.len, .content_hash = hash.contentHash(data), .blocks = blocks, .page_refs = page_refs.items });
@@ -370,7 +374,7 @@ pub const Volume = struct {
             existing.deinit(std.heap.smp_allocator);
             break :blk true;
         };
-        const manifest = pack_manifest_fmt.encodePackManifest(.{ .pack_id = 1, .pack_version = mounted.reader.manifest.pack_version + 1, .build_id = mounted.reader.manifest.build_id + 1, .file_count = mounted.reader.manifest.file_count + @as(u64, if (existed) 0 else 1), .tombstone_count = mounted.reader.manifest.tombstone_count, .content_hash = hash.contentHash(data) });
+        const manifest = pack_manifest_fmt.encodePackManifest(.{ .pack_id = mounted.meta.pack_id, .pack_version = mounted.reader.manifest.pack_version + 1, .build_id = mounted.reader.manifest.build_id + 1, .file_count = mounted.reader.manifest.file_count + @as(u64, if (existed) 0 else 1), .tombstone_count = mounted.reader.manifest.tombstone_count, .content_hash = hash.contentHash(data) });
         try writer.putPackManifest(&manifest);
         try writer.close();
         closed = true;
@@ -425,7 +429,7 @@ pub const Volume = struct {
         const block = resolved.manifest.blocks[0];
         if (block.page_size == 0 or page_index >= block.page_count) return null;
         var loaded = self.loadPageFromManifest(resolved.mounted, &resolved.manifest, 0, page_index) catch |e| switch (e) {
-            error.NotFound => return null,
+            error.NotFound, error.UnsupportedFeature => return null,
             else => |err| return err,
         };
         defer loaded.deinit();
@@ -447,7 +451,7 @@ pub const Volume = struct {
         else blk: {
             const key = try object_key.pageKey(manifest.header.file_entry, block_index, page_index);
             break :blk file_manifest_fmt.PageRef{
-                .pack_id = owner.meta.pack_id,
+                .pack_id = std.math.cast(u32, owner.meta.pack_id) orelse return error.UnsupportedFeature,
                 .pack_generation = owner.meta.pack_version,
                 .file_entry = manifest.header.file_entry,
                 .block_index = block_index,
@@ -497,38 +501,49 @@ pub const Volume = struct {
     /// may point at an older generation of a pack that has since been
     /// refreshed) and pin it. The returned node stays valid for the volume's
     /// lifetime; `unpinMounted` must be called once per successful pin.
-    pub fn pinStoreMounted(self: *Volume, pack_id: u32, pack_generation: u64) !*MountedPack {
+    pub fn pinStoreMounted(self: *Volume, pack_id: u64, pack_generation: u64) !*MountedPack {
         const mounted = findInList(self.currentMounts(), pack_id, pack_generation) orelse return error.NotFound;
         try self.pinMounted(mounted);
         return mounted;
     }
 
-    /// Pin an already-resolved mount: lock-free when the store is ready.
-    ///
-    /// When every open store is pinned by other readers (`max_open_stores`
-    /// saturated) there is nothing to park; instead of failing we back off
-    /// and retry so a read never fails just because peers are mid-read.
+    /// Pin one page source. Slow-path contenders sleep until a store becomes
+    /// idle, rather than spending a fixed spin budget against busy readers.
+    /// Callers must not retain an unrelated read-only store while acquiring.
     pub fn pinMounted(self: *Volume, mounted: *MountedPack) !void {
-        var attempt: u32 = 0;
-        while (true) : (attempt += 1) {
-            if (mounted.pinFast() != null) return;
-            const pinned = blk: {
-                self.lock.lock();
-                defer self.lock.unlock();
-                self.pinMountedLocked(mounted) catch |e| switch (e) {
-                    error.Busy => break :blk false,
-                    else => |err| return err,
-                };
-                break :blk true;
+        if (mounted.pinFast() != null) return;
+        while (true) {
+            self.lock.lock();
+            self.store_notify_lock.lock();
+            const observed = self.store_epoch;
+            self.store_notify_lock.unlock();
+            self.pinMountedLocked(mounted) catch |e| {
+                self.lock.unlock();
+                if (e != error.Busy) return e;
+                // An epoch prevents a lost wake between the failed attempt
+                // and waiting. Notification never needs the volume lock:
+                // the releasing reader may still hold a writable generation
+                // pin which an updater is draining under that lock.
+                self.store_notify_lock.lock();
+                _ = self.store_waiters.fetchAdd(1, .release);
+                while (self.store_epoch == observed) self.store_available.wait(&self.store_notify_lock);
+                _ = self.store_waiters.fetchSub(1, .release);
+                self.store_notify_lock.unlock();
+                continue;
             };
-            if (pinned) return;
-            if (attempt >= PIN_MAX_ATTEMPTS) return error.Busy;
-            if (attempt < 16) std.atomic.spinLoopHint() else std.Thread.yield() catch {};
+            self.lock.unlock();
+            return;
         }
     }
 
-    pub fn unpinMounted(_: *Volume, mounted: *MountedPack) void {
-        mounted.unpin();
+    pub fn unpinMounted(self: *Volume, mounted: *MountedPack) void {
+        const previous = mounted.unpin();
+        if (previous == 1 and !mounted.writable) {
+            self.store_notify_lock.lock();
+            defer self.store_notify_lock.unlock();
+            self.store_epoch +%= 1;
+            self.store_available.broadcast();
+        }
     }
 
     pub fn readonlyReadyCount(self: *Volume) usize {
@@ -537,7 +552,7 @@ pub const Volume = struct {
         return self.readonlyReadyCountLocked();
     }
 
-    fn findMountedPackById(self: *Volume, pack_id: u32) ?*MountedPack {
+    fn findMountedPackById(self: *Volume, pack_id: u64) ?*MountedPack {
         for (self.mounts.items) |mounted| {
             if (mounted.meta.pack_id == pack_id) return mounted;
         }
@@ -870,6 +885,18 @@ test "volume page-level incremental uses explicit refs and fails on missing or c
     handle.close();
     try std.testing.expectEqualSlices(u8, "aaaaXXXXcccc", buf[0..incremental_n]);
 
+    // Close/reopen the writable output as a read-only mount. With a strict
+    // one-store budget, foreign-page reads must release the unused top store.
+    var bounded = try Volume.open("bounded-foreign", .{ .max_open_stores = 1 });
+    defer bounded.close();
+    try bounded.mountPackWithPriority(base_path, 1, 0);
+    try bounded.mountPackWithPriority(writable_path, 2, 0);
+    var foreign_handle = try bounded.openEntry(1, 3001);
+    defer foreign_handle.close();
+    const foreign_n = try foreign_handle.readAt(0, &buf);
+    try std.testing.expectEqualSlices(u8, "aaaaXXXXcccc", buf[0..foreign_n]);
+    try std.testing.expect(bounded.readonlyReadyCount() <= 1);
+
     var missing = try Volume.open("missing-base", .{});
     defer missing.close();
     try missing.mountPackWithPriority(writable_path, 0, 0);
@@ -1105,4 +1132,111 @@ fn mutateDbObjectForTest(pack_path: []const u8, key: u64, mutator: *const fn ([]
 fn expectVerifyIssueForTest(report: anytype, kind: anytype) !void {
     for (report.issues.items) |issue| if (issue.kind == kind) return;
     return error.TestExpectedEqual;
+}
+
+test "u64 pack identities remain distinct and unencodable foreign refs are copied" {
+    const builder = @import("../build/pack_builder.zig");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const high_path = "zig-cache-vfs-wide-id-high";
+    const low_path = "zig-cache-vfs-wide-id-low";
+    const writable_path = "zig-cache-vfs-wide-id-writable";
+    const source = "zig-cache-vfs-wide-id.bin";
+    defer std.Io.Dir.cwd().deleteTree(io, high_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, low_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, writable_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
+    const high_id: u64 = (@as(u64, 1) << 40) | 7;
+    try builder.writeSourceFileForTest(source, "high");
+    try builder.createPack(high_path, &.{.{ .source_path = source, .virtual_path = "/high", .file_entry = 8903, .page_size = 4 }}, .{ .pack_id = high_id });
+    try builder.writeSourceFileForTest(source, "low!");
+    try builder.createPack(low_path, &.{.{ .source_path = source, .virtual_path = "/low", .file_entry = 8904, .page_size = 4 }}, .{ .pack_id = 7 });
+    var volume = try Volume.open("wide", .{ .max_open_stores = 1 });
+    defer volume.close();
+    try volume.mountPackWithPriority(high_path, 1, 0);
+    try volume.mountPackWithPriority(low_path, 2, 0);
+    const high = volume.findMountedPack(high_id, 1).?;
+    const low = volume.findMountedPack(7, 1).?;
+    try std.testing.expect(high != low);
+    var file = try volume.openPath(0, "/high");
+    var bytes: [4]u8 = undefined;
+    _ = try file.readAt(0, &bytes);
+    file.close();
+    try std.testing.expectEqualStrings("high", &bytes);
+    try volume.setWritablePack(writable_path);
+    try volume.writeFileByEntry(8903, "high", .{ .page_size = 4 });
+    file = try volume.openEntry(0, 8903);
+    defer file.close();
+    try std.testing.expectEqual(@as(u32, 1), file.manifest.page_refs[0].pack_id);
+    _ = try file.readAt(0, &bytes);
+    try std.testing.expectEqualStrings("high", &bytes);
+    // A high-ID destination uses the existing implicit-page encoding rather
+    // than truncating its ID to fit an explicit PageRef.
+    var destination = try Volume.open("wide-destination", .{});
+    defer destination.close();
+    try destination.setWritablePack(high_path);
+    try destination.writeFileByEntry(8903, "edit", .{ .page_size = 4 });
+    try std.testing.expectEqual(high_id, destination.writableMount().?.reader.manifest.pack_id);
+    var edited = try destination.openEntry(0, 8903);
+    _ = try edited.readAt(0, &bytes);
+    try std.testing.expectEqualStrings("edit", &bytes);
+    try std.testing.expectEqual(@as(u32, 0), edited.manifest.blocks[0].flags & file_manifest_fmt.BLOCK_FLAG_EXPLICIT_PAGE_REFS);
+    edited.close();
+    try destination.deleteEntry(8903);
+    try std.testing.expectEqual(high_id, destination.writableMount().?.reader.manifest.pack_id);
+}
+
+test "store availability wake never takes the updater lock under an outer writable pin" {
+    const builder = @import("../build/pack_builder.zig");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const r_path = "zig-cache-vfs-pin-order-r";
+    const s_path = "zig-cache-vfs-pin-order-s";
+    const w_path = "zig-cache-vfs-pin-order-w";
+    const source = "zig-cache-vfs-pin-order.bin";
+    defer std.Io.Dir.cwd().deleteTree(io, r_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, s_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, w_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
+    try builder.writeSourceFileForTest(source, "pin");
+    try builder.createPack(r_path, &.{.{ .source_path = source, .virtual_path = "/r", .file_entry = 8905, .page_size = 4 }}, .{ .pack_id = 50 });
+    try builder.createPack(s_path, &.{.{ .source_path = source, .virtual_path = "/s", .file_entry = 8906, .page_size = 4 }}, .{ .pack_id = 51 });
+    var volume = try Volume.open("pin-order", .{ .max_open_stores = 1 });
+    defer volume.close();
+    try volume.setWritablePack(w_path);
+    try volume.mountPackWithPriority(r_path, 1, 0);
+    try volume.mountPackWithPriority(s_path, 2, 0);
+    const writable = volume.writableMount().?;
+    const r = volume.findMountedPack(50, 1).?;
+    const s = volume.findMountedPack(51, 1).?;
+    try volume.pinMounted(writable);
+    try volume.pinMounted(r);
+    const Ctx = struct {
+        volume: *Volume,
+        mounted: *Volume.MountedPack,
+        locked: std.atomic.Value(bool) = .init(false),
+        fn waiter(ctx: *@This()) void {
+            ctx.volume.pinMounted(ctx.mounted) catch unreachable;
+            ctx.volume.unpinMounted(ctx.mounted);
+        }
+        fn updater(ctx: *@This()) void {
+            ctx.volume.lock.lock();
+            defer ctx.volume.lock.unlock();
+            ctx.locked.store(true, .release);
+            Volume.drainPinsLocked(ctx.mounted);
+            Volume.releaseDrainedLocked(ctx.mounted);
+        }
+    };
+    var waiting = Ctx{ .volume = &volume, .mounted = s };
+    const waiter = try std.Thread.spawn(.{}, Ctx.waiter, .{&waiting});
+    while (volume.store_waiters.load(.acquire) == 0) std.Thread.yield() catch {};
+    var updating = Ctx{ .volume = &volume, .mounted = writable };
+    const updater = try std.Thread.spawn(.{}, Ctx.updater, .{&updating});
+    while (!updating.locked.load(.acquire)) std.Thread.yield() catch {};
+    // This is the exact nesting of a writable file's foreign-page read. The
+    // updater owns Volume.lock and awaits our outer pin, so notifying an idle
+    // foreign store must not acquire that lock before we can drop the outer.
+    volume.unpinMounted(r);
+    volume.unpinMounted(writable);
+    updater.join();
+    waiter.join();
+    try std.testing.expect(volume.readonlyReadyCount() <= 1);
 }

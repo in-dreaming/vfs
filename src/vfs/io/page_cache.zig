@@ -25,7 +25,7 @@ pub const SHARD_COUNT: usize = 64;
 pub const DEFAULT_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 
 pub const PageCacheKey = struct {
-    pack_id: u32,
+    pack_id: u64,
     pack_generation: u64,
     file_entry: u64,
     block_index: u32,

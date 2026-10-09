@@ -154,7 +154,7 @@ test "patch overlay: readonly base v1 + overlay reads as v3 and is re-patchable"
     const r1 = try session.run(a, p.v1, overlay_path, &.{p.d12}, null, opts);
     try std.testing.expectEqual(@as(u64, 2), r1.to_version);
     {
-        var v = try volume_mod.Volume.open("pt-ov1", .{});
+        var v = try volume_mod.Volume.open("pt-ov1", .{ .max_open_stores = 1 });
         defer v.close();
         try v.mountPackWithPriority(p.v1, 10, 0);
         try v.mountPackWithPriority(overlay_path, 20, 0);
@@ -165,7 +165,7 @@ test "patch overlay: readonly base v1 + overlay reads as v3 and is re-patchable"
     const r2 = try session.run(a, p.v1, overlay_path, &.{ p.d23, p.d13 }, null, opts);
     try std.testing.expectEqual(@as(u64, 3), r2.to_version);
     {
-        var v = try volume_mod.Volume.open("pt-ov2", .{});
+        var v = try volume_mod.Volume.open("pt-ov2", .{ .max_open_stores = 1 });
         defer v.close();
         try v.mountPackWithPriority(p.v1, 10, 0);
         try v.mountPackWithPriority(overlay_path, 20, 0);

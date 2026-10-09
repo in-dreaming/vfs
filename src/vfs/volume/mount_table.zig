@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub const MountEntry = struct {
-    pack_id: u32,
+    pack_id: u64,
     priority: u32,
     mount_order: u64,
     pack_version: u64,

@@ -22,6 +22,8 @@ pub const BatchOptions = struct {
 };
 
 pub const Batch = struct {
+    abi_lock: @import("platform/sync.zig").Mutex = .{},
+    db_lease: ?kv.HandleLease = null,
     db: *kv.KvDb,
     allocator: std.mem.Allocator,
     ops: std.ArrayList(BatchOp) = .empty,
@@ -141,6 +143,7 @@ pub const Batch = struct {
     }
 
     pub fn deinit(self: *Batch) void {
+        defer if (self.db_lease) |lease| lease.release();
         for (self.ops.items) |op| switch (op) {
             .put => |p| {
                 self.allocator.free(p.key_bytes);
@@ -153,6 +156,7 @@ pub const Batch = struct {
 };
 
 pub const Snapshot = struct {
+    db_lease: ?kv.HandleLease = null,
     allocator: std.mem.Allocator,
     db: *kv.KvDb,
     values: std.AutoHashMap(u128, []u8),
@@ -213,6 +217,7 @@ pub const Snapshot = struct {
     }
 
     pub fn deinit(self: *Snapshot) void {
+        defer if (self.db_lease) |lease| lease.release();
         var it = self.values.iterator();
         while (it.next()) |entry| self.allocator.free(entry.value_ptr.*);
         self.values.deinit();
@@ -220,17 +225,20 @@ pub const Snapshot = struct {
 };
 
 pub export fn db_batch_begin(db_handle: u64) u64 {
-    const d = kv.validateHandle(kv.KvDb, db_handle, .db) catch |err| {
+    const retained = kv.acquireHandle(kv.KvDb, db_handle, .db) catch |err| {
         _ = kv.setLastError(err);
         return 0;
     };
+    defer retained.release();
+    const d = retained.ptr;
     const b = std.heap.smp_allocator.create(Batch) catch {
         _ = kv.setLastStatus(.no_space, "allocation failed");
         return 0;
     };
     b.* = Batch.begin(d, std.heap.smp_allocator);
-    const h = @intFromPtr(b);
-    kv.registerHandle(h, .batch) catch |err| {
+    b.db_lease = retained.retain();
+    const h = kv.registerHandle(b, .batch) catch |err| {
+        b.deinit();
         std.heap.smp_allocator.destroy(b);
         _ = kv.setLastError(err);
         return 0;
@@ -240,7 +248,11 @@ pub export fn db_batch_begin(db_handle: u64) u64 {
 }
 
 pub export fn db_batch_put(batch_handle: u64, key: ?*const anyopaque, key_size: u64, data: ?*const anyopaque, size: u64, flags: u32) c_int {
-    const b = kv.validateHandle(Batch, batch_handle, .batch) catch |err| return kv.setLastError(err);
+    const retained = kv.acquireHandle(Batch, batch_handle, .batch) catch |err| return kv.setLastError(err);
+    defer retained.release();
+    const b = retained.ptr;
+    b.abi_lock.lock();
+    defer b.abi_lock.unlock();
     const k = kv.keySlice(key, key_size) catch |err| return kv.setLastError(err);
     const slice = kv.dataSlice(data, size) catch |err| return kv.setLastError(err);
     b.putBytes(k, slice, flags) catch |err| return kv.setLastError(err);
@@ -248,16 +260,24 @@ pub export fn db_batch_put(batch_handle: u64, key: ?*const anyopaque, key_size: 
 }
 
 pub export fn db_batch_delete(batch_handle: u64, key: ?*const anyopaque, key_size: u64) c_int {
-    const b = kv.validateHandle(Batch, batch_handle, .batch) catch |err| return kv.setLastError(err);
+    const retained = kv.acquireHandle(Batch, batch_handle, .batch) catch |err| return kv.setLastError(err);
+    defer retained.release();
+    const b = retained.ptr;
+    b.abi_lock.lock();
+    defer b.abi_lock.unlock();
     const k = kv.keySlice(key, key_size) catch |err| return kv.setLastError(err);
     b.deleteBytes(k) catch |err| return kv.setLastError(err);
     return kv.setOk();
 }
 
 pub export fn db_batch_commit(batch_handle: u64, durability: u32) c_int {
-    const b = kv.validateHandle(Batch, batch_handle, .batch) catch |err| return kv.setLastError(err);
-    const d: fmt.Durability = switch (durability) { 0 => .none, 1 => .async, 2 => .sync, else => .sync };
-    kv.unregisterHandle(batch_handle);
+    const b = kv.takeHandle(Batch, batch_handle, .batch) catch |err| return kv.setLastError(err);
+    const d: fmt.Durability = switch (durability) {
+        0 => .none,
+        1 => .async,
+        2 => .sync,
+        else => .sync,
+    };
     b.commit(d) catch |err| {
         b.deinit();
         std.heap.smp_allocator.destroy(b);
@@ -269,8 +289,7 @@ pub export fn db_batch_commit(batch_handle: u64, durability: u32) c_int {
 }
 
 pub export fn db_batch_rollback(batch_handle: u64) c_int {
-    const b = kv.validateHandle(Batch, batch_handle, .batch) catch |err| return kv.setLastError(err);
-    kv.unregisterHandle(batch_handle);
+    const b = kv.takeHandle(Batch, batch_handle, .batch) catch |err| return kv.setLastError(err);
     b.rollback();
     b.deinit();
     std.heap.smp_allocator.destroy(b);
@@ -278,10 +297,12 @@ pub export fn db_batch_rollback(batch_handle: u64) c_int {
 }
 
 pub export fn db_snapshot_begin(db_handle: u64) u64 {
-    const d = kv.validateHandle(kv.KvDb, db_handle, .db) catch |err| {
+    const retained = kv.acquireHandle(kv.KvDb, db_handle, .db) catch |err| {
         _ = kv.setLastError(err);
         return 0;
     };
+    defer retained.release();
+    const d = retained.ptr;
     const s = std.heap.smp_allocator.create(Snapshot) catch {
         _ = kv.setLastStatus(.no_space, "allocation failed");
         return 0;
@@ -291,8 +312,8 @@ pub export fn db_snapshot_begin(db_handle: u64) u64 {
         _ = kv.setLastError(err);
         return 0;
     };
-    const h = @intFromPtr(s);
-    kv.registerHandle(h, .snapshot) catch |err| {
+    s.db_lease = retained.retain();
+    const h = kv.registerHandle(s, .snapshot) catch |err| {
         s.deinit();
         std.heap.smp_allocator.destroy(s);
         _ = kv.setLastError(err);
@@ -303,7 +324,9 @@ pub export fn db_snapshot_begin(db_handle: u64) u64 {
 }
 
 pub export fn db_snapshot_get_size(snapshot_handle: u64, key: ?*const anyopaque, key_size: u64, out_size: ?*u64) c_int {
-    const s = kv.validateHandle(Snapshot, snapshot_handle, .snapshot) catch |err| return kv.setLastError(err);
+    const retained = kv.acquireHandle(Snapshot, snapshot_handle, .snapshot) catch |err| return kv.setLastError(err);
+    defer retained.release();
+    const s = retained.ptr;
     const out = out_size orelse return kv.setLastStatus(.invalid_argument, "out_size is null");
     const k = kv.keySlice(key, key_size) catch |err| return kv.setLastError(err);
     out.* = s.getSizeBytes(k) catch |err| return kv.setLastError(err);
@@ -311,7 +334,9 @@ pub export fn db_snapshot_get_size(snapshot_handle: u64, key: ?*const anyopaque,
 }
 
 pub export fn db_snapshot_get_into(snapshot_handle: u64, key: ?*const anyopaque, key_size: u64, dst: ?*anyopaque, dst_size: u64, out_written: ?*u64) c_int {
-    const s = kv.validateHandle(Snapshot, snapshot_handle, .snapshot) catch |err| return kv.setLastError(err);
+    const retained = kv.acquireHandle(Snapshot, snapshot_handle, .snapshot) catch |err| return kv.setLastError(err);
+    defer retained.release();
+    const s = retained.ptr;
     const out = out_written orelse return kv.setLastStatus(.invalid_argument, "out_written is null");
     const k = kv.keySlice(key, key_size) catch |err| return kv.setLastError(err);
     const slice = kv.mutSlice(dst, dst_size) catch |err| return kv.setLastError(err);
@@ -320,8 +345,7 @@ pub export fn db_snapshot_get_into(snapshot_handle: u64, key: ?*const anyopaque,
 }
 
 pub export fn db_snapshot_end(snapshot_handle: u64) c_int {
-    const s = kv.validateHandle(Snapshot, snapshot_handle, .snapshot) catch |err| return kv.setLastError(err);
-    kv.unregisterHandle(snapshot_handle);
+    const s = kv.takeHandle(Snapshot, snapshot_handle, .snapshot) catch |err| return kv.setLastError(err);
     s.deinit();
     std.heap.smp_allocator.destroy(s);
     return kv.setOk();
@@ -381,4 +405,48 @@ test "batch journal recovery only replays committed batches" {
     var buf: [8]u8 = undefined;
     try testing.expectEqual(@as(usize, 4), try reopened.getInto(committed, &buf));
     try testing.expectEqualStrings("kept", buf[0..4]);
+}
+
+test "C ABI DB lifetime includes batches snapshots and custom hash context" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path = "zig-cache/db_retained_dependents";
+    std.Io.Dir.cwd().deleteTree(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, path) catch {};
+    const ok: c_int = @intFromEnum(fmt.DbStatus.ok);
+    const busy: c_int = @intFromEnum(fmt.DbStatus.busy);
+    const invalid: c_int = @intFromEnum(fmt.DbStatus.invalid_argument);
+    const Hash = struct {
+        fn hash(user: ?*anyopaque, _: ?*const anyopaque, size: u64, hi: *u64, lo: *u64) callconv(.c) c_int {
+            const seed: *u64 = @ptrCast(@alignCast(user.?));
+            hi.* = seed.*;
+            lo.* = size;
+            return 0;
+        }
+    };
+    var seed: u64 = 71;
+    var context: kv.db_context_t = .{ .struct_size = @sizeOf(kv.db_context_t), .version = 1, .user_data = &seed, .hash_fn = Hash.hash, .file_ops = null };
+    const db = kv.db_create(path, null, &context);
+    try std.testing.expect(db != 0);
+    const batch = db_batch_begin(db);
+    try std.testing.expect(batch != 0);
+    try std.testing.expectEqual(busy, kv.db_close(db));
+    try std.testing.expectEqual(ok, db_batch_put(batch, "key", 3, "value", 5, 0));
+    try std.testing.expectEqual(ok, db_batch_commit(batch, 2));
+    try std.testing.expectEqual(invalid, db_batch_rollback(batch));
+    const snapshot = db_snapshot_begin(db);
+    try std.testing.expect(snapshot != 0);
+    try std.testing.expectEqual(busy, kv.db_close(db));
+    var out: [8]u8 = undefined;
+    var n: u64 = 0;
+    try std.testing.expectEqual(ok, db_snapshot_get_into(snapshot, "key", 3, &out, out.len, &n));
+    try std.testing.expectEqualStrings("value", out[0..n]);
+    try std.testing.expectEqual(ok, db_snapshot_end(snapshot));
+    const rollback = db_batch_begin(db);
+    try std.testing.expectEqual(busy, kv.db_close(db));
+    try std.testing.expectEqual(ok, db_batch_rollback(rollback));
+    try std.testing.expectEqual(ok, kv.db_close(db));
+    const reopened = kv.db_open(path, null, &context);
+    try std.testing.expect(reopened != 0 and reopened != db);
+    try std.testing.expectEqual(invalid, kv.db_get_size(db, "key", 3, &n));
+    try std.testing.expectEqual(ok, kv.db_close(reopened));
 }

@@ -40,14 +40,18 @@ comptime {
 
 pub export fn db_checkpoint(handle: u64, flags: u32) c_int {
     _ = flags;
-    const d = kv_db.validateHandle(kv_db.KvDb, handle, .db) catch |err| return kv_db.setLastError(err);
+    const retained = kv_db.acquireHandle(kv_db.KvDb, handle, .db) catch |err| return kv_db.setLastError(err);
+    defer retained.release();
+    const d = retained.ptr;
     if (d.dir.custom_ops != null) return kv_db.setLastStatus(.unsupported, "checkpoint with custom file_ops is not supported yet");
     d.checkpoint() catch |err| return kv_db.setLastError(err);
     return kv_db.setOk();
 }
 
 pub export fn db_commit(handle: u64, durability: u32) c_int {
-    const d = kv_db.validateHandle(kv_db.KvDb, handle, .db) catch |err| return kv_db.setLastError(err);
+    const retained = kv_db.acquireHandle(kv_db.KvDb, handle, .db) catch |err| return kv_db.setLastError(err);
+    defer retained.release();
+    const d = retained.ptr;
     const dur: format.Durability = switch (durability) {
         0 => .none,
         1 => .async,
@@ -60,7 +64,9 @@ pub export fn db_commit(handle: u64, durability: u32) c_int {
 
 pub export fn db_verify(handle: u64, flags: u32) c_int {
     _ = flags;
-    const d = kv_db.validateHandle(kv_db.KvDb, handle, .db) catch |err| return kv_db.setLastError(err);
+    const retained = kv_db.acquireHandle(kv_db.KvDb, handle, .db) catch |err| return kv_db.setLastError(err);
+    defer retained.release();
+    const d = retained.ptr;
     d.commitPending(null) catch |err| return kv_db.setLastError(err);
     var report = recovery_verify.verifyIn(d.dir, std.heap.smp_allocator) catch |err| return kv_db.setLastError(err);
     defer report.deinit();
@@ -79,7 +85,9 @@ pub export fn db_recover(path: [*:0]const u8, flags: u32, context: ?*const kv_db
 
 pub export fn db_optimize(handle: u64, flags: u32) c_int {
     _ = flags;
-    const d = kv_db.validateHandle(kv_db.KvDb, handle, .db) catch |err| return kv_db.setLastError(err);
+    const retained = kv_db.acquireHandle(kv_db.KvDb, handle, .db) catch |err| return kv_db.setLastError(err);
+    defer retained.release();
+    const d = retained.ptr;
     if (d.dir.custom_ops != null) return kv_db.setLastStatus(.unsupported, "optimize with custom file_ops is not supported yet");
     d.optimize() catch |err| return kv_db.setLastError(err);
     return kv_db.setOk();

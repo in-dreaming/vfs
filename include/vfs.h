@@ -17,6 +17,12 @@ extern "C" {
 #  define VFS_API
 #endif
 
+/* Handles are process-local opaque IDs, not pointers. A closed ID is never
+ * reused; using it (or an ID of another kind) returns VFS_INVALID_ARGUMENT.
+ * Volume close returns VFS_BUSY, leaving the handle valid, while files or
+ * admitted operations retain it. File close invalidates its ID immediately,
+ * then waits for admitted operations to finish before releasing resources.
+ * No process-global registry lock is held during I/O or these waits. */
 typedef uint64_t vfs_volume_t;
 typedef uint64_t vfs_file_t;
 typedef uint64_t vfs_file_entry_t;
@@ -26,7 +32,9 @@ typedef struct vfs_open_options {
     uint32_t flags;
     /* Decoded page cache budget in bytes; 0 = default (8 MiB). */
     uint64_t page_cache_bytes;
-    /* Maximum simultaneously open read-only pack stores; 0 = default (16). */
+    /* Maximum simultaneously open read-only pack stores; 0 = default (16).
+     * Reads pin only their active source store. Overlay fallback/foreign refs
+     * work with a limit of 1; contenders wait for an idle store. */
     uint32_t max_open_stores;
     /* Extra read-only OS handles per pack data file so concurrent reads are
      * not serialized on one file object; 0 = default (4). */
@@ -40,6 +48,11 @@ enum {
     VFS_OPEN_STREAMING = 1u << 0,
 };
 
+/* Set struct_size to the writable allocation size before each call (at least
+ * 4 bytes). The library writes only min(struct_size, sizeof(vfs_stat_t)) bytes,
+ * preserves struct_size and leaves any newer caller tail untouched. Prefixes
+ * may end inside a field; only fully present fields are usable by the caller.
+ * Too-small sizes are rejected without writing. */
 typedef struct vfs_stat {
     uint32_t struct_size;
     uint32_t flags;
@@ -118,6 +131,8 @@ enum {
     VFS_PATCH_CANCELLED = 3,
 };
 
+/* Same bounded-prefix output convention as vfs_stat_t, with an 8-byte minimum.
+ * Initialize struct_size before polling, including when checking invalid IDs. */
 typedef struct vfs_patch_progress {
     uint32_t struct_size;
     uint32_t state;

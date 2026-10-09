@@ -85,8 +85,7 @@ pub export fn vfs_open_volume(path: ?[*:0]const u8, options: ?*const vfs_open_op
         std.heap.smp_allocator.destroy(v);
         return setError(e);
     };
-    const h = @intFromPtr(v);
-    registry.register(h, .volume) catch |e| {
+    const h = registry.register(v, .volume) catch |e| {
         v.close();
         std.heap.smp_allocator.destroy(v);
         return setError(e);
@@ -96,16 +95,16 @@ pub export fn vfs_open_volume(path: ?[*:0]const u8, options: ?*const vfs_open_op
 }
 
 pub export fn vfs_close_volume(volume: u64) c_int {
-    const v = registry.validate(volume_mod.Volume, volume, .volume) catch |e| return setError(e);
-    if (v.open_file_count.load(.seq_cst) != 0) return setError(error.Busy);
-    registry.unregister(volume);
+    const v = registry.takeIdle(volume_mod.Volume, volume, .volume) catch |e| return setError(e);
     v.close();
     std.heap.smp_allocator.destroy(v);
     return setOk();
 }
 
 pub export fn vfs_mount_pack(volume: u64, pack_path: ?[*:0]const u8, priority: u32, flags: u32) c_int {
-    const v = registry.validate(volume_mod.Volume, volume, .volume) catch |e| return setError(e);
+    const retained = registry.acquire(volume_mod.Volume, volume, .volume) catch |e| return setError(e);
+    defer retained.release();
+    const v = retained.ptr;
     const path = spanZ(pack_path) catch |e| return setError(e);
     v.mountPackWithPriority(path, priority, flags) catch |e| return setError(e);
     return setOk();
@@ -119,26 +118,33 @@ pub export fn vfs_open_path(volume: u64, path: ?[*:0]const u8, flags: u32, out_f
     const out = out_file orelse return setStatus(.invalid_argument, "out_file is null");
     out.* = 0;
     if ((flags & ~OPEN_FLAGS_MASK) != 0) return setStatus(.invalid_argument, "unknown open flags");
-    const v = registry.validate(volume_mod.Volume, volume, .volume) catch |e| return setError(e);
+    const retained = registry.acquire(volume_mod.Volume, volume, .volume) catch |e| return setError(e);
+    defer retained.release();
+    const v = retained.ptr;
     const p = spanZ(path) catch |e| return setError(e);
-    return openFileHandle(volume, out, v.openPathWithFlags(volume, p, flags));
+    return openFileHandle(retained, out, v.openPathWithFlags(volume, p, flags));
 }
 
 pub export fn vfs_open_entry(volume: u64, file_entry: u64, flags: u32, out_file: ?*u64) c_int {
     const out = out_file orelse return setStatus(.invalid_argument, "out_file is null");
     out.* = 0;
     if ((flags & ~OPEN_FLAGS_MASK) != 0) return setStatus(.invalid_argument, "unknown open flags");
-    const v = registry.validate(volume_mod.Volume, volume, .volume) catch |e| return setError(e);
+    const retained = registry.acquire(volume_mod.Volume, volume, .volume) catch |e| return setError(e);
+    defer retained.release();
+    const v = retained.ptr;
     if (file_entry == 0) return setStatus(.invalid_argument, "file_entry is zero");
-    return openFileHandle(volume, out, v.openEntryWithFlags(volume, file_entry, flags));
+    return openFileHandle(retained, out, v.openEntryWithFlags(volume, file_entry, flags));
 }
 
 pub export fn vfs_stat_path(volume: u64, path: ?[*:0]const u8, out_stat: ?*vfs_stat_t) c_int {
     const out = out_stat orelse return setStatus(.invalid_argument, "out_stat is null");
     const requested = out.struct_size;
+    if (requested < @sizeOf(u32)) return setStatus(.invalid_argument, "struct_size too small");
     @memset(@as([*]u8, @ptrCast(out))[0..@min(@as(usize, @intCast(requested)), @sizeOf(vfs_stat_t))], 0);
     out.struct_size = requested;
-    const v = registry.validate(volume_mod.Volume, volume, .volume) catch |e| return setError(e);
+    const retained = registry.acquire(volume_mod.Volume, volume, .volume) catch |e| return setError(e);
+    defer retained.release();
+    const v = retained.ptr;
     const p = spanZ(path) catch |e| return setError(e);
     const st = v.statPath(p) catch |e| return setError(e);
     fillStat(out, requested, st);
@@ -148,9 +154,12 @@ pub export fn vfs_stat_path(volume: u64, path: ?[*:0]const u8, out_stat: ?*vfs_s
 pub export fn vfs_stat_entry(volume: u64, file_entry: u64, out_stat: ?*vfs_stat_t) c_int {
     const out = out_stat orelse return setStatus(.invalid_argument, "out_stat is null");
     const requested = out.struct_size;
+    if (requested < @sizeOf(u32)) return setStatus(.invalid_argument, "struct_size too small");
     @memset(@as([*]u8, @ptrCast(out))[0..@min(@as(usize, @intCast(requested)), @sizeOf(vfs_stat_t))], 0);
     out.struct_size = requested;
-    const v = registry.validate(volume_mod.Volume, volume, .volume) catch |e| return setError(e);
+    const retained = registry.acquire(volume_mod.Volume, volume, .volume) catch |e| return setError(e);
+    defer retained.release();
+    const v = retained.ptr;
     if (file_entry == 0) return setStatus(.invalid_argument, "file_entry is zero");
     const st = v.statEntry(file_entry) catch |e| return setError(e);
     fillStat(out, requested, st);
@@ -161,7 +170,9 @@ pub export fn vfs_read_at(file: u64, offset: u64, dst: ?*anyopaque, size: u64, o
     const out = out_read orelse return setStatus(.invalid_argument, "out_read is null");
     out.* = 0;
     if (size != 0 and dst == null) return setStatus(.invalid_argument, "dst is null");
-    const f = registry.validate(file_mod.FileHandle, file, .file) catch |e| return setError(e);
+    const retained = registry.acquire(file_mod.FileHandle, file, .file) catch |e| return setError(e);
+    defer retained.release();
+    const f = retained.ptr;
     const len = std.math.cast(usize, size) orelse return setStatus(.invalid_argument, "size too large");
     var empty: [0]u8 = .{};
     const buf = if (len == 0) empty[0..] else @as([*]u8, @ptrCast(dst.?))[0..len];
@@ -170,38 +181,33 @@ pub export fn vfs_read_at(file: u64, offset: u64, dst: ?*anyopaque, size: u64, o
 }
 
 pub export fn vfs_close_file(file: u64) c_int {
-    const f = registry.validate(file_mod.FileHandle, file, .file) catch |e| return setError(e);
-    registry.unregister(file);
+    const f = registry.take(file_mod.FileHandle, file, .file) catch |e| return setError(e);
     f.close();
     std.heap.smp_allocator.destroy(f);
     return setOk();
 }
 
-fn openFileHandle(volume_handle: u64, out: *u64, result: anyerror!file_mod.FileHandle) c_int {
+fn openFileHandle(volume_lease: registry.Lease(volume_mod.Volume), out: *u64, result: anyerror!file_mod.FileHandle) c_int {
     var value = result catch |e| return setError(e);
     const f = std.heap.smp_allocator.create(file_mod.FileHandle) catch {
         value.close();
         return setStatus(.internal_error, "allocation failed");
     };
     f.* = value;
-    const h = @intFromPtr(f);
-    registry.register(h, .file) catch |e| {
+    f.volume_lease = volume_lease.retain();
+    const h = registry.register(f, .file) catch |e| {
         f.close();
         std.heap.smp_allocator.destroy(f);
         return setError(e);
     };
-    _ = volume_handle;
     out.* = h;
     return setOk();
 }
 
 fn fillStat(out: *vfs_stat_t, requested: u32, st: @import("pack/pack_reader.zig").Stat) void {
-    _ = requested;
-    out.flags = 0;
-    out.file_entry = st.file_entry;
-    out.size = st.size;
-    out.page_size = st.page_size;
-    out.reserved0 = 0;
+    const full: vfs_stat_t = .{ .struct_size = requested, .flags = 0, .file_entry = st.file_entry, .size = st.size, .page_size = st.page_size, .reserved0 = 0 };
+    const n = @min(@as(usize, requested), @sizeOf(vfs_stat_t));
+    @memcpy(@as([*]u8, @ptrCast(out))[0..n], std.mem.asBytes(&full)[0..n]);
 }
 
 // ---- patch (polling, background thread) --------------------------------------
@@ -344,10 +350,9 @@ pub export fn vfs_patch_begin(target_pack: ?[*:0]const u8, overlay_pack_or_null:
     }
     job.options.progress = &job.progress;
 
-    const h = @intFromPtr(job);
-    registry.register(h, .patch) catch |e| return setError(e);
+    const h = registry.register(job, .patch) catch |e| return setError(e);
     job.thread = std.Thread.spawn(.{}, PatchJob.main, .{job}) catch {
-        registry.unregister(h);
+        _ = registry.take(PatchJob, h, .patch) catch unreachable;
         return setStatus(.internal_error, "thread spawn failed");
     };
     ok = true;
@@ -359,10 +364,11 @@ pub export fn vfs_patch_poll(patch: u64, out_progress: ?*vfs_patch_progress_t) c
     const out = out_progress orelse return setStatus(.invalid_argument, "out_progress is null");
     const requested = out.struct_size;
     if (requested < @offsetOf(vfs_patch_progress_t, "state") + @sizeOf(u32)) return setStatus(.invalid_argument, "struct_size too small");
-    // Poll may run on a different thread than end; hold the registry shared
-    // until the snapshot is taken so end cannot free the job under us.
-    const job = registry.acquire(PatchJob, patch, .patch) catch |e| return setError(e);
-    defer registry.release();
+    // Poll retains the job while taking its snapshot. End can invalidate the
+    // public handle concurrently, but cannot free this retained object.
+    const retained = registry.acquire(PatchJob, patch, .patch) catch |e| return setError(e);
+    const job = retained.ptr;
+    defer retained.release();
     var full: vfs_patch_progress_t = .{
         .struct_size = requested,
         .state = job.state.load(.acquire),
@@ -385,9 +391,10 @@ pub export fn vfs_patch_wait(patch: u64, timeout_ms: u32) c_int {
     while (true) {
         // Re-acquire per iteration so a concurrent end is not blocked for
         // the whole timeout and is observed as invalid_argument afterwards.
-        const job = registry.acquire(PatchJob, patch, .patch) catch |e| return setError(e);
+        const retained = registry.acquire(PatchJob, patch, .patch) catch |e| return setError(e);
+        const job = retained.ptr;
         const finished = job.finished();
-        registry.release();
+        retained.release();
         if (finished) return setOk();
         if (task_sched.nowNs() >= deadline) return setStatus(.busy, "patch still running");
         task_sched.sleepNs(500 * std.time.ns_per_us);
@@ -395,15 +402,16 @@ pub export fn vfs_patch_wait(patch: u64, timeout_ms: u32) c_int {
 }
 
 pub export fn vfs_patch_cancel(patch: u64) c_int {
-    const job = registry.acquire(PatchJob, patch, .patch) catch |e| return setError(e);
-    defer registry.release();
+    const retained = registry.acquire(PatchJob, patch, .patch) catch |e| return setError(e);
+    const job = retained.ptr;
+    defer retained.release();
     job.progress.cancel.store(true, .release);
     return setOk();
 }
 
 pub export fn vfs_patch_end(patch: u64) c_int {
-    // take() removes the handle atomically: a second end (or a racing poll)
-    // sees invalid_argument instead of a freed job.
+    // take() invalidates atomically, then drains this object's existing
+    // leases without holding the map lock. Join also holds no registry lock.
     const job = registry.take(PatchJob, patch, .patch) catch |e| return setError(e);
     if (!job.finished()) job.progress.cancel.store(true, .release);
     job.join();
@@ -925,7 +933,9 @@ test "vfs abi streaming flag reads whole pages without caching and rejects unkno
     try std.testing.expectEqual(err.code(.ok), vfs_open_entry(volume, 8201, VFS_OPEN_STREAMING, &file));
     defer _ = vfs_close_file(file);
 
-    const v: *volume_mod.Volume = @ptrFromInt(volume);
+    const inspection = try registry.acquire(volume_mod.Volume, volume, .volume);
+    defer inspection.release();
+    const v = inspection.ptr;
     var out: [payload.len]u8 = undefined;
     var n: u64 = 0;
     // Whole-file read: every page (including the short 100-byte tail page) is
@@ -1005,4 +1015,101 @@ test "vfs abi concurrent read_at on one volume" {
     for (&threads, 0..) |*thread, i| thread.* = try std.Thread.spawn(.{}, Ctx.reader, .{ &ctx, i });
     for (&threads) |*thread| thread.join();
     for (errors) |e| try std.testing.expectEqual(@as(u32, 0), e);
+}
+
+test "vfs stat versioned prefixes preserve caller canaries" {
+    const builder = @import("build/pack_builder.zig");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const pack = "zig-cache-vfs-abi-stat-prefix";
+    const source = "zig-cache-vfs-abi-stat-prefix.bin";
+    defer std.Io.Dir.cwd().deleteTree(io, pack) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
+    try builder.writeSourceFileForTest(source, "prefix");
+    try builder.createPack(pack, &.{.{ .source_path = source, .virtual_path = "/prefix", .file_entry = 8901, .page_size = 8 }}, .{});
+    var volume: u64 = 0;
+    try std.testing.expectEqual(err.code(.ok), vfs_open_volume("prefix", null, &volume));
+    defer _ = vfs_close_volume(volume);
+    try std.testing.expectEqual(err.code(.ok), vfs_mount_pack(volume, pack, 1, 0));
+    for ([_]u32{ 0, 3, 4, 8, 12, 16, 24, 32, 40, 48 }) |size| {
+        var storage: [56]u8 align(8) = @splat(0xa5);
+        const out: *vfs_stat_t = @ptrCast(&storage);
+        out.struct_size = size;
+        const before = storage;
+        const expected = if (size < 4) err.code(.invalid_argument) else err.code(.ok);
+        try std.testing.expectEqual(expected, vfs_stat_entry(volume, 8901, out));
+        const end: usize = if (size < 4) 4 else @min(size, @sizeOf(vfs_stat_t));
+        try std.testing.expectEqualSlices(u8, before[end..], storage[end..]);
+        try std.testing.expectEqual(size, out.struct_size);
+        storage = @splat(0xa5);
+        out.struct_size = size;
+        try std.testing.expectEqual(expected, vfs_stat_path(volume, "/prefix", out));
+        try std.testing.expectEqualSlices(u8, before[end..], storage[end..]);
+    }
+}
+
+test "vfs ABI file close drains retained reads while volume remains busy" {
+    const builder = @import("build/pack_builder.zig");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const pack = "zig-cache-vfs-abi-close-drain";
+    const source = "zig-cache-vfs-abi-close-drain.bin";
+    defer std.Io.Dir.cwd().deleteTree(io, pack) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
+    try builder.writeSourceFileForTest(source, "retained");
+    try builder.createPack(pack, &.{.{ .source_path = source, .virtual_path = "/retained", .file_entry = 8902, .page_size = 8 }}, .{ .pack_id = @as(u64, 1) << 40 });
+    var volume: u64 = 0;
+    try std.testing.expectEqual(err.code(.ok), vfs_open_volume("retained", null, &volume));
+    try std.testing.expectEqual(err.code(.ok), vfs_mount_pack(volume, pack, 1, 0));
+    var file: u64 = 0;
+    try std.testing.expectEqual(err.code(.ok), vfs_open_entry(volume, 8902, 0, &file));
+    try std.testing.expectEqual(err.code(.invalid_argument), vfs_close_file(volume));
+    try std.testing.expectEqual(err.code(.invalid_argument), vfs_close_volume(file));
+    const held = try registry.acquire(file_mod.FileHandle, file, .file);
+    const Ctx = struct {
+        handle: u64,
+        status: c_int = -1,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(ctx: *@This()) void {
+            ctx.status = vfs_close_file(ctx.handle);
+            ctx.done.store(true, .release);
+        }
+    };
+    var ctx = Ctx{ .handle = file };
+    const closer = try std.Thread.spawn(.{}, Ctx.run, .{&ctx});
+    while (true) {
+        if (registry.acquire(file_mod.FileHandle, file, .file)) |lease| lease.release() else |_| break;
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(!ctx.done.load(.acquire));
+    try std.testing.expectEqual(err.code(.busy), vfs_close_volume(volume));
+    var bytes: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 8), try held.ptr.readAt(0, &bytes));
+    try std.testing.expectEqualStrings("retained", &bytes);
+    var n: u64 = 99;
+    try std.testing.expectEqual(err.code(.invalid_argument), vfs_read_at(file, 0, &bytes, bytes.len, &n));
+    held.release();
+    closer.join();
+    try std.testing.expectEqual(err.code(.ok), ctx.status);
+    var replacement: u64 = 0;
+    try std.testing.expectEqual(err.code(.ok), vfs_open_entry(volume, 8902, 0, &replacement));
+    try std.testing.expect(replacement != file);
+    try std.testing.expectEqual(err.code(.invalid_argument), vfs_close_file(file));
+    try std.testing.expectEqual(err.code(.ok), vfs_close_file(replacement));
+    try std.testing.expectEqual(err.code(.ok), vfs_close_volume(volume));
+}
+
+test "vfs patch progress versioned prefixes preserve caller canaries" {
+    var job: PatchJob = .{ .allocator = std.heap.smp_allocator, .target = &.{}, .overlay = null, .diffs = &.{}, .to_version = null, .options = .{} };
+    job.state.store(@intFromEnum(PatchState.done), .release);
+    const handle = try registry.register(&job, .patch);
+    defer _ = registry.take(PatchJob, handle, .patch) catch unreachable;
+    for ([_]u32{ 0, 4, 8, 12, 16, 40, 64, 72 }) |size| {
+        var storage: [80]u8 align(8) = @splat(0xa5);
+        const out: *vfs_patch_progress_t = @ptrCast(&storage);
+        out.struct_size = size;
+        const before = storage;
+        try std.testing.expectEqual(if (size < 8) err.code(.invalid_argument) else err.code(.ok), vfs_patch_poll(handle, out));
+        const end: usize = if (size < 8) 4 else @min(size, @sizeOf(vfs_patch_progress_t));
+        try std.testing.expectEqualSlices(u8, before[end..], storage[end..]);
+        try std.testing.expectEqual(size, out.struct_size);
+    }
 }

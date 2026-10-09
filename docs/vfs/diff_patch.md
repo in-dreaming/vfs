@@ -1065,8 +1065,7 @@ int vfs_patch_end(vfs_patch_t p);                                // 释放；未
 （`PreconditionFailed` / `PatchIntentMismatch` / `OverlayBaseMismatch` / `CodecMismatch`）；`NoPatchPath` 映射为 `VFS_INVALID_ARGUMENT`，
 锁文件冲突为 `VFS_BUSY`。取消后的 pack 处于可续跑的中间状态（intent 仍在，已提交 unit 幂等跳过）。
 
-线程安全：`poll` / `cancel` / `wait` 通过 `handle_registry.acquire`（持共享锁）访问 job，`end` 用 `take`
-（独占锁，原子移除 handle）——并发的 `poll` 与 `end` 不会读到已释放的 job，第二次 `end` 得到 `VFS_INVALID_ARGUMENT`。
+线程安全：`poll` / `cancel` / `wait` 通过 `handle_registry.acquire` 获取对象级 lease；`end` 用 `take` 原子移除 opaque ID，并在不持全局注册表锁的情况下等待该对象的 lease 归还。并发 `poll` 不会读到已释放的 job，第二次 `end` 得到 `VFS_INVALID_ARGUMENT`。ID 单调分配且不复用，不再是对象指针。
 
 diff 端不进 C ABI（构建机工具）。
 

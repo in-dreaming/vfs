@@ -1032,8 +1032,8 @@ pub const db_info_t = extern struct {
 };
 
 pub const HandleKind = enum(u8) { db, batch, snapshot };
-var handle_lock: sync.RwLock = .{};
-var handles: std.AutoHashMapUnmanaged(u64, HandleKind) = .empty;
+pub const handle_registry = @import("handle_registry.zig").Registry(HandleKind, 1);
+pub const HandleLease = handle_registry.Lease(KvDb);
 
 threadlocal var last_status: c_int = @intFromEnum(fmt.DbStatus.ok);
 threadlocal var last_error: [256]u8 = [_]u8{0} ** 256;
@@ -1058,26 +1058,9 @@ pub fn setOk() c_int {
     return setLastStatus(.ok, "ok");
 }
 
-pub fn registerHandle(handle: u64, kind: HandleKind) !void {
-    handle_lock.lock();
-    defer handle_lock.unlock();
-    try handles.put(std.heap.smp_allocator, handle, kind);
-}
-
-pub fn unregisterHandle(handle: u64) void {
-    handle_lock.lock();
-    defer handle_lock.unlock();
-    _ = handles.remove(handle);
-}
-
-pub fn validateHandle(comptime T: type, handle: u64, kind: HandleKind) !*T {
-    if (handle == 0) return error.InvalidArgument;
-    handle_lock.lockShared();
-    const found = handles.get(handle);
-    handle_lock.unlockShared();
-    if (found == null or found.? != kind) return error.InvalidArgument;
-    return @ptrFromInt(handle);
-}
+pub const registerHandle = handle_registry.register;
+pub const acquireHandle = handle_registry.acquire;
+pub const takeHandle = handle_registry.take;
 
 pub fn keySlice(ptr: ?*const anyopaque, size: u64) ![]const u8 {
     const len = std.math.cast(usize, size) orelse return error.InvalidArgument;
@@ -1158,8 +1141,7 @@ fn openImpl(path: [*:0]const u8, options: ?*const db_open_options_t, context: ?*
             _ = setLastError(err);
             return 0;
         };
-    const h = @intFromPtr(db);
-    registerHandle(h, .db) catch |err| {
+    const h = registerHandle(db, .db) catch |err| {
         db.close() catch {};
         std.heap.smp_allocator.destroy(db);
         _ = setLastError(err);
@@ -1178,8 +1160,7 @@ pub fn db_open(path: [*:0]const u8, options: ?*const db_open_options_t, context:
 }
 
 pub fn db_close(handle: u64) callconv(.c) c_int {
-    const d = validateHandle(KvDb, handle, .db) catch |err| return setLastError(err);
-    unregisterHandle(handle);
+    const d = handle_registry.takeIdle(KvDb, handle, .db) catch |err| return setLastError(err);
     d.close() catch |err| {
         std.heap.smp_allocator.destroy(d);
         return setLastError(err);
@@ -1197,7 +1178,9 @@ pub fn db_last_error_message() callconv(.c) [*:0]const u8 {
 }
 
 pub fn db_get_info(handle: u64, out_info: ?*db_info_t) callconv(.c) c_int {
-    const d = validateHandle(KvDb, handle, .db) catch |err| return setLastError(err);
+    const retained = acquireHandle(KvDb, handle, .db) catch |err| return setLastError(err);
+    defer retained.release();
+    const d = retained.ptr;
     const out = out_info orelse return setLastStatus(.invalid_argument, "out_info is null");
     const got = d.getInfo(std.heap.smp_allocator) catch |err| return setLastError(err);
     const requested = out.struct_size;
@@ -1222,7 +1205,9 @@ pub fn db_get_info(handle: u64, out_info: ?*db_info_t) callconv(.c) c_int {
 }
 
 pub fn db_get_size(handle: u64, key: ?*const anyopaque, key_size: u64, out_size: ?*u64) callconv(.c) c_int {
-    const d = validateHandle(KvDb, handle, .db) catch |err| return setLastError(err);
+    const retained = acquireHandle(KvDb, handle, .db) catch |err| return setLastError(err);
+    defer retained.release();
+    const d = retained.ptr;
     const out = out_size orelse return setLastStatus(.invalid_argument, "out_size is null");
     const k = keySlice(key, key_size) catch |err| return setLastError(err);
     out.* = d.getSizeBytes(k) catch |err| return setLastError(err);
@@ -1230,7 +1215,9 @@ pub fn db_get_size(handle: u64, key: ?*const anyopaque, key_size: u64, out_size:
 }
 
 pub fn db_get_into(handle: u64, key: ?*const anyopaque, key_size: u64, dst: ?*anyopaque, dst_size: u64, out_written: ?*u64) callconv(.c) c_int {
-    const d = validateHandle(KvDb, handle, .db) catch |err| return setLastError(err);
+    const retained = acquireHandle(KvDb, handle, .db) catch |err| return setLastError(err);
+    defer retained.release();
+    const d = retained.ptr;
     const out = out_written orelse return setLastStatus(.invalid_argument, "out_written is null");
     const k = keySlice(key, key_size) catch |err| return setLastError(err);
     const slice = mutSlice(dst, dst_size) catch |err| return setLastError(err);
@@ -1239,7 +1226,9 @@ pub fn db_get_into(handle: u64, key: ?*const anyopaque, key_size: u64, dst: ?*an
 }
 
 pub fn db_put(handle: u64, key: ?*const anyopaque, key_size: u64, data: ?*const anyopaque, size: u64, flags: u32) callconv(.c) c_int {
-    const d = validateHandle(KvDb, handle, .db) catch |err| return setLastError(err);
+    const retained = acquireHandle(KvDb, handle, .db) catch |err| return setLastError(err);
+    defer retained.release();
+    const d = retained.ptr;
     const k = keySlice(key, key_size) catch |err| return setLastError(err);
     const slice = dataSlice(data, size) catch |err| return setLastError(err);
     d.putBytes(k, slice, .{ .flags = flags }) catch |err| return setLastError(err);
@@ -1247,7 +1236,9 @@ pub fn db_put(handle: u64, key: ?*const anyopaque, key_size: u64, data: ?*const 
 }
 
 pub fn db_delete(handle: u64, key: ?*const anyopaque, key_size: u64) callconv(.c) c_int {
-    const d = validateHandle(KvDb, handle, .db) catch |err| return setLastError(err);
+    const retained = acquireHandle(KvDb, handle, .db) catch |err| return setLastError(err);
+    defer retained.release();
+    const d = retained.ptr;
     const k = keySlice(key, key_size) catch |err| return setLastError(err);
     d.deleteBytes(k, .{}) catch |err| return setLastError(err);
     return setOk();
