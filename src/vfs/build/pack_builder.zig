@@ -17,6 +17,8 @@ const build_cache_mod = @import("build_cache.zig");
 const pack_reader = @import("../pack/pack_reader.zig");
 const registry = @import("../compress/registry.zig");
 const task = @import("../task/root.zig");
+const publication = @import("publication.zig");
+pub const recoverBuild = publication.recover;
 
 pub const DEFAULT_PAGE_SIZE: u32 = 64 * 1024;
 
@@ -43,6 +45,7 @@ pub const IncrementalBuildResult = struct {
     rebuilt_files: u32 = 0,
     skipped_files: u32 = 0,
     cache_rebuilt: bool = false,
+    cache_write_failed: bool = false,
     wrote_pack: bool = false,
     scheduled_tasks: u32 = 0,
 };
@@ -143,7 +146,15 @@ const BuildContext = struct {
 };
 
 pub fn createPack(output_path: []const u8, files: []const BuildFileInput, options: PackBuildOptions) !void {
+    return createPackInternal(output_path, files, options, false);
+}
+
+fn createPackInternal(output_path: []const u8, files: []const BuildFileInput, options: PackBuildOptions, fail_after_close: bool) !void {
     const allocator = std.heap.smp_allocator;
+    var publish = try publication.Publication.init(allocator, output_path);
+    defer publish.deinit();
+    try publish.begin();
+    errdefer publish.cancel() catch {};
     var file_entries = std.AutoHashMap(u64, void).init(allocator);
     defer file_entries.deinit();
     var paths = std.StringHashMap(void).init(allocator);
@@ -186,14 +197,8 @@ pub fn createPack(output_path: []const u8, files: []const BuildFileInput, option
     var report = try sched.run(&graph, .{ .context = &ctx, .run = BuildContext.run }, .{});
     report.deinit(allocator);
 
-    // Phase 2: single-writer publish in a deterministic order. A pack is
-    // always created from scratch; stale objects of a previous build (or of a
-    // patch applied to it) must not leak into the new version.
-    {
-        const io = std.Io.Threaded.global_single_threaded.io();
-        _ = std.Io.Dir.cwd().deleteTree(io, output_path) catch {};
-    }
-    var writer = try pack_writer.PackWriter.createWithOptions(allocator, output_path, .{ .shards = options.shards });
+    // Build a fresh, private generation. The old output is never mutated.
+    var writer = try pack_writer.PackWriter.createWithOptions(allocator, publish.stage, .{ .shards = options.shards });
     var writer_closed = false;
     errdefer if (!writer_closed) writer.abort();
 
@@ -254,6 +259,9 @@ pub fn createPack(output_path: []const u8, files: []const BuildFileInput, option
     try writer.putPackManifest(&manifest);
     try writer.close();
     writer_closed = true;
+    if (fail_after_close) return error.InjectedBuildFailure;
+    try verifyPackDb(publish.stage, allocator);
+    try publish.publish();
 }
 
 pub const DumpInfo = struct {
@@ -336,14 +344,20 @@ pub fn buildPlanIncremental(plan: build_plan_mod.BuildPlan, allocator: std.mem.A
         });
         estimated_tasks += 2 + file.estimated_page_count;
     }
-    const io = std.Io.Threaded.global_single_threaded.io();
-    _ = std.Io.Dir.cwd().deleteTree(io, plan.pack_path) catch {};
     try createPack(plan.pack_path, inputs.items, .{ .pack_id = plan.pack_id, .pack_version = plan.pack_version, .build_id = plan.pack_version, .shards = plan.shards });
-    try verifyPackDb(plan.pack_path, allocator);
     result.scheduled_tasks = estimated_tasks;
     result.rebuilt_files = @intCast(plan.files.len);
     result.wrote_pack = true;
 
+    // The pack is already committed. Cache failure may cost a later rebuild,
+    // but must not misreport successful publication as a failed build.
+    writeBuildCache(plan, allocator) catch {
+        result.cache_write_failed = true;
+    };
+    return result;
+}
+
+fn writeBuildCache(plan: build_plan_mod.BuildPlan, allocator: std.mem.Allocator) !void {
     var entries = std.ArrayList(build_cache_mod.Entry).empty;
     defer {
         for (entries.items) |entry| {
@@ -360,7 +374,6 @@ pub fn buildPlanIncremental(plan: build_plan_mod.BuildPlan, allocator: std.mem.A
         try entries.append(allocator, try build_cache_mod.entryFromPlan(allocator, file, hash.contentHash(manifest_bytes)));
     }
     try build_cache_mod.write(allocator, plan.pack_path, entries.items);
-    return result;
 }
 
 /// The per-file cache cannot see pack-level settings; a pack whose
@@ -619,4 +632,40 @@ pub fn writeSourceFileForTest(path: []const u8, data: []const u8) !void {
     try pf.setLen(file, 0);
     try pf.pwriteAll(file, 0, data);
     try pf.flushMetadata(file);
+}
+
+test "pack build capacity handles fresh and replacement outputs" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const out = "zig-cache-vfs-build-capacity";
+    const source = "zig-cache-vfs-build-capacity.bin";
+    defer std.Io.Dir.cwd().deleteTree(io, out) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
+    const bytes = try std.testing.allocator.alloc(u8, 1024 * 64);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes, 42);
+    try writeSourceFileForTest(source, bytes);
+    const inputs = [_]BuildFileInput{.{ .source_path = source, .virtual_path = "/large", .file_entry = 8100, .page_size = 64 }};
+    try createPack(out, &inputs, .{});
+    try verifyPackDb(out, std.testing.allocator);
+    try createPack(out, &inputs, .{ .pack_version = 2 });
+    var reader = try pack_reader.PackReader.open(std.testing.allocator, out);
+    defer reader.close(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 2), reader.manifest.pack_version);
+}
+
+test "failed replacement retains old valid pack" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const out = "zig-cache-vfs-build-failure";
+    const source = "zig-cache-vfs-build-failure.bin";
+    defer std.Io.Dir.cwd().deleteTree(io, out) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
+    try writeSourceFileForTest(source, "old");
+    const inputs = [_]BuildFileInput{.{ .source_path = source, .virtual_path = "/old", .file_entry = 8101 }};
+    try createPack(out, &inputs, .{ .pack_version = 7 });
+    // Invalid writer configuration fails after source processing, before publication.
+    try std.testing.expectError(error.InvalidArgument, createPack(out, &inputs, .{ .shards = 0 }));
+    try std.testing.expectError(error.InjectedBuildFailure, createPackInternal(out, &inputs, .{}, true));
+    var reader = try pack_reader.PackReader.open(std.testing.allocator, out);
+    defer reader.close(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 7), reader.manifest.pack_version);
 }

@@ -83,7 +83,9 @@ pub const DeltaIndex = struct {
     }
 
     pub fn ensureRoomFor(self: *DeltaIndex, additional: u64) !void {
-        if ((self.used_slots + additional) * 100 > self.journal.header.slot_count * 70) return error.NeedCheckpoint;
+        const needed = try std.math.add(u64, self.used_slots, additional);
+        const slots = self.journal.header.slot_count;
+        if (needed > slots / 10 * 7 + slots % 10 * 7 / 10) return error.NeedCheckpoint;
     }
 
     pub fn publishCommittedMany(self: *DeltaIndex, entries: []const PublishEntry) !void {
@@ -110,7 +112,8 @@ pub const DeltaIndex = struct {
         }
     }
 
-    fn unmap(self: *DeltaIndex) void {
+    /// Release an obsolete mapping after its replacement has been activated.
+    pub fn unmap(self: *DeltaIndex) void {
         if (self.mapping) |*mapping| {
             pf.munmap(mapping);
             self.mapping = null;
@@ -127,19 +130,23 @@ fn lockMutex(m: *std.atomic.Mutex) void {
 
 pub fn create(index: *idx.IndexFile, slot_count: u64, journal_size: u64) !DeltaIndex {
     if (slot_count == 0 or !std.math.isPowerOfTwo(slot_count)) return error.InvalidArgument;
-    const slot_bytes = slot_count * SLOT_SIZE;
-    const journal_offset = journal_mod.DELTA_HEADER_SIZE + slot_bytes;
-    const region_size = journal_offset + journal_size;
+    const slot_bytes = try std.math.mul(u64, slot_count, SLOT_SIZE);
+    const journal_offset = try std.math.add(u64, journal_mod.DELTA_HEADER_SIZE, slot_bytes);
+    const region_size = try std.math.add(u64, journal_offset, journal_size);
     const id = try idx.allocateRegion(index, .delta, region_size);
     const region = try index.region(id);
     const header = journal_mod.DeltaHeader{ .magic = journal_mod.DELTA_MAGIC, .version = 1, .slot_offset = journal_mod.DELTA_HEADER_SIZE, .slot_count = slot_count, .journal_offset = journal_offset, .journal_size = journal_size, .journal_tail = 0, .clean = 1, .flags = 0, .crc = 0 };
     try journal_mod.writeDeltaHeader(index.file, region.offset, header);
     try zeroSlots(index.file, region.offset + header.slot_offset, slot_count);
-    try idx.activateRegion(index, id, region_size);
-    const active = try index.region(id);
-    var di = DeltaIndex{ .journal = .{ .index = index, .region = active, .header = header }, .used_slots = 0, .writable = true };
+    var di = DeltaIndex{ .journal = .{ .index = index, .region = region, .header = header }, .used_slots = 0, .writable = true };
     try attachMapping(&di, true);
+    errdefer di.unmap();
     try markDirty(&di);
+    // Prepare and flush everything before publishing the active region ID.
+    // No fallible work may remain after activation.
+    try idx.activateRegion(index, id, region_size);
+    di.journal.region.state = .active;
+    di.journal.region.used_size = region_size;
     return di;
 }
 

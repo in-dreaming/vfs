@@ -105,7 +105,7 @@ pub const Batch = struct {
 
         self.db.beginBatchCommit();
         defer self.db.endBatchCommit();
-        try self.db.delta.ensureRoomFor(@intCast(self.ops.items.len));
+        try self.db.reserveCommit(@intCast(self.ops.items.len));
         const batch_id = self.db.nextBatchIdNoLock();
         _ = try self.db.delta.journal.appendBatchBegin(batch_id, .{ .durability = .none, .defer_header = true });
         errdefer _ = self.db.delta.journal.appendBatchAbort(batch_id, .{ .durability = durability }) catch {};
@@ -159,6 +159,8 @@ pub const Snapshot = struct {
 
     pub fn begin(db: *kv.KvDb, allocator: std.mem.Allocator) !Snapshot {
         try db.commitPending(null);
+        db.beginBatchCommit();
+        defer db.endBatchCommit();
         var snap = Snapshot{ .allocator = allocator, .db = db, .values = std.AutoHashMap(u128, []u8).init(allocator) };
         var base = base_mod.open(db.index) catch null;
         if (base) |*b| {

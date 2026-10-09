@@ -69,8 +69,11 @@ pub fn main(init: std.process.Init) !void {
         const result = try pack_builder.buildFromConfig(args[2], arena);
         var stdout_buffer: [256]u8 = undefined;
         var w = std.Io.File.stdout().writer(init.io, &stdout_buffer);
-        try w.interface.print("build rebuilt_files={d} skipped_files={d} wrote_pack={}\n", .{ result.rebuilt_files, result.skipped_files, result.wrote_pack });
+        try w.interface.print("build rebuilt_files={d} skipped_files={d} wrote_pack={} cache_write_failed={}\n", .{ result.rebuilt_files, result.skipped_files, result.wrote_pack, result.cache_write_failed });
         try w.interface.flush();
+    } else if (std.mem.eql(u8, cmd, "recover-build")) {
+        if (args.len != 3) return usage();
+        try pack_builder.recoverBuild(args[2], arena);
     } else if (std.mem.eql(u8, cmd, "recover-pack")) {
         if (args.len != 3) return usage();
         var report = try pack_tools.recoverPack(args[2], arena);
@@ -182,6 +185,7 @@ fn usage() void {
         \\  dump-path-index <pack_dir>
         \\  dump-file <pack_dir> <file_entry>
         \\  extract-file <pack_dir> <file_entry> <out_path>
+        \\  recover-build <pack_dir> (only after the builder has stopped)
         \\  recover-pack <pack_dir>
         \\  diff-pack <base_dir> <target_dir> <out_diff_dir> [--chunk-mb N] [--strategy auto|logical|page|replace] [--threads N]
         \\  dump-diff <diff_dir>

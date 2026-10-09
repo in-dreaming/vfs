@@ -75,7 +75,7 @@ pub const KvDb = struct {
     /// optimize) instead of being mmap'ed, verified and unmapped on every
     /// lookup. `null` when the store has no base region yet.
     base: ?base_mod.BaseIndex = null,
-    /// Guards `base` replacement in read-write mode. Read-only stores never
+    /// Guards base/delta mapping replacement in read-write mode. Read-only stores never
     /// replace it and skip the lock entirely.
     base_lock: sync.RwLock = .{},
     batch_counter: u64 = 1,
@@ -380,6 +380,8 @@ pub const KvDb = struct {
     /// first on a writable store.
     pub fn collectLiveKeys(self: *KvDb, allocator: std.mem.Allocator) ![]LiveEntry {
         try self.prepareRead();
+        self.batch_lock.lock();
+        defer self.batch_lock.unlock();
         return checkpoint_mod.collectLiveEntries(self, allocator);
     }
 
@@ -442,6 +444,8 @@ pub const KvDb = struct {
     pub fn checkpoint(self: *KvDb) !void {
         try self.requireWrite();
         try self.commitPending(null);
+        self.batch_lock.lock();
+        defer self.batch_lock.unlock();
         self.maintenance_lock.lock();
         defer self.maintenance_lock.unlock();
         try checkpoint_mod.run(self, std.heap.smp_allocator);
@@ -451,6 +455,8 @@ pub const KvDb = struct {
     pub fn optimize(self: *KvDb) !void {
         try self.requireWrite();
         try self.commitPending(null);
+        self.batch_lock.lock();
+        defer self.batch_lock.unlock();
         self.maintenance_lock.lock();
         defer self.maintenance_lock.unlock();
         try self.optimizeNoConcurrentAccess(std.heap.smp_allocator);
@@ -511,6 +517,8 @@ pub const KvDb = struct {
     }
 
     pub fn getInfo(self: *KvDb, allocator: std.mem.Allocator) !DbInfo {
+        self.batch_lock.lock();
+        defer self.batch_lock.unlock();
         var out = DbInfo{
             .abi_version = fmt.ABI_VERSION,
             .format_version = fmt.FORMAT_VERSION,
@@ -559,7 +567,7 @@ pub const KvDb = struct {
         defer self.pending_lock.unlock();
         if (self.pending.items.len == 0) return;
         try self.requireWrite();
-        try self.delta.ensureRoomFor(@intCast(self.pending.items.len));
+        try self.reserveCommit(@intCast(self.pending.items.len));
 
         const batch_id = self.nextBatchIdNoLock();
         const durability = durability_override orelse pendingMaxDurability(self.pending.items);
@@ -613,6 +621,42 @@ pub const KvDb = struct {
         try self.delta.publishCommittedMany(published.items);
         self.freePending();
         self.pending.clearRetainingCapacity();
+    }
+
+    /// Called with batch_lock held, before writing any part of the new batch.
+    /// Checkpoint only committed state, then reserve the entire atomic batch.
+    pub fn reserveCommit(self: *KvDb, operations: u64) !void {
+        const record_count = try std.math.add(u64, operations, 2);
+        const journal_bytes = try std.math.mul(u64, record_count, journal_mod.JOURNAL_RECORD_SIZE);
+        const slots_needed = try std.math.add(u64, self.delta.used_slots, operations);
+        const slot_limit = self.delta.journal.header.slot_count / 10 * 7 + self.delta.journal.header.slot_count % 10 * 7 / 10;
+        if (slots_needed <= slot_limit and journal_bytes <= self.delta.journal.header.journal_size - self.delta.journal.header.journal_tail) return;
+
+        var slots = self.delta.journal.header.slot_count;
+        while (operations > slots / 10 * 7 + slots % 10 * 7 / 10) {
+            slots = try std.math.mul(u64, slots, 2);
+        }
+        const journal_size = @max(self.delta.journal.header.journal_size, journal_bytes);
+        self.maintenance_lock.lock();
+        defer self.maintenance_lock.unlock();
+        self.base_lock.lock();
+        defer self.base_lock.unlock();
+
+        // Publishing the new base first is safe: replaying the old delta over
+        // that base is idempotent. Never activate the empty delta first.
+        // Existing commits have already published shard superblocks. Flush
+        // those writes without reading tails that concurrent batch appends own.
+        try pf.flushMetadata(self.data.file);
+        for (self.extra_data) |*data| try pf.flushMetadata(data.file);
+        try checkpoint_mod.run(self, std.heap.smp_allocator);
+        var fresh_base = try base_mod.open(self.index);
+        errdefer fresh_base.close();
+        const fresh_delta = try delta_mod.create(self.index, slots, journal_size);
+        // Activation has completed; swapping and disposing must not fail.
+        self.delta.unmap();
+        if (self.base) |*base| base.close();
+        self.delta = fresh_delta;
+        self.base = fresh_base;
     }
 
     pub const ShardedAppendInput = struct {
@@ -698,17 +742,17 @@ pub const KvDb = struct {
     /// a read-write store takes `base_lock` shared so checkpoint/optimize can
     /// swap the mapping underneath concurrent readers.
     fn lookupInfo(self: *KvDb, key: fmt.Key128) !fmt.IndexInfo {
+        if (self.mode != .read_only) self.base_lock.lockShared();
+        defer if (self.mode != .read_only) self.base_lock.unlockShared();
+        return self.lookupInfoUnlocked(key);
+    }
+
+    fn lookupInfoUnlocked(self: *KvDb, key: fmt.Key128) !fmt.IndexInfo {
         switch (try self.delta.lookup(key)) {
             .found => |info| return info,
             .deleted => return error.NotFound,
             .not_found => {},
         }
-        if (self.mode == .read_only) {
-            const base = &(self.base orelse return error.NotFound);
-            return base.lookup(key);
-        }
-        self.base_lock.lockShared();
-        defer self.base_lock.unlockShared();
         const base = &(self.base orelse return error.NotFound);
         return base.lookup(key);
     }
@@ -719,12 +763,14 @@ pub const KvDb = struct {
     /// (not yet checkpointed away), or nothing. Verification uses this to
     /// tell superseded/deleted records (normal garbage) from orphans.
     pub fn keyState(self: *KvDb, key: fmt.Key128) !KeyState {
+        if (self.mode != .read_only) self.base_lock.lockShared();
+        defer if (self.mode != .read_only) self.base_lock.unlockShared();
         switch (try self.delta.lookup(key)) {
             .found => return .live,
             .deleted => return .deleted,
             .not_found => {},
         }
-        const info = self.lookupInfo(key) catch |e| switch (e) {
+        const info = self.lookupInfoUnlocked(key) catch |e| switch (e) {
             error.NotFound => return .unknown,
             else => |err| return err,
         };
@@ -1579,7 +1625,7 @@ test "kv db concurrent readers writers overwrite delete and maintenance" {
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var db = try KvDb.openAt(tmp.dir, .{ .durability = .none, .max_delta_entries = 2048 });
+    var db = try KvDb.openAt(tmp.dir, .{ .durability = .none, .max_delta_entries = 16 });
 
     var errors = [_]u32{0} ** (writer_count + reader_count);
     var ctx = StressCtx{ .db = &db, .errors = &errors };
@@ -1793,4 +1839,73 @@ test "kv db parallel batches on disjoint shards commit correctly" {
             try testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "s{d}-r{d}-j{d}", .{ shard, n / 16, n % 16 }), try db.getBorrowedBytes(&key_bytes));
         }
     }
+}
+
+test "pending commits cross delta capacity and reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try KvDb.openAt(tmp.dir, .{ .max_delta_entries = 16 });
+    var closed = false;
+    defer if (!closed) db.close() catch {};
+    for (0..80) |i| try db.put(.{ .hi = 0, .lo = i }, "value", .{});
+    try db.commitPending(.sync);
+    for (80..160) |i| try db.put(.{ .hi = 0, .lo = i }, "value", .{});
+    try db.commitPending(.sync);
+    try db.checkpoint();
+    try db.close();
+    closed = true;
+    var reopened = try KvDb.openAt(tmp.dir, .{ .create_if_missing = false });
+    defer reopened.close() catch {};
+    for (0..160) |i| try std.testing.expectEqual(@as(u64, 5), try reopened.getSize(.{ .hi = 0, .lo = i }));
+}
+
+test "explicit batches reserve whole delta and preserve checkpoint deletes" {
+    const testing = std.testing;
+    const batch_mod = @import("batch_snapshot.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try KvDb.openAt(tmp.dir, .{ .max_delta_entries = 16 });
+    var closed = false;
+    defer if (!closed) db.close() catch {};
+    try db.put(.{ .hi = 0, .lo = 9999 }, "old", .{});
+    try db.commitPending(.sync);
+    try db.checkpoint();
+    var batch = batch_mod.Batch.begin(&db, testing.allocator);
+    defer batch.deinit();
+    try batch.delete(.{ .hi = 0, .lo = 9999 });
+    for (0..1000) |i| try batch.put(.{ .hi = 0, .lo = i }, "batch", 0);
+    try batch.commit(.sync);
+    // Rebuild the active slot table from its journal, as dirty-open recovery does.
+    try delta_mod.recover(&db.delta);
+    for (0..1000) |i| try testing.expectEqual(@as(u64, 5), try db.getSize(.{ .hi = 0, .lo = i }));
+    // Force a second rollover, merging the delete into the base.
+    for (1000..2000) |i| try db.put(.{ .hi = 0, .lo = i }, "pending", .{});
+    try db.commitPending(.sync);
+    try testing.expectError(error.NotFound, db.getSize(.{ .hi = 0, .lo = 9999 }));
+    try db.close();
+    closed = true;
+    var reopened = try KvDb.openAt(tmp.dir, .{ .create_if_missing = false });
+    defer reopened.close() catch {};
+    try testing.expectError(error.NotFound, reopened.getSize(.{ .hi = 0, .lo = 9999 }));
+    for (0..1000) |i| try testing.expectEqual(@as(u64, 5), try reopened.getSize(.{ .hi = 0, .lo = i }));
+    for (1000..2000) |i| try testing.expectEqual(@as(u64, 7), try reopened.getSize(.{ .hi = 0, .lo = i }));
+}
+
+test "commit rolls over exhausted journal with few delta keys" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try KvDb.openAt(tmp.dir, .{});
+    defer db.close() catch {};
+    // Use a small valid journal to exercise exhaustion without thousands of IOs.
+    const small = try delta_mod.create(db.index, 1024, 6 * journal_mod.JOURNAL_RECORD_SIZE);
+    db.delta.unmap();
+    db.delta = small;
+    const original_region = db.index.activeDeltaRegionId();
+    for (0..3) |_| {
+        try db.put(.{ .hi = 0, .lo = 1 }, "update", .{});
+        try db.commitPending(.sync);
+    }
+    try testing.expect(db.index.activeDeltaRegionId() != original_region);
+    try testing.expectEqual(@as(u64, 6), try db.getSize(.{ .hi = 0, .lo = 1 }));
 }

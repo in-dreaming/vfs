@@ -235,13 +235,14 @@ pub fn activateRegion(index: *IndexFile, id: u32, used_size: u64) !void {
     r.used_size = used_size;
     r.epoch = index.super.region_directory_epoch + 1;
     try writeRegion(index.file, r);
-    index.super.region_directory_epoch += 1;
+    var next = index.super;
+    next.region_directory_epoch += 1;
     switch (r.region_type) {
-        .base_index => index.super.active_base_region_id = id,
-        .delta => index.super.active_delta_region_id = id,
+        .base_index => next.active_base_region_id = id,
+        .delta => next.active_delta_region_id = id,
         else => {},
     }
-    try commitSuper(index);
+    try commitSuper(index, next);
 }
 
 pub fn verify(index: *const IndexFile) !void {
@@ -255,11 +256,13 @@ pub fn verify(index: *const IndexFile) !void {
     }
 }
 
-fn commitSuper(index: *IndexFile) !void {
-    index.super.epoch += 1;
-    const off = if (index.super.epoch % 2 == 0) SUPER_A_OFFSET else SUPER_B_OFFSET;
-    try writeSuper(index.file, off, index.super);
+fn commitSuper(index: *IndexFile, candidate: IndexSuperBlock) !void {
+    var next = candidate;
+    next.epoch += 1;
+    const off = if (next.epoch % 2 == 0) SUPER_A_OFFSET else SUPER_B_OFFSET;
+    try writeSuper(index.file, off, next);
     try pf.flushMetadata(index.file);
+    index.super = next;
 }
 
 fn writeHeader(file: pf.FileHandle, h: IndexFileHeader) !void {
