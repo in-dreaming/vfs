@@ -56,22 +56,33 @@ pub const CustomFileOps = struct {
     munmap: ?CustomMunmapFn,
 };
 
+// The v1 C layout stores function pointers as opaque pointers (alignment 1).
+// Some targets, including AArch64, require aligned function addresses. Reject
+// malformed tables before asserting that alignment for the typed pointer.
+fn rawCallback(comptime T: type, raw: ?*const anyopaque) !T {
+    const p = raw orelse return error.InvalidArgument;
+    const info = @typeInfo(T).pointer;
+    const alignment = info.alignment orelse @alignOf(info.child);
+    if (@intFromPtr(p) % alignment != 0) return error.InvalidArgument;
+    return @ptrCast(@alignCast(p));
+}
+
 pub fn customOpsFromRaw(raw: *const RawFileOps) !CustomFileOps {
     if (raw.struct_size < @offsetOf(RawFileOps, "munmap") + @sizeOf(?*const anyopaque)) return error.InvalidArgument;
     if (raw.version != 1) return error.UnsupportedVersion;
     return .{
         .user_data = raw.user_data,
-        .open = @ptrCast(raw.open orelse return error.InvalidArgument),
-        .close = @ptrCast(raw.close orelse return error.InvalidArgument),
-        .read_at = @ptrCast(raw.read_at orelse return error.InvalidArgument),
-        .write_at = @ptrCast(raw.write_at orelse return error.InvalidArgument),
-        .get_size = @ptrCast(raw.get_size orelse return error.InvalidArgument),
-        .set_size = @ptrCast(raw.set_size orelse return error.InvalidArgument),
-        .sync = @ptrCast(raw.sync orelse return error.InvalidArgument),
-        .preallocate = if (raw.preallocate) |p| @ptrCast(p) else null,
-        .mmap = if (raw.mmap) |p| @ptrCast(p) else null,
-        .msync = if (raw.msync) |p| @ptrCast(p) else null,
-        .munmap = if (raw.munmap) |p| @ptrCast(p) else null,
+        .open = try rawCallback(CustomOpenFn, raw.open),
+        .close = try rawCallback(CustomCloseFn, raw.close),
+        .read_at = try rawCallback(CustomReadAtFn, raw.read_at),
+        .write_at = try rawCallback(CustomWriteAtFn, raw.write_at),
+        .get_size = try rawCallback(CustomGetSizeFn, raw.get_size),
+        .set_size = try rawCallback(CustomSetSizeFn, raw.set_size),
+        .sync = try rawCallback(CustomSyncFn, raw.sync),
+        .preallocate = if (raw.preallocate) |p| try rawCallback(CustomPreallocateFn, p) else null,
+        .mmap = if (raw.mmap) |p| try rawCallback(CustomMmapFn, p) else null,
+        .msync = if (raw.msync) |p| try rawCallback(CustomMsyncFn, p) else null,
+        .munmap = if (raw.munmap) |p| try rawCallback(CustomMunmapFn, p) else null,
     };
 }
 
@@ -517,4 +528,13 @@ test "platform concurrent pread shares one file handle" {
     for (&threads, 0..) |*thread, i| thread.* = try std.Thread.spawn(.{}, Ctx.reader, .{ &ctx, i });
     for (&threads) |*thread| thread.join();
     for (errors) |err| try testing.expectEqual(@as(u32, 0), err);
+}
+
+test "opaque callback conversion validates target function alignment" {
+    // Explicit alignment exercises the Arm64 requirement on x86 hosts too.
+    const AlignedFn = *align(4) const fn () callconv(.c) void;
+    try std.testing.expectError(error.InvalidArgument, rawCallback(AlignedFn, null));
+    try std.testing.expectError(error.InvalidArgument, rawCallback(AlignedFn, @ptrFromInt(0x1001)));
+    const aligned = try rawCallback(AlignedFn, @ptrFromInt(0x1000));
+    try std.testing.expectEqual(@as(usize, 0x1000), @intFromPtr(aligned));
 }

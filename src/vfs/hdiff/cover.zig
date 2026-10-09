@@ -192,7 +192,7 @@ pub fn dispose(allocator: std.mem.Allocator, covers: *std.ArrayList(Cover), old:
         const last_end_old = last.old_pos + last.len;
         const same_shift = (c.new_pos >= c.old_pos) == (last.new_pos >= last.old_pos) and
             (if (c.new_pos >= c.old_pos) c.new_pos - c.old_pos else c.old_pos - c.new_pos) ==
-            (if (last.new_pos >= last.old_pos) last.new_pos - last.old_pos else last.old_pos - last.new_pos);
+                (if (last.new_pos >= last.old_pos) last.new_pos - last.old_pos else last.old_pos - last.new_pos);
         if (same_shift and c.new_pos >= last_end_new and c.new_pos - last_end_new <= options.link_max_gap and c.old_pos >= last_end_old) {
             last.len = (c.new_pos + c.len) - last.new_pos;
         } else {

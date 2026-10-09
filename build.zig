@@ -142,12 +142,30 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    const run_vfs_cabi_smoke = addVfsCabiSmoke(b, target, optimize, vfs_static_lib, vfs_exe, "static");
-    const run_vfs_shared_cabi_smoke = addVfsCabiSmoke(b, target, optimize, vfs_shared_lib, vfs_exe, "shared");
+    const abi_step = b.step("test-abi", "Run C11 and C++17 consumers of DB/VFS static and shared libraries");
+    const abi_compile_step = b.step("check-abi", "Compile and link all ABI consumers without executing target code");
+    for ([_]bool{ false, true }) |cpp| {
+        for ([_]bool{ false, true }) |shared| {
+            const label = b.fmt("{s}_{s}", .{ if (cpp) "cpp" else "c", if (shared) "shared" else "static" });
+            const db_smoke = addAbiConsumer(b, target, optimize, if (shared) shared_lib else static_lib, "db", "tests/cabi_smoke.c", cpp, shared, label);
+            abi_compile_step.dependOn(&db_smoke.step);
+            const run_db = b.addRunArtifact(db_smoke);
+            run_db.addArg(b.fmt(".zig-cache/db_cabi_smoke_{s}", .{label}));
+            run_db.has_side_effects = true;
+            abi_step.dependOn(&run_db.step);
+            const run_vfs = addVfsCabiSmoke(b, target, optimize, if (shared) vfs_shared_lib else vfs_static_lib, vfs_exe, cpp, shared, label, abi_compile_step);
+            abi_step.dependOn(&run_vfs.step);
+        }
+    }
 
     const run_tests = b.addRunArtifact(tests);
     const run_vfs_tests = b.addRunArtifact(vfs_tests);
     const run_vfs_pack_roundtrip = b.addRunArtifact(vfs_pack_roundtrip);
+    // These tests mutate fixed fixtures and include concurrency/fault checks.
+    // Repeated reliability invocations must execute them, not reuse a pass.
+    run_tests.has_side_effects = true;
+    run_vfs_tests.has_side_effects = true;
+    run_vfs_pack_roundtrip.has_side_effects = true;
     const process_recovery = b.addExecutable(.{
         .name = "vfs_patch_process",
         .root_module = b.createModule(.{
@@ -166,8 +184,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_vfs_tests.step);
     test_step.dependOn(&run_vfs_pack_roundtrip.step);
-    test_step.dependOn(&run_vfs_cabi_smoke.step);
-    test_step.dependOn(&run_vfs_shared_cabi_smoke.step);
+    test_step.dependOn(abi_step);
     test_step.dependOn(&exe.step);
     test_step.dependOn(&vfs_exe.step);
     test_step.dependOn(&static_lib.step);
@@ -178,21 +195,9 @@ pub fn build(b: *std.Build) void {
 
 // Both C startup modes must exercise background thread creation. Merely
 // running Zig tests cannot detect a library compiled for the wrong TLS ABI.
-fn addVfsCabiSmoke(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, library: *std.Build.Step.Compile, vfs_exe: *std.Build.Step.Compile, label: []const u8) *std.Build.Step.Run {
-    const vfs_cabi_smoke = b.addExecutable(.{
-        .name = b.fmt("vfs_cabi_smoke_{s}", .{label}),
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    vfs_cabi_smoke.root_module.addCSourceFile(.{
-        .file = b.path("tests/vfs_cabi_smoke.c"),
-        .flags = &.{},
-    });
-    vfs_cabi_smoke.root_module.addIncludePath(b.path("include"));
-    vfs_cabi_smoke.root_module.linkLibrary(library);
+fn addVfsCabiSmoke(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, library: *std.Build.Step.Compile, vfs_exe: *std.Build.Step.Compile, cpp: bool, shared: bool, label: []const u8, compile_step: *std.Build.Step) *std.Build.Step.Run {
+    const vfs_cabi_smoke = addAbiConsumer(b, target, optimize, library, "vfs", "tests/vfs_cabi_smoke.c", cpp, shared, label);
+    compile_step.dependOn(&vfs_cabi_smoke.step);
 
     const smoke_assets = b.addWriteFiles();
     const smoke_payload = smoke_assets.add("a.bin", "hello-vfs-cabi");
@@ -236,4 +241,24 @@ fn addVfsCabiSmoke(b: *std.Build, target: std.Build.ResolvedTarget, optimize: st
     run_vfs_cabi_smoke.step.dependOn(&prepare_diff.step);
 
     return run_vfs_cabi_smoke;
+}
+
+fn addAbiConsumer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, library: *std.Build.Step.Compile, api: []const u8, source: []const u8, cpp: bool, shared: bool, label: []const u8) *std.Build.Step.Compile {
+    const exe = b.addExecutable(.{
+        .name = b.fmt("{s}_abi_{s}", .{ api, label }),
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    exe.root_module.addCSourceFile(.{
+        .file = b.path(source),
+        .language = if (cpp) .cpp else .c,
+        .flags = if (cpp) &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror", "-Wno-missing-field-initializers" } else &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    if (shared) exe.root_module.addCMacro(if (std.mem.eql(u8, api, "db")) "DB_SHARED" else "VFS_SHARED", "1");
+    exe.root_module.addIncludePath(b.path("include"));
+    exe.root_module.linkLibrary(library);
+    return exe;
 }

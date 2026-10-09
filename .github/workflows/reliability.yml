@@ -1,0 +1,47 @@
+name: Extended reliability and performance
+
+# Explicit opt-in: no scheduled runs, releases, uploads, or publication.
+on:
+  workflow_dispatch:
+    inputs:
+      benchmark:
+        description: Run the OS-cache-warm read benchmark after recovery checks
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  reliability:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+          use-cache: false
+      - name: Verify toolchain pin
+        shell: bash
+        run: |
+          zig version
+          test "$(zig version)" = "$(tr -d '\r\n' < .zigversion)"
+      - name: Repeat the full suite serially
+        shell: bash
+        run: |
+          for run in 1 2 3; do
+            echo "Reliability pass $run"
+            zig build test -Doptimize=ReleaseSafe -j2 --summary all
+          done
+      - name: Real owned-child process-death recovery matrix
+        run: zig build test-heavy -Doptimize=ReleaseSafe -j2 --summary all
+      - name: OS-cache-warm performance sample (no timing threshold)
+        if: inputs.benchmark
+        run: zig build bench-read -Doptimize=ReleaseFast -j2 -- 8

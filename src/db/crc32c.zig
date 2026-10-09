@@ -75,7 +75,8 @@ inline fn hwWord(crc: u32, word: u64) u32 {
             return @truncate(out);
         },
         .aarch64 => {
-            return asm ("crc32cx %w[out], %w[crc], %[word]"
+            // Zig names register-width modifiers inside the operand brackets.
+            return asm ("crc32cx %[out:w], %[crc:w], %[word]"
                 : [out] "=r" (-> u32),
                 : [crc] "r" (crc),
                   [word] "r" (word),
@@ -88,14 +89,17 @@ inline fn hwWord(crc: u32, word: u64) u32 {
 inline fn hwByte(crc: u32, byte: u8) u32 {
     switch (builtin.cpu.arch) {
         .x86_64 => {
-            return asm ("crc32b %[byte], %[acc]"
+            // Let operand types select 8-bit input / 32-bit accumulator. Zig
+            // 0.16's x86 backend rejects `q` and mis-sizes the `crc32b` suffix.
+            // This spelling also works with LLVM; keep the u8 input type.
+            return asm ("crc32 %[byte], %[acc]"
                 : [acc] "=r" (-> u32),
-                : [byte] "q" (byte),
+                : [byte] "r" (byte),
                   [acc_in] "0" (crc),
             );
         },
         .aarch64 => {
-            return asm ("crc32cb %w[out], %w[crc], %w[byte]"
+            return asm ("crc32cb %[out:w], %[crc:w], %[byte:w]"
                 : [out] "=r" (-> u32),
                 : [crc] "r" (crc),
                   [byte] "r" (@as(u32, byte)),
@@ -212,4 +216,14 @@ test "crc32c continuation equals one-shot over concatenation" {
     state = update(state, b);
     state = update(state, c);
     try std.testing.expectEqual(whole, finish(state));
+}
+
+test "crc32c every byte value and short hardware tail matches reference" {
+    var bytes: [16]u8 = undefined;
+    for (0..256) |value| {
+        @memset(&bytes, @intCast(value));
+        for (1..bytes.len + 1) |len| {
+            try std.testing.expectEqual(referenceBitwise(bytes[0..len]), hash(bytes[0..len]));
+        }
+    }
 }

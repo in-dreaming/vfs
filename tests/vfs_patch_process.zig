@@ -169,7 +169,7 @@ pub fn main(init: std.process.Init) !void {
     }
     var random: [16]u8 = undefined;
     std.Io.random(init.io, &random);
-    const root = try std.fmt.allocPrint(a, "/tmp/vfs-patch-process-{x}", .{random});
+    const root = try std.fmt.allocPrint(a, "zig-cache-vfs-patch-process-{x}", .{random});
     try cwd.createDir(init.io, root, .default_dir);
     defer cwd.deleteTree(init.io, root) catch {};
     var count: usize = 0;

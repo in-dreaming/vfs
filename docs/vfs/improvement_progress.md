@@ -201,3 +201,49 @@ git diff --check
 ```
 
 Residual limits are the payload/metadata/source-stability/offline contracts above, non-exhaustive failure injection, no race-detector or cross-platform runtime validation, and the pre-existing Debug CRC portability issue deferred to stage 5. The earlier allocator fault's exact cause remains unproven; the independently demonstrated scheduler lifetime and allocation-unwind defects were fixed and the final serial gates passed.
+
+## Stage 5: pinned toolchain, ABI consumers and platform validation (2026-10-08)
+
+### Implemented
+
+- Pin official Zig 0.16.0 in `.zigversion` and CI, with no new package dependency. Explain target/CPU selection, platform artifacts, native validation and cross-compilation limits in `docs/validation.md` and the README.
+- Reproduce the native Debug CRC failure (`invalid constraint: 'q'`). Changing only the input constraint exposes a second native-backend failure (`crc32 r8 r8`). Use a typed u8 `r` input with unsuffixed `crc32` so operand widths remain u8/u32. Keep the hardware implementation, portable fallback and all previous correctness comparisons; add exhaustive byte values over every short tail length. No forced LLVM backend or disabled correctness checks.
+- Cross-compilation exposed two additional pre-existing Arm64 blockers: opaque callback pointers require target function alignment, and ARM CRC operands used GCC instead of Zig register-width modifier syntax. Validate callback alignment before casting (return InvalidArgument for malformed tables, preserve v1 layout/nullability), and use Zig `%[operand:w]` modifiers for the CRC u32 registers. Add a host-executable alignment regression; keep the ARM hardware path enabled.
+- Repair the obsolete standalone DB C smoke to use u64 handles and byte keys with lengths. Cover an embedded-NUL key, persistence/reopen, batch/snapshot retention and stale IDs, maintenance and deletion. Build and run C11/C++17 consumers against both static/shared DB and VFS libraries: eight variants with distinct fixtures and real C/C++ startup. Preserve the VFS stat-prefix, handle, mounted patch and background-thread checks. Shared Windows consumers use the public import macros.
+- Add `test-abi` and compile/link-only `check-abi`; keep all eight consumers in ordinary `test`. Explicitly mark the three fixture-mutating Zig test Run steps side-effectful so even repeated fixed-seed invocations execute tests; compilation remains cached.
+- Running `bench-read` exposed its obsolete cast from a public volume ID to `*Volume`, causing a crash in the C-ABI scenario after stage 2. Configure the fresh cache through `vfs_open_options_t.page_cache_bytes` instead. Audit tests/tools/current examples for other opaque-ID pointer casts; none remain. Mark the old pointer-based batch/snapshot design draft as historical and link the current header/smoke.
+- Retain the existing `test-heavy` process-kill matrix rather than adding a duplicate. Replace its hard-coded `/tmp` root with an exclusively created random checkout-local fixture, preserving owned-child-only termination and cleanup.
+- Add pinned-action Linux x86_64 / Windows x86_64 / macOS Arm64 Debug + ReleaseSafe CI, with read-only repository permissions and no publication. CRC fallback is explicit on Arm64 (`baseline-crc`, because macOS's M1 baseline enables CRC). A manual-only extended workflow repeats full suites serially, runs `test-heavy`, and optionally samples the existing OS-cache-warm benchmark without a speed threshold. No remote workflow was run.
+- Fix two pre-existing formatting-only violations in `base_index.zig` and `hdiff/cover.zig` so the repository-wide formatting gate passes.
+
+### Historical repetition audit
+
+A review raised possible cached test-result reuse. Audit of the retained stage-2 repeat-1/2/3, stage-3 repeat-1/2/3 and stage-4 verified-1/2/3 logs confirms **all three Zig test executables actually ran in each recorded invocation**, with `run test N pass` lines and differing elapsed times/RSS, not cached results. For example, stage-4 DB timings were 217/219/211 ms and roundtrip timings 20/13/16 ms. Zig 0.16's build runner supplies a random default test seed, which participates in the run cache key. The possible-skipped-run inference was withdrawn; the historical verification above remains valid. Explicit side-effect flags now guarantee execution when a deliberately fixed seed is reused too.
+
+### Verification
+
+Final-tree validation uses official Zig 0.16.0 on Linux x86_64; fixture-mutating aggregates ran strictly sequentially.
+
+- Full Debug: **200/200 Zig tests** (49 DB, 150 VFS, 1 roundtrip), **53/53 steps**, including all eight ABI consumers.
+- Three final ReleaseSafe repetitions with the identical `--seed 0x5eed`: **200/200 tests and 53/53 steps each**. All three test executables actually executed each time (DB timings 219/208/215 ms; roundtrip 15/12/13 ms), while compilation remained cached where unchanged.
+- CRC: **4/4 tests** in explicit SSE4.2 native-backend Debug, LLVM Debug, ReleaseSafe and ReleaseFast, plus baseline portable Debug. macOS Arm64 CRC tests compile/link in Debug and ReleaseSafe; they were not executed. A compile-time assertion separately confirms `has_hardware == false` for x86 baseline and macOS Arm64 baseline-crc.
+- Windows GNU x86_64 and macOS Arm64 ReleaseSafe `check-abi`: **20/20 compile/link steps each**, including all eight consumers. This is cross-compilation only, not native platform execution.
+- Independent read-only review of build/ABI/CRC, callback alignment, CI and documentation reported no remaining actionable issue after fixes. YAML parsed locally and repository-wide `zig fmt --check` / `git diff --check` passed. GitHub workflow execution, Windows/macOS native runtime, sanitizer/race-detector and power-loss validation remain unverified. No push or remote dispatch.
+
+Commands:
+
+```sh
+ZIG=/tmp/vfs-review-tools/zig-x86_64-linux-0.16.0/zig
+export ZIG_GLOBAL_CACHE_DIR=/tmp/vfs-review-tools/global-cache
+$ZIG build test -j2 --seed 0x5eed --summary all
+$ZIG build test -Doptimize=ReleaseSafe -j2 --seed 0x5eed --summary all # three serial runs
+$ZIG build test-heavy -Doptimize=ReleaseSafe -j2 --summary all
+$ZIG build -j2 --summary all
+$ZIG build -Doptimize=ReleaseSafe -j2 --summary all
+$ZIG build check-abi -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe -j2 --summary all
+$ZIG build check-abi -Dtarget=aarch64-macos -Doptimize=ReleaseSafe -j2 --summary all
+$ZIG build bench-read -Doptimize=ReleaseFast -j2 -- 2
+$ZIG fmt --check build.zig src tests tools
+```
+
+Additional final gates passed: **20/20** real owned-child process-death recovery cases (**4/4** heavy steps), **18/18** installed-build steps in each of Debug and ReleaseSafe, and the repaired ReleaseFast benchmark completed every scenario at **1 and 2 threads**, including the C ABI. Benchmark data are VFS-cache-cold/OS-cache-warm or warm-cache CPU/memory overhead samples, **not physical disk bandwidth** or a statistically controlled before/after performance claim. The opaque-handle benchmark correction received independent review; that benchmark fix changes no production runtime or ABI contract. Both full Debug and ReleaseSafe aggregates were rerun afterward, each passing 200/200 tests and 53/53 steps.

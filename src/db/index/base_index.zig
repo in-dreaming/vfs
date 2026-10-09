@@ -192,7 +192,10 @@ fn chooseBucketBits(n: usize) u5 {
     if (n == 0) return 0;
     var buckets: usize = 1;
     var bits: u5 = 0;
-    while (buckets < n / 4 + 1 and bits < 20) : ({ buckets <<= 1; bits += 1; }) {}
+    while (buckets < n / 4 + 1 and bits < 20) : ({
+        buckets <<= 1;
+        bits += 1;
+    }) {}
     return bits;
 }
 

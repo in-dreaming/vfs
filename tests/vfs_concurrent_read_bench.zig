@@ -423,11 +423,16 @@ fn benchAbiWarm(out: *std.Io.Writer, io: std.Io, pack_path: []const u8) !void {
     const z_pack = try std.heap.smp_allocator.dupeZ(u8, pack_path);
     defer std.heap.smp_allocator.free(z_pack);
     var volume: u64 = 0;
-    if (abi.vfs_open_volume("abi-bench", null, &volume) != 0) return error.BenchFailed;
+    // ABI IDs are opaque retained handles, never Volume addresses. Configure
+    // the fresh cache through the public options instead of dereferencing one.
+    const options = abi.vfs_open_options_t{
+        .struct_size = @sizeOf(abi.vfs_open_options_t),
+        .flags = 0,
+        .page_cache_bytes = 128 * 1024 * 1024,
+    };
+    if (abi.vfs_open_volume("abi-bench", &options, &volume) != 0) return error.BenchFailed;
     defer _ = abi.vfs_close_volume(volume);
     if (abi.vfs_mount_pack(volume, z_pack.ptr, 1, 0) != 0) return error.BenchFailed;
-    const v: *Volume = @ptrFromInt(volume);
-    flushCache(v, 128 * 1024 * 1024);
 
     const repeats: u32 = 16;
     var errors = std.atomic.Value(u32).init(0);

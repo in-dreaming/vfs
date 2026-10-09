@@ -53,20 +53,40 @@ Pack directories contain `manifest.db`, `index.db` and one or more `data_NNN.db`
 
 ## Build and test
 
-```powershell
-zig build
-zig build test
-zig build -Doptimize=ReleaseSafe
+Use **official Zig 0.16.0**, pinned in `.zigversion`, on PATH. No external
+libraries or package manager are required. Other Zig releases/nightlies are not
+part of the supported toolchain. Keep the pin and both CI workflows in sync.
+
+```sh
+zig version                         # must print 0.16.0
+zig build                           # native Debug, static/shared DB + VFS + tools
+zig build test                      # full regressions, including all eight ABI consumers
 zig build test -Doptimize=ReleaseSafe
+zig build test-abi                   # C11/C++17 × DB/VFS × static/shared only
+zig build check-abi                  # compile/link consumers only; useful for cross targets
+zig fmt --check build.zig src tests tools
 ```
 
-Installed artifacts are placed in `zig-out/`:
+Run fixture-mutating commands **sequentially** in a checkout. Historical test
+paths are fixed; independent concurrent `zig build test` processes can collide.
+`-j2` bounds compilation parallelism on smaller machines; it does not make
+concurrent aggregate invocations safe. Zig's own build driver handles the
+independent fixtures within one invocation.
 
-- `zig-out/lib/vfs.lib` and `zig-out/bin/vfs_shared.dll`
-- `zig-out/include/vfs.h`
-- `zig-out/lib/db.lib` and `zig-out/bin/db_shared.dll`
-- `zig-out/include/db.h`
-- `zig-out/bin/vfs.exe` and `zig-out/bin/db.exe`
+Installed headers are `zig-out/include/db.h` and `vfs.h`. Artifacts vary by target:
+
+- Linux: `zig-out/lib/libdb.a`, `libvfs.a`, `libdb_shared.so`, `libvfs_shared.so`
+- macOS: static `.a` and shared `.dylib` libraries under `zig-out/lib/`
+- Windows: static/import libraries under `zig-out/lib/`, shared `.dll` files under `zig-out/bin/`
+- Tools: `zig-out/bin/db` and `vfs` (`.exe` on Windows)
+
+C-facing library roots link libc, including the platform thread runtime. C and
+C++ consumers must link the corresponding library and arrange normal shared
+library lookup when using DLLs/dylibs/shared objects. Define `DB_SHARED` or
+`VFS_SHARED` for Windows shared-library imports. `test-abi` exercises actual
+C/C++ process startup, DB persistence and VFS background patch threads, not just
+header parsing. See [validation and platform coverage](docs/validation.md) for
+commands, reliability/performance entry points, and current verification limits.
 
 ## VFS command-line tools
 

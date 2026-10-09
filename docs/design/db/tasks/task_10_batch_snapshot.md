@@ -1,5 +1,7 @@
 # Task 10：Batch 与 Snapshot
 
+> 历史设计记录：下文的指针型 C ABI 草案已被替代，不能作为当前调用示例。当前接口见 [include/db.h](../../../../include/db.h)：DB、batch 和 snapshot 均使用不透明 `db_handle_t` ID（不可转换为指针），key 使用字节指针及长度。可运行示例见 [tests/cabi_smoke.c](../../../../tests/cabi_smoke.c)。
+
 ## 1. 任务目标
 
 实现轻量 batch 原子发布与 snapshot read。
