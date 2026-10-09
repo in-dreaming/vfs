@@ -63,7 +63,7 @@ pub const Manifest = struct {
 
     pub fn close(self: *Manifest) !void {
         if (!self.file.isOpen()) return;
-        try pf.flushMetadata(self.file);
+        if (self.file.writable) try pf.flushMetadata(self.file);
         pf.close(&self.file);
     }
 
@@ -128,7 +128,12 @@ pub fn openAt(dir: std.Io.Dir, path: []const u8) !Manifest {
 }
 
 pub fn openIn(dir: pf.Directory, path: []const u8) !Manifest {
-    var file = try pf.openIn(dir, path, .{ .mode = .read_write });
+    return openInMode(dir, path, .read_write);
+}
+
+pub fn openInMode(dir: pf.Directory, path: []const u8, mode: pf.OpenMode) !Manifest {
+    if (mode == .create_read_write) return error.InvalidArgument;
+    var file = try pf.openIn(dir, path, .{ .mode = mode });
     errdefer pf.close(&file);
     return load(file);
 }

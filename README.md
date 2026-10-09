@@ -25,8 +25,8 @@ This repository ships two independently usable layers for engine and runtime dat
 ### Current limitations
 
 - `zstd` is not implemented; pack creation and reading reject it with `UnsupportedFeature`.
-- The public C ABI covers read/mount and polling-style patch application. Pack building and diffing are available through the Zig library APIs and tools, not as C calls.
-- `db_context_t.file_ops` is declared by `libdb`, but custom file backends are not implemented. The supported pack storage path uses platform IO.
+- The public C ABI covers synchronous/asynchronous reads, ordered batches, prefetch, diagnostics, mount and polling-style patch application. Pack building and diffing are available through the Zig library APIs and tools, not as C calls.
+- `db_context_t.file_ops` is implemented. VFS Zig options support readonly custom mounts; the public VFS C API keeps filesystem paths and no new callback vtable. Custom mounted writes/patches are unsupported. See [runtime read contracts](docs/vfs/runtime_reads.md).
 
 ## Architecture
 
@@ -211,7 +211,7 @@ The target must not be mounted while it is patched in place. An interrupted patc
 - 64-bit opaque `db_handle_t` handles. `0` is invalid; APIs report status through return values, `db_last_status()`, and `db_last_error_message()`.
 - A default stable 128-bit key hash, with an optional caller-supplied `db_context_t.hash_fn`.
 
-`db_context_t.file_ops` reserves a custom file-backend seam, but it is not implemented today: passing non-null `file_ops` returns `DB_UNSUPPORTED`. The supported storage backend is platform IO.
+`db_context_t.file_ops` supplies the existing versioned custom file backend, including positional IO and mapping capabilities. Readonly VFS Zig mounts propagate it through park/reopen; see [provider and runtime contracts](docs/vfs/runtime_reads.md). Missing capabilities return an explicit unsupported status.
 
 ### DB C ABI
 

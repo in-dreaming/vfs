@@ -60,14 +60,15 @@ pub const BaseIndex = struct {
     pub fn lookup(self: *const BaseIndex, key: fmt.Key128) !fmt.IndexInfo {
         const h = fmt.mixHash128To64(key);
         const bucket_id = bucketId(h, self.header.bucket_bits);
-        const b = try readBucket(self.bytes(), self.header.buckets_offset + @as(u64, bucket_id) * BUCKET_SIZE);
+        const b = try readBucket(self.bytes(), try tableOffset(self.header.buckets_offset, bucket_id, BUCKET_SIZE));
+        if (b.begin > self.header.entry_count or b.count > self.header.entry_count - b.begin) return error.Corruption;
         if (b.count == 0) return error.NotFound;
         const begin = b.begin;
         const end = begin + b.count;
         if (b.count <= 16) {
             var i = begin;
             while (i < end) : (i += 1) {
-                const e = try readEntry(self.bytes(), self.header.entries_offset + @as(u64, i) * ENTRY_SIZE);
+                const e = try readEntry(self.bytes(), try tableOffset(self.header.entries_offset, i, ENTRY_SIZE));
                 if (e.h == h and e.key_hi == key.hi and e.key_lo == key.lo) return e.info;
             }
             return error.NotFound;
@@ -76,12 +77,12 @@ pub const BaseIndex = struct {
         var hi = end;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            const e = try readEntry(self.bytes(), self.header.entries_offset + @as(u64, mid) * ENTRY_SIZE);
+            const e = try readEntry(self.bytes(), try tableOffset(self.header.entries_offset, mid, ENTRY_SIZE));
             if (e.h < h) lo = mid + 1 else hi = mid;
         }
         var i = lo;
         while (i < end) : (i += 1) {
-            const e = try readEntry(self.bytes(), self.header.entries_offset + @as(u64, i) * ENTRY_SIZE);
+            const e = try readEntry(self.bytes(), try tableOffset(self.header.entries_offset, i, ENTRY_SIZE));
             if (e.h != h) break;
             if (e.key_hi == key.hi and e.key_lo == key.lo) return e.info;
         }
@@ -89,15 +90,16 @@ pub const BaseIndex = struct {
     }
 
     fn bytes(self: *const BaseIndex) []const u8 {
-        return self.mapping.bytesConst()[self.view_offset..];
+        return self.mapping.bytesConst()[self.view_offset..][0..@intCast(self.header.total_size)];
     }
 };
 
 pub fn collectEntries(base: *const BaseIndex, allocator: std.mem.Allocator) ![]BuildEntry {
     const out = try allocator.alloc(BuildEntry, base.header.entry_count);
+    errdefer allocator.free(out);
     var i: u32 = 0;
     while (i < base.header.entry_count) : (i += 1) {
-        const e = try readEntry(base.bytes(), base.header.entries_offset + @as(u64, i) * ENTRY_SIZE);
+        const e = try readEntry(base.bytes(), try tableOffset(base.header.entries_offset, i, ENTRY_SIZE));
         out[i] = .{ .key = .{ .hi = e.key_hi, .lo = e.key_lo }, .info = e.info };
     }
     return out;
@@ -173,19 +175,22 @@ pub fn open(index: *const idx.IndexFile) !BaseIndex {
     if (region_id == 0) return error.NotFound;
     const region = try index.region(region_id);
     const file_len = try pf.len(index.file);
+    if (region.used_size < HEADER_SIZE or region.used_size > region.size) return error.Corruption;
+    if (region.offset > file_len or region.size > file_len - region.offset) return error.Corruption;
     var map = try pf.mmapReadonly(index.file, 0, file_len);
     errdefer pf.munmap(&map);
-    const view_offset = std.math.cast(usize, region.offset) orelse return error.InvalidArgument;
-    const used_size = std.math.cast(usize, region.used_size) orelse return error.InvalidArgument;
-    if (view_offset + used_size > map.bytesConst().len) return error.Corruption;
+    const view_offset = std.math.cast(usize, region.offset) orelse return error.Corruption;
+    const used_size = std.math.cast(usize, region.used_size) orelse return error.Corruption;
+    if (view_offset > map.bytesConst().len or used_size > map.bytesConst().len - view_offset) return error.Corruption;
     const view = map.bytesConst()[view_offset..][0..used_size];
-    const header = try readHeader(view[0..HEADER_SIZE]);
-    try verifyBytes(view[0..header.total_size]);
+    // Validate the unsliced provider view before trusting header.total_size.
+    try verifyBytes(view);
+    const header = try readHeader(view);
     return .{ .mapping = map, .view_offset = view_offset, .header = header };
 }
 
 pub fn verify(base: *const BaseIndex) !void {
-    try verifyBytes(base.bytes()[0..base.header.total_size]);
+    try verifyBytes(base.bytes());
 }
 
 fn chooseBucketBits(n: usize) u5 {
@@ -215,19 +220,25 @@ fn verifyBytes(bytes: []const u8) !void {
     if (bytes.len < HEADER_SIZE) return error.Corruption;
     const header = try readHeader(bytes[0..HEADER_SIZE]);
     if (header.magic != MAGIC or header.version != 1 or header.header_size != HEADER_SIZE) return error.Corruption;
-    if (header.bucket_count != (@as(u32, 1) << @intCast(header.bucket_bits))) return error.Corruption;
-    if (header.total_size > bytes.len) return error.Corruption;
+    if (header.bucket_bits > 31) return error.Corruption;
+    if (header.bucket_count != (@as(u32, 1) << @as(u5, @intCast(header.bucket_bits)))) return error.Corruption;
+    if (header.total_size < HEADER_SIZE or header.total_size > bytes.len) return error.Corruption;
+    if (header.buckets_offset < HEADER_SIZE) return error.Corruption;
+    const buckets_end = try tableOffset(header.buckets_offset, header.bucket_count, BUCKET_SIZE);
+    const entries_end = try tableOffset(header.entries_offset, header.entry_count, ENTRY_SIZE);
+    if (buckets_end > header.entries_offset or header.entries_offset > header.total_size or entries_end > header.total_size) return error.Corruption;
+    const view = bytes[0..@intCast(header.total_size)];
     var expected_begin: u32 = 0;
     var b: u32 = 0;
     while (b < header.bucket_count) : (b += 1) {
-        const bucket = try readBucket(bytes, header.buckets_offset + @as(u64, b) * BUCKET_SIZE);
+        const bucket = try readBucket(view, try tableOffset(header.buckets_offset, b, BUCKET_SIZE));
         if (bucket.begin != expected_begin) return error.Corruption;
-        if (@as(u64, bucket.begin) + bucket.count > header.entry_count) return error.Corruption;
+        if (bucket.begin > header.entry_count or bucket.count > header.entry_count - bucket.begin) return error.Corruption;
         expected_begin += bucket.count;
         var prev: ?BaseEntry = null;
         var i: u32 = bucket.begin;
         while (i < bucket.begin + bucket.count) : (i += 1) {
-            const e = try readEntry(bytes, header.entries_offset + @as(u64, i) * ENTRY_SIZE);
+            const e = try readEntry(view, try tableOffset(header.entries_offset, i, ENTRY_SIZE));
             if (bucketId(e.h, header.bucket_bits) != b) return error.Corruption;
             if (prev) |p| {
                 if (p.h > e.h or (p.h == e.h and (p.key_hi > e.key_hi or (p.key_hi == e.key_hi and p.key_lo >= e.key_lo)))) return error.Corruption;
@@ -236,6 +247,11 @@ fn verifyBytes(bytes: []const u8) !void {
         }
     }
     if (expected_begin != header.entry_count) return error.Corruption;
+}
+
+fn tableOffset(base: u64, index: u64, stride: u64) !u64 {
+    const delta = std.math.mul(u64, index, stride) catch return error.Corruption;
+    return std.math.add(u64, base, delta) catch return error.Corruption;
 }
 
 fn writeHeader(dst: []u8, h: BaseIndexHeader) void {
@@ -255,6 +271,7 @@ fn writeHeader(dst: []u8, h: BaseIndexHeader) void {
 }
 
 fn readHeader(src: []const u8) !BaseIndexHeader {
+    if (src.len < HEADER_SIZE) return error.Corruption;
     var tmp: [HEADER_SIZE]u8 = undefined;
     @memcpy(&tmp, src[0..HEADER_SIZE]);
     const stored = fmt.readU32Le(tmp[48..52]);
@@ -285,7 +302,7 @@ fn writeBucket(dst: []u8, b: BaseBucket) void {
 }
 
 fn readBucket(bytes: []const u8, off: u64) !BaseBucket {
-    if (off + BUCKET_SIZE > bytes.len) return error.Corruption;
+    if (off > bytes.len or BUCKET_SIZE > bytes.len - off) return error.Corruption;
     const s = bytes[@intCast(off)..][0..BUCKET_SIZE];
     var tmp: [BUCKET_SIZE]u8 = undefined;
     @memcpy(&tmp, s);
@@ -311,7 +328,7 @@ fn writeEntry(dst: []u8, e: BaseEntry) void {
 }
 
 fn readEntry(bytes: []const u8, off: u64) !BaseEntry {
-    if (off + ENTRY_SIZE > bytes.len) return error.Corruption;
+    if (off > bytes.len or ENTRY_SIZE > bytes.len - off) return error.Corruption;
     const s = bytes[@intCast(off)..][0..ENTRY_SIZE];
     return .{
         .h = fmt.readU64Le(s[0..8]),
@@ -363,4 +380,88 @@ test "base index builds into index db region and mmap lookup works" {
 
     var dup = [_]BuildEntry{ entries[0], entries[0] };
     try testing.expectError(error.DuplicateKey, build(&index, testing.allocator, &dup));
+}
+
+test "base index corrupt provider metadata returns errors and releases mappings" {
+    const memory = @import("../platform/inmemory_file_ops.zig");
+    const Tracker = struct {
+        var original: pf.CustomFileOps = undefined;
+        var active: usize = 0;
+        var total: usize = 0;
+
+        fn map(file: ?*anyopaque, offset: u64, size: u64, flags: u32, mapping: *?*anyopaque, data: *?*anyopaque, out_size: *u64) callconv(.c) c_int {
+            const status = original.mmap.?(file, offset, size, flags, mapping, data, out_size);
+            if (status == 0) {
+                active += 1;
+                total += 1;
+            }
+            return status;
+        }
+
+        fn unmap(mapping: ?*anyopaque) callconv(.c) c_int {
+            active -= 1;
+            return original.munmap.?(mapping);
+        }
+
+        fn setUsedSize(index: *idx.IndexFile, region_id: u32, used_size: u64) !void {
+            const offset = idx.REGION_DIR_OFFSET + @as(u64, region_id) * idx.REGION_DESC_SIZE;
+            var bytes: [idx.REGION_DESC_SIZE]u8 = undefined;
+            if (try pf.preadAll(index.file, offset, &bytes) != bytes.len) return error.Corruption;
+            fmt.writeU64Le(bytes[32..40], used_size);
+            fmt.writeU32Le(bytes[48..52], 0);
+            fmt.writeU32Le(bytes[48..52], fmt.crc32c(&bytes));
+            try pf.pwriteAll(index.file, offset, &bytes);
+        }
+    };
+    var fs = memory.FileSystem.init(std.testing.allocator, false);
+    defer fs.deinit();
+    const raw = fs.rawOps();
+    const ops = try pf.customOpsFromRaw(&raw);
+    var index = try idx.createIn(.fromCustom("zig-cache-base-bounds-memory", ops), "index.db", [_]u8{0} ** 16);
+    defer index.close() catch {};
+    const region_id = try build(&index, std.testing.allocator, &.{});
+    const region = try index.region(region_id);
+    var original_bytes: [HEADER_SIZE]u8 = undefined;
+    try std.testing.expectEqual(original_bytes.len, try pf.preadAll(index.file, region.offset, &original_bytes));
+    const header = try readHeader(&original_bytes);
+    Tracker.original = ops;
+    Tracker.active = 0;
+    Tracker.total = 0;
+    index.file.custom_ops.?.mmap = Tracker.map;
+    index.file.custom_ops.?.munmap = Tracker.unmap;
+
+    for ([_]u64{ 0, HEADER_SIZE - 1, region.size + 1, std.math.maxInt(u64) }) |used_size| {
+        try Tracker.setUsedSize(&index, region_id, used_size);
+        try std.testing.expectError(error.Corruption, open(&index));
+        try std.testing.expectEqual(@as(usize, 0), Tracker.active);
+        if (used_size > region.size) try std.testing.expectError(error.Corruption, idx.verify(&index));
+    }
+    try Tracker.setUsedSize(&index, region_id, region.used_size);
+
+    var malformed = [_]BaseIndexHeader{header} ** 8;
+    malformed[0].total_size = std.math.maxInt(u64);
+    malformed[1].total_size = HEADER_SIZE - 1;
+    malformed[2].bucket_bits = 32;
+    malformed[3].bucket_bits = std.math.maxInt(u32);
+    malformed[4].buckets_offset = std.math.maxInt(u64);
+    malformed[5].entries_offset = std.math.maxInt(u64);
+    malformed[5].entry_count = 1;
+    malformed[6].header_size = HEADER_SIZE - 1;
+    malformed[7].entry_count = std.math.maxInt(u32);
+    for (malformed) |bad| {
+        var bytes: [HEADER_SIZE]u8 = undefined;
+        @memset(&bytes, 0);
+        writeHeader(&bytes, bad); // Every malformed header has a valid checksum.
+        try pf.pwriteAll(index.file, region.offset, &bytes);
+        try std.testing.expectError(error.Corruption, open(&index));
+        try std.testing.expectEqual(@as(usize, 0), Tracker.active);
+    }
+    try std.testing.expect(Tracker.total >= malformed.len);
+    try pf.pwriteAll(index.file, region.offset, &original_bytes);
+    var valid = try open(&index);
+    try std.testing.expectEqual(@as(usize, 1), Tracker.active);
+    valid.close();
+    try std.testing.expectEqual(@as(usize, 0), Tracker.active);
+    try std.testing.expectError(error.Corruption, readBucket(&original_bytes, std.math.maxInt(u64)));
+    try std.testing.expectError(error.Corruption, readEntry(&original_bytes, std.math.maxInt(u64)));
 }

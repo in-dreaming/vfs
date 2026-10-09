@@ -16,6 +16,9 @@ pub const Stat = struct {
 };
 
 pub const OpenOptions = struct {
+    /// Borrowed callback context; it must outlive the reader, including park /
+    /// reopen. The pack path is an opaque provider root when this is non-null.
+    file_ops: ?db_internal.platform.file.CustomFileOps = null,
     /// Extra read-only OS handles on the data file so concurrent page reads
     /// are not serialized by the kernel on one file object (Windows).
     read_handles: u8 = DEFAULT_READ_HANDLES,
@@ -36,7 +39,7 @@ pub const PackReader = struct {
     }
 
     pub fn openWithOptions(allocator: std.mem.Allocator, pack_path: []const u8, options: OpenOptions) !PackReader {
-        var db = try kv.KvDb.open(pack_path, .{ .mode = .read_only, .create_if_missing = false, .read_handles = options.read_handles });
+        var db = try kv.KvDb.open(pack_path, .{ .mode = .read_only, .create_if_missing = false, .read_handles = options.read_handles, .file_ops = options.file_ops });
         errdefer db.close() catch {};
         const manifest_bytes = try readObjectFromDb(&db, allocator, object_key.packManifestKey());
         defer allocator.free(manifest_bytes);
@@ -179,4 +182,115 @@ test "pack reader rejects CRC-valid malformed path index at open" {
         try writer.close();
     }
     try std.testing.expectError(error.Corruption, PackReader.open(allocator, pack_path));
+}
+
+test "pack reader readonly custom backend short reads and opaque root reopen" {
+    const builder = @import("../build/pack_builder.zig");
+    const backend_mod = @import("backend_test_support.zig");
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const parent_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(parent_path);
+    const pack_path = try std.fs.path.join(allocator, &.{ parent_path, "pack" });
+    defer allocator.free(pack_path);
+    const source_path = try std.fs.path.join(allocator, &.{ parent_path, "source" });
+    defer allocator.free(source_path);
+    try builder.writeSourceFileForTest(source_path, "provider-only-payload");
+    try builder.createPack(pack_path, &.{.{ .source_path = source_path, .virtual_path = "/custom.bin", .file_entry = 991, .page_size = 7 }}, .{});
+    {
+        var native = try kv.KvDb.open(pack_path, .{});
+        defer native.close() catch {};
+        try native.checkpoint();
+    }
+
+    var backend = backend_mod.ReadOnlyBackend.init(allocator);
+    defer backend.deinit();
+    const root = "memory-provider/opaque/../root";
+    try backend.importPack(pack_path, root);
+    const corrupt_root = "memory-provider/corrupt";
+    try backend.importPack(pack_path, corrupt_root);
+    var corrupt_manifest = try db_internal.platform.file.openIn(.fromCustom(corrupt_root, backend.memoryOps()), "manifest.db", .{ .mode = .read_write });
+    try db_internal.platform.file.pwriteAll(corrupt_manifest, 0, "BAD!");
+    db_internal.platform.file.close(&corrupt_manifest);
+    try tmp.dir.deleteTree(io, "pack");
+
+    var reader = try PackReader.openWithOptions(allocator, root, .{ .file_ops = backend.ops() });
+    var closed = false;
+    defer if (!closed) reader.close(allocator);
+    const index_bytes = reader.path_index.ptr;
+    try std.testing.expectEqual(@as(u64, 991), try reader.resolvePath(allocator, "custom.bin"));
+    const native_stat = try reader.statEntry(allocator, 991);
+    try std.testing.expectEqual(@as(u64, 21), native_stat.size);
+    try std.testing.expect(backend.read_count > 3);
+    try std.testing.expectEqual(@as(usize, 3), backend.live_handles);
+    for (0..3) |_| {
+        try reader.park();
+        try std.testing.expectEqual(@as(usize, 0), backend.live_handles);
+        try std.testing.expectEqual(@as(usize, 0), backend.live_mappings);
+        backend.fail_open = true;
+        try std.testing.expectError(error.IoError, reader.ensureReady());
+        try std.testing.expect(!reader.isReady());
+        backend.fail_open = false;
+        const record_reads_before_reopen = backend.record_read_count;
+        try reader.ensureReady();
+        // Reopen must not recovery-scan records outside bounded worker scratch.
+        try std.testing.expectEqual(record_reads_before_reopen, backend.record_read_count);
+        try std.testing.expectEqual(index_bytes, reader.path_index_view.bytes.ptr);
+        try std.testing.expectEqual(@as(u64, 991), try reader.resolvePath(allocator, "/custom.bin"));
+        const page = try reader.readPageAlloc(allocator, 991, 0, 0);
+        defer allocator.free(page);
+        const decoded = try page_value_fmt.decodePageValue(page, .{ .file_entry = 991, .block_index = 0, .page_index = 0 });
+        try std.testing.expectEqualStrings("provide", decoded.payload);
+    }
+    reader.close(allocator);
+    closed = true;
+    try std.testing.expectEqual(backend.open_count, backend.close_count);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutation_count);
+
+    try std.testing.expectError(error.Corruption, PackReader.openWithOptions(allocator, corrupt_root, .{ .file_ops = backend.ops() }));
+    try std.testing.expectEqual(@as(usize, 0), backend.live_handles);
+    backend.fail_open_after = backend.open_count + 1;
+    try std.testing.expectError(error.IoError, PackReader.openWithOptions(allocator, root, .{ .file_ops = backend.ops() }));
+    try std.testing.expectEqual(@as(usize, 0), backend.live_handles);
+    backend.fail_open_after = null;
+    var no_mapping = backend.ops();
+    no_mapping.mmap = null;
+    try std.testing.expectError(error.Unsupported, PackReader.openWithOptions(allocator, root, .{ .file_ops = no_mapping }));
+    try std.testing.expectEqual(@as(usize, 0), backend.live_handles);
+    backend.fail_read = true;
+    try std.testing.expectError(error.IoError, PackReader.openWithOptions(allocator, root, .{ .file_ops = backend.ops() }));
+    try std.testing.expectEqual(@as(usize, 0), backend.live_handles);
+    backend.fail_read = false;
+    try std.testing.expectError(error.FileNotFound, PackReader.openWithOptions(allocator, "memory-provider/missing-root", .{ .file_ops = backend.ops() }));
+    // Invalid persisted slot state is rejected without leaking a provider map.
+    const offsets = blk: {
+        var inspect = try kv.KvDb.openCustom(root, backend.memoryOps(), .{ .mode = .read_only });
+        defer inspect.close() catch {};
+        const base = try inspect.index.region(inspect.index.activeBaseRegionId());
+        break :blk .{ .slot = inspect.delta.journal.region.offset + inspect.delta.journal.header.slot_offset, .base = base.offset };
+    };
+    {
+        const pf = db_internal.platform.file;
+        const db_fmt = db_internal.format;
+        var index = try pf.openIn(.fromCustom(root, backend.memoryOps()), "index.db", .{ .mode = .read_write });
+        defer pf.close(&index);
+        var original: [64]u8 = undefined;
+        try std.testing.expectEqual(original.len, try pf.preadAll(index, offsets.base, &original));
+        var malformed = original;
+        db_fmt.writeU32Le(malformed[12..16], 32); // Invalid shift with a valid CRC.
+        db_fmt.writeU32Le(malformed[48..52], 0);
+        db_fmt.writeU32Le(malformed[48..52], db_fmt.crc32c(&malformed));
+        try pf.pwriteAll(index, offsets.base, &malformed);
+        try std.testing.expectError(error.Corruption, PackReader.openWithOptions(allocator, root, .{ .file_ops = backend.ops() }));
+        try std.testing.expectEqual(@as(usize, 0), backend.live_handles);
+        try std.testing.expectEqual(@as(usize, 0), backend.live_mappings);
+        try pf.pwriteAll(index, offsets.base, &original);
+        try pf.pwriteAll(index, offsets.slot, &.{255});
+    }
+    try std.testing.expectError(error.Corruption, PackReader.openWithOptions(allocator, root, .{ .file_ops = backend.ops() }));
+    try std.testing.expectEqual(@as(usize, 0), backend.live_handles);
+    try std.testing.expectEqual(@as(usize, 0), backend.live_mappings);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutation_count);
 }

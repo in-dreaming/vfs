@@ -150,6 +150,7 @@ pub const MappedRegion = struct {
     custom_mapping: ?*anyopaque = null,
     custom_ops: ?CustomFileOps = null,
     custom_bytes: []u8 = &.{},
+    writable: bool = false,
 
     pub fn bytes(self: *MappedRegion) []u8 {
         if (self.map) |*map| return map.memory;
@@ -216,7 +217,9 @@ fn openCustom(root: []const u8, ops: CustomFileOps, path: []const u8, options: O
     const joined = if (root.len == 0)
         try std.heap.smp_allocator.dupe(u8, path)
     else
-        try std.fs.path.join(std.heap.smp_allocator, &.{ root, path });
+        // Provider roots are opaque identifiers, not filesystem paths. Preserve
+        // every root byte and use a platform-independent leaf separator.
+        try std.mem.concat(std.heap.smp_allocator, u8, &.{ root, "/", path });
     defer std.heap.smp_allocator.free(joined);
     const flags: u32 = switch (options.mode) {
         .read_only => OPEN_FLAG_READ_ONLY,
@@ -228,7 +231,10 @@ fn openCustom(root: []const u8, ops: CustomFileOps, path: []const u8, options: O
     _ = options.direct_io;
     _ = options.create_parent_dirs;
     var out_file: ?*anyopaque = null;
-    try statusToError(ops.open(ops.user_data, joined.ptr, joined.len, flags, &out_file));
+    statusToError(ops.open(ops.user_data, joined.ptr, joined.len, flags, &out_file)) catch |err| {
+        if (out_file) |handle| _ = ops.close(handle);
+        return err;
+    };
     return .{ .native = null, .custom = out_file orelse return error.IoError, .custom_ops = ops, .writable = options.mode != .read_only };
 }
 
@@ -248,35 +254,53 @@ pub fn pread(file: FileHandle, offset: u64, dst: []u8) !usize {
     // may pread the same OS handle. The Io implementation is used only as the
     // syscall adapter; fileReadPositional ignores the single-threaded scheduler.
     if (file.custom) |custom| {
+        _ = std.math.add(u64, offset, dst.len) catch return error.InvalidArgument;
         const ops = file.custom_ops orelse return error.InvalidArgument;
         var got: u64 = 0;
         try statusToError(ops.read_at(custom, offset, dst.ptr, dst.len, &got));
-        return std.math.cast(usize, got) orelse error.InvalidArgument;
+        if (got > dst.len) return error.IoError;
+        return @intCast(got);
     }
     return (try file.file()).readPositional(defaultIo(), &.{dst}, offset);
 }
 
 pub fn preadAll(file: FileHandle, offset: u64, dst: []u8) !usize {
     if (file.custom != null) {
-        return pread(file, offset, dst);
+        _ = std.math.add(u64, offset, dst.len) catch return error.InvalidArgument;
+        var total: usize = 0;
+        while (total < dst.len) {
+            const got = try pread(file, offset + total, dst[total..]);
+            if (got == 0) break;
+            total += got;
+        }
+        return total;
     }
     return (try file.file()).readPositionalAll(defaultIo(), dst, offset);
 }
 
 pub fn pwrite(file: FileHandle, offset: u64, src: []const u8) !usize {
+    if (!file.writable) return error.AccessDenied;
     if (file.custom) |custom| {
+        _ = std.math.add(u64, offset, src.len) catch return error.InvalidArgument;
         const ops = file.custom_ops orelse return error.InvalidArgument;
         var wrote: u64 = 0;
         try statusToError(ops.write_at(custom, offset, src.ptr, src.len, &wrote));
-        return std.math.cast(usize, wrote) orelse error.InvalidArgument;
+        if (wrote > src.len) return error.IoError;
+        return @intCast(wrote);
     }
     return (try file.file()).writePositional(defaultIo(), &.{src}, offset);
 }
 
 pub fn pwriteAll(file: FileHandle, offset: u64, src: []const u8) !void {
+    if (!file.writable) return error.AccessDenied;
     if (file.custom != null) {
-        const wrote = try pwrite(file, offset, src);
-        if (wrote != src.len) return error.IoError;
+        _ = std.math.add(u64, offset, src.len) catch return error.InvalidArgument;
+        var total: usize = 0;
+        while (total < src.len) {
+            const wrote = try pwrite(file, offset + total, src[total..]);
+            if (wrote == 0) return error.IoError;
+            total += wrote;
+        }
         return;
     }
     try (try file.file()).writePositionalAll(defaultIo(), src, offset);
@@ -286,7 +310,7 @@ pub fn pwritevAll(file: FileHandle, offset: u64, vecs: []const IoVec) !void {
     var at = offset;
     for (vecs) |vec| {
         try pwriteAll(file, at, vec.data);
-        at += vec.data.len;
+        at = std.math.add(u64, at, vec.data.len) catch return error.InvalidArgument;
     }
 }
 
@@ -301,6 +325,7 @@ pub fn len(file: FileHandle) !u64 {
 }
 
 pub fn setLen(file: FileHandle, new_len: u64) !void {
+    if (!file.writable) return error.AccessDenied;
     if (file.custom) |custom| {
         const ops = file.custom_ops orelse return error.InvalidArgument;
         return statusToError(ops.set_size(custom, new_len));
@@ -309,6 +334,7 @@ pub fn setLen(file: FileHandle, new_len: u64) !void {
 }
 
 pub fn preallocate(file: FileHandle, offset: u64, size: u64) !void {
+    if (!file.writable) return error.AccessDenied;
     if (file.custom) |custom| {
         const ops = file.custom_ops orelse return error.InvalidArgument;
         if (ops.preallocate) |f| return statusToError(f(custom, offset, size));
@@ -323,6 +349,7 @@ pub fn preallocate(file: FileHandle, offset: u64, size: u64) !void {
 /// Io abstraction currently exposes a conservative file sync; callers that
 /// need durable file length after extension should call flushMetadata as well.
 pub fn flushData(file: FileHandle) !void {
+    if (!file.writable) return error.AccessDenied;
     if (file.custom) |custom| {
         const ops = file.custom_ops orelse return error.InvalidArgument;
         return statusToError(ops.sync(custom, SYNC_DATA));
@@ -334,6 +361,7 @@ pub fn flushData(file: FileHandle) !void {
 /// flushData so DB sync paths have a portable way to make extended length
 /// durable before publishing dependent metadata.
 pub fn flushMetadata(file: FileHandle) !void {
+    if (!file.writable) return error.AccessDenied;
     if (file.custom) |custom| {
         const ops = file.custom_ops orelse return error.InvalidArgument;
         return statusToError(ops.sync(custom, SYNC_METADATA));
@@ -363,6 +391,7 @@ pub fn mmapReadonly(file: FileHandle, offset: u64, size: u64) !MappedRegion {
 }
 
 pub fn mmapReadWrite(file: FileHandle, offset: u64, size: u64) !MappedRegion {
+    if (!file.writable) return error.AccessDenied;
     if (file.custom) |custom| return mmapCustom(file, custom, offset, size, MMAP_FLAG_WRITE);
     const map_len = std.math.cast(usize, size) orelse return error.InvalidArgument;
     var map = try (try file.file()).createMemoryMap(defaultIo(), .{
@@ -371,23 +400,37 @@ pub fn mmapReadWrite(file: FileHandle, offset: u64, size: u64) !MappedRegion {
         .protection = .{ .read = true, .write = true, .execute = false },
     });
     try map.read(defaultIo());
-    return .{ .map = map };
+    return .{ .map = map, .writable = true };
 }
 
 fn mmapCustom(file: FileHandle, custom: *anyopaque, offset: u64, size: u64, flags: u32) !MappedRegion {
     const ops = file.custom_ops orelse return error.InvalidArgument;
     const mmap_fn = ops.mmap orelse return error.Unsupported;
-    if (ops.msync == null or ops.munmap == null) return error.Unsupported;
+    const unmap_fn = ops.munmap orelse return error.Unsupported;
+    const writable = (flags & MMAP_FLAG_WRITE) != 0;
+    if (writable and ops.msync == null) return error.Unsupported;
+    const requested = std.math.cast(usize, size) orelse return error.InvalidArgument;
+    _ = std.math.add(u64, offset, size) catch return error.InvalidArgument;
     var mapping: ?*anyopaque = null;
     var data: ?*anyopaque = null;
     var data_len: u64 = 0;
-    try statusToError(mmap_fn(custom, offset, size, flags, &mapping, &data, &data_len));
-    const n = std.math.cast(usize, data_len) orelse return error.InvalidArgument;
+    const status = mmap_fn(custom, offset, size, flags, &mapping, &data, &data_len);
+    const handle = mapping orelse data;
+    errdefer if (handle) |h| {
+        _ = unmap_fn(h);
+    };
+    try statusToError(status);
+    // Providers may map a larger region, but the caller's view is exactly the
+    // requested range. Never manufacture a slice from a short/null mapping.
+    if (data_len < size) return error.IoError;
     const ptr = data orelse return error.IoError;
-    return .{ .custom_mapping = mapping orelse ptr, .custom_ops = ops, .custom_bytes = @as([*]u8, @ptrCast(ptr))[0..n] };
+    const address = @intFromPtr(ptr);
+    _ = std.math.add(usize, address, requested) catch return error.IoError;
+    return .{ .custom_mapping = handle, .custom_ops = ops, .custom_bytes = @as([*]u8, @ptrCast(ptr))[0..requested], .writable = writable };
 }
 
 pub fn msync(region: *MappedRegion) !void {
+    if (!region.writable) return error.AccessDenied;
     if (region.map) |*map| return map.write(defaultIo());
     const ops = region.custom_ops orelse return error.InvalidArgument;
     const f = ops.msync orelse return error.Unsupported;
@@ -537,4 +580,146 @@ test "opaque callback conversion validates target function alignment" {
     try std.testing.expectError(error.InvalidArgument, rawCallback(AlignedFn, @ptrFromInt(0x1001)));
     const aligned = try rawCallback(AlignedFn, @ptrFromInt(0x1000));
     try std.testing.expectEqual(@as(usize, 0x1000), @intFromPtr(aligned));
+}
+
+const CallbackProbe = struct {
+    bytes: [32]u8 = [_]u8{0} ** 32,
+    size: usize = 0,
+    max_transfer: usize = 3,
+    oversize_count: bool = false,
+    zero_write: bool = false,
+    short_mapping: bool = false,
+    null_mapping_data: bool = false,
+    unmaps: usize = 0,
+    writes: usize = 0,
+
+    fn ops(self: *CallbackProbe) CustomFileOps {
+        return .{ .user_data = self, .open = openFn, .close = closeFn, .read_at = readFn, .write_at = writeFn, .get_size = sizeFn, .set_size = resizeFn, .sync = syncFn, .preallocate = null, .mmap = mapFn, .msync = null, .munmap = unmapFn };
+    }
+
+    fn from(handle: ?*anyopaque) *CallbackProbe {
+        return @ptrCast(@alignCast(handle.?));
+    }
+
+    fn openFn(user: ?*anyopaque, _: [*]const u8, _: u64, _: u32, out: *?*anyopaque) callconv(.c) c_int {
+        out.* = user;
+        return 0;
+    }
+
+    fn closeFn(_: ?*anyopaque) callconv(.c) c_int {
+        return 0;
+    }
+
+    fn readFn(handle: ?*anyopaque, offset: u64, dst: ?*anyopaque, count: u64, out: *u64) callconv(.c) c_int {
+        const self = from(handle);
+        if (self.oversize_count) {
+            out.* = count + 1;
+            return 0;
+        }
+        if (offset >= self.size) {
+            out.* = 0;
+            return 0;
+        }
+        const n = @min(count, self.max_transfer, self.size - @as(usize, @intCast(offset)));
+        @memcpy(@as([*]u8, @ptrCast(dst.?))[0..n], self.bytes[@intCast(offset)..][0..n]);
+        out.* = n;
+        return 0;
+    }
+
+    fn writeFn(handle: ?*anyopaque, offset: u64, src: ?*const anyopaque, count: u64, out: *u64) callconv(.c) c_int {
+        const self = from(handle);
+        self.writes += 1;
+        if (self.oversize_count or self.zero_write) {
+            out.* = if (self.zero_write) 0 else count + 1;
+            return 0;
+        }
+        if (offset >= self.bytes.len) return 8;
+        const n = @min(count, self.max_transfer, self.bytes.len - @as(usize, @intCast(offset)));
+        @memcpy(self.bytes[@intCast(offset)..][0..n], @as([*]const u8, @ptrCast(src.?))[0..n]);
+        self.size = @max(self.size, @as(usize, @intCast(offset)) + @as(usize, @intCast(n)));
+        out.* = n;
+        return 0;
+    }
+
+    fn sizeFn(handle: ?*anyopaque, out: *u64) callconv(.c) c_int {
+        out.* = from(handle).size;
+        return 0;
+    }
+
+    fn resizeFn(handle: ?*anyopaque, size: u64) callconv(.c) c_int {
+        if (size > from(handle).bytes.len) return 8;
+        from(handle).size = @intCast(size);
+        return 0;
+    }
+
+    fn syncFn(_: ?*anyopaque, _: u32) callconv(.c) c_int {
+        return 10;
+    }
+
+    fn mapFn(handle: ?*anyopaque, offset: u64, size: u64, _: u32, mapping: *?*anyopaque, data: *?*anyopaque, out: *u64) callconv(.c) c_int {
+        const self = from(handle);
+        if (offset > self.bytes.len or size > self.bytes.len - offset) return 2;
+        mapping.* = self;
+        data.* = if (self.null_mapping_data) null else self.bytes[@intCast(offset)..].ptr;
+        out.* = if (self.short_mapping) size - 1 else size;
+        return 0;
+    }
+
+    fn unmapFn(handle: ?*anyopaque) callconv(.c) c_int {
+        from(handle).unmaps += 1;
+        return 0;
+    }
+};
+
+test "custom positional IO loops short transfers and validates provider counts" {
+    var probe = CallbackProbe{};
+    var file = try openIn(.fromCustom("opaque://root/../pack", probe.ops()), "leaf", .{ .mode = .read_write });
+    defer close(&file);
+    try pwriteAll(file, 0, "short-transfers");
+    try std.testing.expect(probe.writes > 1);
+    var out: [20]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 15), try preadAll(file, 0, &out));
+    try std.testing.expectEqualStrings("short-transfers", out[0..15]);
+    probe.oversize_count = true;
+    try std.testing.expectError(error.IoError, preadAll(file, 0, &out));
+    try std.testing.expectError(error.IoError, pwriteAll(file, 0, "bad"));
+    probe.oversize_count = false;
+    probe.zero_write = true;
+    try std.testing.expectError(error.IoError, pwriteAll(file, 0, "zero"));
+    try std.testing.expectError(error.InvalidArgument, preadAll(file, std.math.maxInt(u64), &out));
+    try std.testing.expectError(error.InvalidArgument, pwriteAll(file, std.math.maxInt(u64), "overflow"));
+}
+
+test "custom readonly handles prevent mutations and require only read mapping capabilities" {
+    var probe = CallbackProbe{};
+    var file = try openIn(.fromCustom("root", probe.ops()), "leaf", .{ .mode = .read_only });
+    defer close(&file);
+    try std.testing.expectError(error.AccessDenied, pwrite(file, 0, "x"));
+    try std.testing.expectError(error.AccessDenied, pwriteAll(file, 0, "x"));
+    try std.testing.expectError(error.AccessDenied, setLen(file, 1));
+    try std.testing.expectError(error.AccessDenied, preallocate(file, 0, 1));
+    try std.testing.expectError(error.AccessDenied, mmapReadWrite(file, 0, 1));
+    try std.testing.expectError(error.AccessDenied, flushData(file));
+    try std.testing.expectError(error.AccessDenied, flushMetadata(file));
+    var mapping = try mmapReadonly(file, 0, 1);
+    try std.testing.expectError(error.AccessDenied, msync(&mapping));
+    munmap(&mapping);
+    try std.testing.expectEqual(@as(usize, 1), probe.unmaps);
+    try std.testing.expectEqual(@as(usize, 0), probe.writes);
+    file.custom_ops.?.mmap = null;
+    try std.testing.expectError(error.Unsupported, mmapReadonly(file, 0, 1));
+}
+
+test "custom malformed mappings release provider resources" {
+    var probe = CallbackProbe{ .short_mapping = true };
+    var file = try openIn(.fromCustom("root", probe.ops()), "leaf", .{ .mode = .read_write });
+    defer close(&file);
+    try std.testing.expectError(error.IoError, mmapReadonly(file, 0, 4));
+    probe.short_mapping = false;
+    probe.null_mapping_data = true;
+    try std.testing.expectError(error.IoError, mmapReadonly(file, 0, 4));
+    try std.testing.expectEqual(@as(usize, 2), probe.unmaps);
+    try std.testing.expectError(error.Unsupported, mmapReadWrite(file, 0, 4));
+    file.custom_ops.?.munmap = null;
+    try std.testing.expectError(error.Unsupported, mmapReadonly(file, 0, 4));
 }

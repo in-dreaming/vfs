@@ -5,6 +5,7 @@ const volume_mod = @import("volume/volume.zig");
 const file_mod = @import("io/file_handle.zig");
 const patch_mod = @import("patch/root.zig");
 const task_sched = @import("task/scheduler.zig");
+const reads = @import("io/read_requests.zig");
 
 pub const vfs_open_options_t = extern struct {
     struct_size: u32,
@@ -14,6 +15,11 @@ pub const vfs_open_options_t = extern struct {
     max_open_stores: u32 = 0,
     /// Extra read-only OS handles per pack data file; 0 = default.
     read_handles: u32 = 0,
+    read_workers: u32 = 0,
+    max_requests: u32 = 0,
+    max_ranges_per_request: u32 = 0,
+    reserved: u32 = 0,
+    read_scratch_bytes: u64 = 0,
 };
 
 pub const vfs_stat_t = extern struct {
@@ -64,6 +70,11 @@ fn optionsFromC(options: ?*const vfs_open_options_t) !volume_mod.OpenOptions {
     if (opts.struct_size >= @offsetOf(vfs_open_options_t, "read_handles") + @sizeOf(u32) and opts.read_handles != 0) {
         out.read_handles = std.math.cast(u8, opts.read_handles) orelse return error.InvalidArgument;
     }
+    inline for (.{ .{ "read_workers", "workers" }, .{ "max_requests", "max_requests" }, .{ "max_ranges_per_request", "max_ranges" } }) |names| {
+        if (opts.struct_size >= @offsetOf(vfs_open_options_t, names[0]) + @sizeOf(u32) and @field(opts, names[0]) != 0) @field(out.reads, names[1]) = @field(opts, names[0]);
+    }
+    if (opts.struct_size >= @offsetOf(vfs_open_options_t, "read_scratch_bytes") + @sizeOf(u64) and opts.read_scratch_bytes != 0) out.reads.scratch_bytes = std.math.cast(usize, opts.read_scratch_bytes) orelse return error.InvalidArgument;
+    try out.reads.validate();
     return out;
 }
 
@@ -208,6 +219,169 @@ fn fillStat(out: *vfs_stat_t, requested: u32, st: @import("pack/pack_reader.zig"
     const full: vfs_stat_t = .{ .struct_size = requested, .flags = 0, .file_entry = st.file_entry, .size = st.size, .page_size = st.page_size, .reserved0 = 0 };
     const n = @min(@as(usize, requested), @sizeOf(vfs_stat_t));
     @memcpy(@as([*]u8, @ptrCast(out))[0..n], std.mem.asBytes(&full)[0..n]);
+}
+
+// ---- bounded polling read requests -----------------------------------------
+pub const vfs_read_range_t = reads.Range;
+pub const vfs_read_options_t = extern struct { struct_size: u32, flags: u32, priority: i32 = 0, reserved: u32 = 0 };
+pub const vfs_request_progress_t = extern struct { struct_size: u32, state: u32, ranges_total: u32, ranges_done: u32, bytes_read: u64, last_status: i32, reserved: u32 = 0 };
+pub const vfs_read_result_t = extern struct { struct_size: u32, state: u32, bytes_read: u64, last_status: i32, reserved: u32 = 0 };
+pub const vfs_stats_t = extern struct {
+    struct_size: u32,
+    flags: u32 = 0,
+    cache_hits: u64,
+    cache_misses: u64,
+    cache_coalesced: u64,
+    cache_evictions: u64,
+    cache_resident_bytes: u64,
+    cache_allocated_bytes: u64,
+    cache_peak_bytes: u64,
+    cache_inflight_bytes: u64,
+    cache_pinned_bytes: u64,
+    cache_evicted_pinned_bytes: u64,
+    requests_queued: u64,
+    requests_running: u64,
+    requests_retained: u64,
+    requests_completed: u64,
+    requests_failed: u64,
+    requests_cancelled: u64,
+    requests_rejected: u64,
+    bytes_read: u64,
+    bytes_prefetched: u64,
+    open_stores: u64,
+    cache_limit_bytes: u64,
+    scratch_limit_per_worker: u64,
+    worker_limit: u32,
+    request_limit: u32,
+    ranges_limit: u32,
+    backend: u32,
+    scratch_retained_bytes: u64,
+    scratch_peak_worker_bytes: u64,
+};
+
+fn readPriority(options: ?*const vfs_read_options_t, prefetch: bool) !i32 {
+    const o = options orelse return if (prefetch) -1 else 0;
+    if (o.struct_size < 8 or o.flags != 0) return error.InvalidArgument;
+    return if (o.struct_size >= @offsetOf(vfs_read_options_t, "priority") + 4) o.priority else if (prefetch) -1 else 0;
+}
+
+fn submitRead(file: u64, ranges: []const reads.Range, options: ?*const vfs_read_options_t, prefetch: bool, out_request: ?*u64) c_int {
+    const out = out_request orelse return setError(error.InvalidArgument);
+    out.* = 0;
+    const priority = readPriority(options, prefetch) catch |e| return setError(e);
+    const retained = registry.acquire(file_mod.FileHandle, file, .file) catch |e| return setError(e);
+    defer retained.release();
+    const pool = retained.ptr.volume.readExecutor() catch |e| return setError(e);
+    out.* = pool.submit(retained, ranges, priority, prefetch) catch |e| return setError(e);
+    return setOk();
+}
+
+pub export fn vfs_read_async(file: u64, offset: u64, dst: ?*anyopaque, size: u64, options: ?*const vfs_read_options_t, out_request: ?*u64) c_int {
+    return submitRead(file, &.{.{ .offset = offset, .dst = dst, .size = size }}, options, false, out_request);
+}
+pub export fn vfs_read_batch_async(file: u64, ranges: ?[*]const vfs_read_range_t, count: u32, options: ?*const vfs_read_options_t, out_request: ?*u64) c_int {
+    if (out_request) |out| out.* = 0;
+    const items = ranges orelse return setError(error.InvalidArgument);
+    if (count == 0) return setError(error.InvalidArgument);
+    return submitRead(file, items[0..count], options, false, out_request);
+}
+pub export fn vfs_prefetch_async(file: u64, offset: u64, size: u64, options: ?*const vfs_read_options_t, out_request: ?*u64) c_int {
+    return submitRead(file, &.{.{ .offset = offset, .dst = null, .size = size }}, options, true, out_request);
+}
+
+fn outputPrefix(comptime T: type, out: *T, value: *const T) void {
+    const n = @min(@as(usize, out.struct_size), @sizeOf(T));
+    @memcpy(@as([*]u8, @ptrCast(out))[0..n], std.mem.asBytes(value)[0..n]);
+}
+
+pub export fn vfs_request_poll(request: u64, output: ?*vfs_request_progress_t) c_int {
+    const out = output orelse return setError(error.InvalidArgument);
+    if (out.struct_size < 8) return setError(error.InvalidArgument);
+    const lease = registry.acquire(reads.Request, request, .request) catch |e| return setError(e);
+    defer lease.release();
+    const p = lease.ptr.snapshot();
+    const full: vfs_request_progress_t = .{ .struct_size = out.struct_size, .state = @intFromEnum(p.state), .ranges_total = p.ranges_total, .ranges_done = p.ranges_done, .bytes_read = p.bytes, .last_status = err.code(p.status) };
+    outputPrefix(vfs_request_progress_t, out, &full);
+    return setOk();
+}
+pub export fn vfs_request_result(request: u64, index: u32, output: ?*vfs_read_result_t) c_int {
+    const out = output orelse return setError(error.InvalidArgument);
+    if (out.struct_size < 8) return setError(error.InvalidArgument);
+    const lease = registry.acquire(reads.Request, request, .request) catch |e| return setError(e);
+    defer lease.release();
+    const r = lease.ptr.result(index) catch |e| return setError(e);
+    const full: vfs_read_result_t = .{ .struct_size = out.struct_size, .state = @intFromEnum(r.state), .bytes_read = r.bytes, .last_status = err.code(r.status) };
+    outputPrefix(vfs_read_result_t, out, &full);
+    return setOk();
+}
+pub export fn vfs_request_wait(request: u64, timeout_ms: u32) c_int {
+    const deadline = task_sched.nowNs() + @as(i128, timeout_ms) * std.time.ns_per_ms;
+    while (true) {
+        const lease = registry.acquire(reads.Request, request, .request) catch |e| return setError(e);
+        const finished = reads.terminal(lease.ptr.snapshot().state);
+        lease.release();
+        if (finished) return setOk();
+        if (task_sched.nowNs() >= deadline) return setError(error.Busy);
+        task_sched.sleepNs(500 * std.time.ns_per_us);
+    }
+}
+pub export fn vfs_request_cancel(request: u64) c_int {
+    const lease = registry.acquire(reads.Request, request, .request) catch |e| return setError(e);
+    defer lease.release();
+    lease.ptr.cancel();
+    return setOk();
+}
+pub export fn vfs_request_end(request: u64) c_int {
+    const job = registry.take(reads.Request, request, .request) catch |e| return setError(e);
+    job.destroy();
+    return setOk();
+}
+pub export fn vfs_get_stats(volume: u64, output: ?*vfs_stats_t) c_int {
+    const out = output orelse return setError(error.InvalidArgument);
+    if (out.struct_size < 8) return setError(error.InvalidArgument);
+    const lease = registry.acquire(volume_mod.Volume, volume, .volume) catch |e| return setError(e);
+    defer lease.release();
+    const v = lease.ptr;
+    // Update release clears the cache under Volume.lock. Read diagnostics
+    // must not race cache reconstruction even though normal IO is admitted.
+    v.lock.lock();
+    defer v.lock.unlock();
+    const c = v.page_cache.stats();
+    const m = v.page_cache.memoryStats();
+    const r = v.readStats();
+    const full: vfs_stats_t = .{
+        .struct_size = out.struct_size,
+        .cache_hits = c.hits,
+        .cache_misses = c.misses,
+        .cache_coalesced = c.coalesced,
+        .cache_evictions = c.evictions,
+        .cache_resident_bytes = m.resident_bytes,
+        .cache_allocated_bytes = m.allocated_bytes,
+        .cache_peak_bytes = m.peak_allocated_bytes,
+        .cache_inflight_bytes = m.inflight_bytes,
+        .cache_pinned_bytes = m.pinned_bytes,
+        .cache_evicted_pinned_bytes = m.evicted_pinned_bytes,
+        .requests_queued = r.queued,
+        .requests_running = r.running,
+        .requests_retained = r.retained,
+        .requests_completed = r.completed,
+        .requests_failed = r.failed,
+        .requests_cancelled = r.cancelled,
+        .requests_rejected = r.rejected,
+        .bytes_read = r.read_bytes,
+        .bytes_prefetched = r.prefetch_bytes,
+        .open_stores = v.readonlyReadyCountLockedForStats(),
+        .cache_limit_bytes = v.options.page_cache_bytes,
+        .scratch_limit_per_worker = v.options.reads.scratch_bytes,
+        .worker_limit = v.options.reads.workers,
+        .request_limit = v.options.reads.max_requests,
+        .ranges_limit = v.options.reads.max_ranges,
+        .backend = if (v.options.file_ops != null) 1 else 0,
+        .scratch_retained_bytes = r.scratch_retained_bytes,
+        .scratch_peak_worker_bytes = r.scratch_peak_worker_bytes,
+    };
+    outputPrefix(vfs_stats_t, out, &full);
+    return setOk();
 }
 
 // ---- patch (polling, background thread) --------------------------------------

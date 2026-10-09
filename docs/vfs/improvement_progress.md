@@ -247,3 +247,107 @@ $ZIG fmt --check build.zig src tests tools
 ```
 
 Additional final gates passed: **20/20** real owned-child process-death recovery cases (**4/4** heavy steps), **18/18** installed-build steps in each of Debug and ReleaseSafe, and the repaired ReleaseFast benchmark completed every scenario at **1 and 2 threads**, including the C ABI. Benchmark data are VFS-cache-cold/OS-cache-warm or warm-cache CPU/memory overhead samples, **not physical disk bandwidth** or a statistically controlled before/after performance claim. The opaque-handle benchmark correction received independent review; that benchmark fix changes no production runtime or ABI contract. Both full Debug and ReleaseSafe aggregates were rerun afterward, each passing 200/200 tests and 53/53 steps.
+
+## Stage 6: bounded polling reads and readonly provider seam (2026-10-08)
+
+### Implemented
+
+- Add single/batch asynchronous reads, explicit decoded-cache prefetch, queued
+  priority/FIFO dispatch, cooperative cancellation, polling/results/wait/end,
+  and size-versioned runtime diagnostics. Keep synchronous APIs, opaque ID
+  representation, old structure prefixes, existing status values and all on-disk
+  formats. The range descriptor is intentionally a fixed-stride C array element.
+- One lazy fixed worker pool per volume; bounded admitted request count includes
+  completed-but-unreleased results. Descriptors/options are copied. Workers
+  retain the existing file→volume dependency chain through completion and
+  release it before publishing terminal state. Completed results retain only
+  an independent admission ledger and remain pollable/endable after volume close.
+- Charge cache decoded payload reservations before allocation, including loading,
+  resident, pinned/retired pages and compressed streaming scratch. Preserve
+  coalesced-error ownership and propagate one loader's failure to waiters.
+  Prefetch validates the same logical span as normal reads. Fix placeholder
+  replacement and cached-page allocator ownership.
+- Transient cache pressure never becomes a public fitting-read error: retry only
+  after unwinding every store/cache pin, retain the completed prefix, back off
+  100 microseconds and check cancellation. Permanent oversized page or async
+  worker-record scratch limits use additive `VFS_RESOURCE_LIMIT` (14).
+  Bound scratch growth peak and release it on worker exit. Document raw streaming
+  bypass, compressed streaming admission and all payload/RSS accounting limits.
+- Reuse existing DB custom file operations in readonly VFS Zig volume options,
+  with explicit provider/root identity, unchanged VerifiedView ownership,
+  capability checks, correct short IO loops and original-provider park/reopen.
+  No new public VFS callback vtable, remote SDK, authentication or custom writer.
+  Preserve filesystem canonical update admission. Reject custom writable setup
+  and mounted update leases; document direct-write permission errors and legacy
+  path-only patch APIs as filesystem-only.
+- Make readonly manifest/index opens truly readonly without sync callbacks,
+  writable delta recovery or tail scans. Explicit native overlay patch resume,
+  already advisory-locked, recovers only its writable crash-dirty overlay before
+  reopening; its base stays readonly and byte-identical. Dirty ordinary readonly
+  mounts return Busy instead of mutating storage.
+- Validate corrupt provider base/delta metadata before slicing, shifting or
+  arithmetic, release mappings on failed opens, and propagate active-base
+  corruption instead of silently treating it as empty. Repair failed mount
+  publication rollback by removing the exact inserted node after sorting.
+- Extend all four VFS C11/C++17 static/shared hosts to call every new symbol,
+  check output prefixes and release results after volume close. Add 13 focused
+  async contract tests plus cache/scratch/provider/corruption/recovery regressions.
+  Update README, validation guidance, historical roadmap and runtime contracts.
+
+### Verification notes
+
+The first full Debug integration exposed three real contract/fixture mismatches:
+cache low-level admission now reports transient pressure, readonly OS write
+rejection is AccessDenied, and an overlay fixture read its manifest after opening
+its writer. Preserve complete byte/data assertions while testing low-level retry,
+expect the portable permission error, and capture metadata before writer open.
+Public sync reads separately test eight concurrent callers with a two-page cache;
+every read must succeed and match every byte.
+
+Independent source reviews found and drove fixes for active-range state,
+prefetch span verification, readonly tail-scan scratch escape, corrupt base
+bounds/error masking, and sorted mount OOM rollback. The full process-death gate
+then exposed crash-dirty overlay resume; the patch-only recovery path and a
+base-byte fingerprint regression fix that behavior without restoring writable
+side effects to ordinary readonly opens.
+
+Final Linux x86_64 gates passed with official Zig 0.16.0:
+
+- Debug and three serial fixed-seed ReleaseSafe full aggregates: **231/231 Zig
+  tests** (58 DB, 172 VFS, 1 roundtrip), **53/53 steps** each. All eight ordinary
+  C11/C++17 static/shared consumers ran; repeated test steps actually executed.
+- Final real owned-child process-death matrix: **20/20 cases**, **4/4 steps**,
+  including in-place/overlay, 1/4 workers, every existing stop boundary and
+  byte-identical readonly bases. Debug and ReleaseSafe installed builds each
+  passed **18/18 steps**.
+- Windows GNU x86_64 and macOS Arm64 ReleaseSafe ABI consumers each passed
+  **20/20 compile/link steps**. These are not native runtime results.
+- Repository-wide Zig formatting and diff whitespace checks passed. Independent
+  read-only scoped reviews rechecked terminal lifetimes, retry pin release,
+  provider/budget fixes and the final patch-only recovery path with no new
+  blocker. No push, publication or remote workflow dispatch.
+
+```sh
+ZIG=/tmp/vfs-review-tools/zig-x86_64-linux-0.16.0/zig
+export ZIG_GLOBAL_CACHE_DIR=/tmp/vfs-review-tools/global-cache
+# Run all fixture-mutating aggregates strictly serially.
+$ZIG build test -j2 --seed 0x5eed --summary all
+$ZIG build test -Doptimize=ReleaseSafe -j2 --seed 0x5eed --summary all # three runs
+$ZIG build test-heavy -Doptimize=ReleaseSafe -j2 --summary all
+$ZIG build -j2 --summary all
+$ZIG build -Doptimize=ReleaseSafe -j2 --summary all
+$ZIG build check-abi -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe -j2 --summary all
+$ZIG build check-abi -Dtarget=aarch64-macos -Doptimize=ReleaseSafe -j2 --summary all
+$ZIG fmt --check build.zig src tests tools
+git diff --check
+```
+
+Residual scope is explicit in [runtime read contracts](runtime_reads.md):
+cooperative rather than hard-latency cancellation; priority without preemption
+or starvation guarantees; payload/scratch rather than total RSS limits; caller
+responsibility for custom provider aliases, immutability and callback lifetime;
+no generalized remote/backend writer; and no native Windows/macOS, race-detector,
+power-loss or physical-IO performance claim. The inherited native writable DB
+close/sync-failure partial-cleanup limitation is not repaired by this stage;
+the patch recovery helper returns the first close failure and does not blindly
+retry cleanup on a partially closed DB.

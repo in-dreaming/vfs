@@ -679,7 +679,7 @@ pub fn run(allocator: std.mem.Allocator, target_path: []const u8, overlay_path: 
     if (overlay_path) |op| try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), op);
     var lock = try PatchLock.acquire(allocator, written_dir);
     defer lock.release();
-    if (overlay_path) |op| try overlay_mod.openOrCreate(allocator, target_path, op, .{ .shards = options.overlay_shards });
+    if (overlay_path) |op| try overlay_mod.openOrCreateForPatch(allocator, target_path, op, .{ .shards = options.overlay_shards });
 
     const report = try runSession(allocator, target_path, overlay_path, diff_paths, to_version, options);
 

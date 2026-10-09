@@ -11,7 +11,18 @@ const a = std.heap.smp_allocator;
 pub fn mount(path: []const u8) ![]u8 {
     const resolved = try std.Io.Dir.cwd().realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, a);
     defer a.free(resolved);
-    const canonical = try a.dupe(u8, resolved);
+    return register(try a.dupe(u8, resolved));
+}
+
+/// Provider-scoped opaque roots are not OS paths. Aliasing provider contexts
+/// must explicitly share identity/root spelling; external mutation is forbidden
+/// for the lifetime of a mount. Custom mounted updates are unsupported.
+pub fn mountCustom(provider: u64, root: []const u8) ![]u8 {
+    if (provider == 0 or root.len == 0) return error.InvalidArgument;
+    return register(try std.fmt.allocPrint(a, "custom:{x}:{s}", .{ provider, root }));
+}
+
+fn register(canonical: []u8) ![]u8 {
     errdefer a.free(canonical);
     mutex.lock();
     defer mutex.unlock();

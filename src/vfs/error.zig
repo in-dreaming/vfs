@@ -13,12 +13,13 @@ pub const Status = enum(c_int) {
     key_collision = 9,
     db_error = 10,
     busy = 11,
-    /// A patch was cancelled by the caller; the target is unchanged or at a
-    /// resumable intermediate state.
+    /// An asynchronous operation was cancelled. Patch targets remain
+    /// unchanged or at a resumable intermediate state.
     cancelled = 12,
     /// The target does not match what a patch expects (content hash, pending
     /// PatchIntent of another chain, overlay/base mismatch).
     precondition_failed = 13,
+    resource_limit = 14,
     internal_error = 100,
 };
 
@@ -35,6 +36,7 @@ pub fn fromError(err: anyerror) Status {
         error.ChecksumMismatch => .checksum_mismatch,
         error.KeyCollision => .key_collision,
         error.Busy => .busy,
+        error.CacheBudgetExceeded, error.CachePageTooLarge, error.ReadScratchLimitExceeded => .resource_limit,
         error.DbError => .db_error,
         error.OutOfMemory, error.NoSpace => .internal_error,
         else => .io_error,

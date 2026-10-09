@@ -707,3 +707,12 @@ meta 已 commit:
 
 这个边界足够小，但已经验证了 VFS 最核心的两条 open 路径和 page 读取闭环。
 
+
+## 2026-10-08 runtime read extension
+
+Polling asynchronous reads, ordered batches, explicit prefetch, queued priorities,
+cooperative cancellation, bounded decoded payload/worker scratch, diagnostics and
+readonly custom-provider propagation are implemented. See
+[runtime read contracts](runtime_reads.md) for ownership, permanent configured
+limits and supported provider scope. Adaptive readahead, native overlapped IO,
+remote-provider SDKs and callback completion are not included.

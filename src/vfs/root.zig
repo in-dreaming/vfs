@@ -62,6 +62,7 @@ pub const patch = @import("patch/root.zig");
 pub const io = struct {
     pub const file_handle = @import("io/file_handle.zig");
     pub const page_cache = @import("io/page_cache.zig");
+    pub const read_requests = @import("io/read_requests.zig");
 };
 
 comptime {
@@ -74,11 +75,21 @@ comptime {
     _ = abi.vfs_stat_entry;
     _ = abi.vfs_read_at;
     _ = abi.vfs_close_file;
+    _ = abi.vfs_read_async;
+    _ = abi.vfs_read_batch_async;
+    _ = abi.vfs_prefetch_async;
+    _ = abi.vfs_request_poll;
+    _ = abi.vfs_request_result;
+    _ = abi.vfs_request_wait;
+    _ = abi.vfs_request_cancel;
+    _ = abi.vfs_request_end;
+    _ = abi.vfs_get_stats;
     _ = abi.vfs_last_status;
     _ = abi.vfs_last_error_message;
 }
 
 test {
+    _ = @import("io/read_requests_test.zig");
     _ = abi;
     _ = errors;
     _ = handle_registry;

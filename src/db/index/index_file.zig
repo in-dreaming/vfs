@@ -85,7 +85,7 @@ pub const IndexFile = struct {
 
     pub fn close(self: *IndexFile) !void {
         if (!self.file.isOpen()) return;
-        try pf.flushMetadata(self.file);
+        if (self.file.writable) try pf.flushMetadata(self.file);
         pf.close(&self.file);
     }
 
@@ -172,7 +172,12 @@ pub fn openAt(dir: std.Io.Dir, path: []const u8) !IndexFile {
 }
 
 pub fn openIn(dir: pf.Directory, path: []const u8) !IndexFile {
-    var file = try pf.openIn(dir, path, .{ .mode = .read_write });
+    return openInMode(dir, path, .read_write);
+}
+
+pub fn openInMode(dir: pf.Directory, path: []const u8, mode: pf.OpenMode) !IndexFile {
+    if (mode == .create_read_write) return error.InvalidArgument;
+    var file = try pf.openIn(dir, path, .{ .mode = mode });
     errdefer pf.close(&file);
     const header = try readHeader(file);
     if (header.magic != INDEX_MAGIC or header.major_version != 1 or header.endian != ENDIAN_LE) return error.Corruption;
@@ -250,8 +255,8 @@ pub fn verify(index: *const IndexFile) !void {
     inline for (.{ index.super.active_base_region_id, index.super.active_delta_region_id, index.super.checkpoint_delta_region_id }) |id| {
         if (id != 0) {
             const r = try readRegion(index.file, id);
-            if (r.state == .building) return error.Corruption;
-            if (r.offset < REGION_AREA_OFFSET or r.offset + r.size > file_len) return error.Corruption;
+            if (r.state == .building or r.used_size > r.size) return error.Corruption;
+            if (r.offset < REGION_AREA_OFFSET or r.offset > file_len or r.size > file_len - r.offset) return error.Corruption;
         }
     }
 }
@@ -386,8 +391,8 @@ fn readRegion(file: pf.FileHandle, id: u32) !RegionDesc {
     if (fmt.crc32c(&c) != stored) return error.Corruption;
     return .{
         .id = fmt.readU32Le(b[0..4]),
-        .region_type = @enumFromInt(fmt.readU32Le(b[4..8])),
-        .state = @enumFromInt(fmt.readU32Le(b[8..12])),
+        .region_type = std.enums.fromInt(RegionType, fmt.readU32Le(b[4..8])) orelse return error.Corruption,
+        .state = std.enums.fromInt(RegionState, fmt.readU32Le(b[8..12])) orelse return error.Corruption,
         .flags = fmt.readU32Le(b[12..16]),
         .offset = fmt.readU64Le(b[16..24]),
         .size = fmt.readU64Le(b[24..32]),

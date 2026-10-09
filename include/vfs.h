@@ -30,7 +30,8 @@ typedef uint64_t vfs_file_entry_t;
 typedef struct vfs_open_options {
     uint32_t struct_size;
     uint32_t flags;
-    /* Decoded page cache budget in bytes; 0 = default (8 MiB). */
+    /* Decoded payload budget including pinned/inflight pages; 0 = 8 MiB.
+     * Oversized pages return RESOURCE_LIMIT; transient pressure retries. */
     uint64_t page_cache_bytes;
     /* Maximum simultaneously open read-only pack stores; 0 = default (16).
      * Reads pin only their active source store. Overlay fallback/foreign refs
@@ -39,12 +40,22 @@ typedef struct vfs_open_options {
     /* Extra read-only OS handles per pack data file so concurrent reads are
      * not serialized on one file object; 0 = default (4). */
     uint32_t read_handles;
+    /* Fixed lazy read workers, 0 = 4; maximum 64. */
+    uint32_t read_workers;
+    /* Includes queued, running and completed-but-unreleased requests; 0 = 256. */
+    uint32_t max_requests;
+    /* Maximum ranges per submitted batch; 0 = 256. */
+    uint32_t max_ranges_per_request;
+    uint32_t reserved;
+    /* DB record scratch limit per read worker; 0 = 16 MiB. */
+    uint64_t read_scratch_bytes;
 } vfs_open_options_t;
 
 /* Flags for vfs_open_path / vfs_open_entry. */
 enum {
-    /* Reads covering a whole page bypass the page cache and decode straight
-     * into the caller's buffer. Use for one-shot whole-file loads. */
+    /* Whole implicit pages bypass cache residency. Raw pages copy directly;
+     * compressed pages use bounded decoded scratch. Partial pages and explicit
+     * PageRefs still use the cache. Use for one-shot whole-file loads. */
     VFS_OPEN_STREAMING = 1u << 0,
 };
 
@@ -75,13 +86,103 @@ enum {
     VFS_KEY_COLLISION = 9,
     VFS_DB_ERROR = 10,
     VFS_BUSY = 11,
-    /* A patch was cancelled by the caller. */
+    /* An asynchronous operation was cancelled by the caller. */
     VFS_CANCELLED = 12,
     /* The patch target does not match what the DiffPacks expect (content
      * hash, PatchIntent of another chain, overlay/base mismatch). */
     VFS_PRECONDITION_FAILED = 13,
+    /* A page exceeds its decoded-cache limit, or a record exceeds worker scratch. */
+    VFS_RESOURCE_LIMIT = 14,
     VFS_INTERNAL_ERROR = 100,
 };
+
+/* ---- Bounded asynchronous reads (polling; no callbacks) ------------------ */
+typedef uint64_t vfs_request_t;
+/* Fixed-layout array element; its stride is not struct_size-extensible. */
+typedef struct vfs_read_range {
+    uint64_t offset;
+    void* dst;
+    uint64_t size;
+} vfs_read_range_t;
+typedef struct vfs_read_options {
+    uint32_t struct_size;
+    uint32_t flags; /* Must be zero. */
+    /* Higher queued priority first, FIFO ties. No preemption or deadline.
+     * NULL options default to 0 for reads, -1 for prefetch. */
+    int32_t priority;
+    uint32_t reserved;
+} vfs_read_options_t;
+enum {
+    VFS_REQUEST_QUEUED = 0,
+    VFS_REQUEST_RUNNING = 1,
+    VFS_REQUEST_DONE = 2,
+    VFS_REQUEST_FAILED = 3,
+    VFS_REQUEST_CANCELLED = 4,
+};
+typedef struct vfs_request_progress {
+    uint32_t struct_size;
+    uint32_t state;
+    uint32_t ranges_total;
+    uint32_t ranges_done; /* Successfully completed ranges. */
+    uint64_t bytes_read; /* Logical bytes, including a valid partial prefix. */
+    int32_t last_status;
+    uint32_t reserved;
+} vfs_request_progress_t;
+typedef struct vfs_read_result {
+    uint32_t struct_size;
+    uint32_t state; /* QUEUED means unexecuted, including after batch failure. */
+    uint64_t bytes_read;
+    int32_t last_status;
+    uint32_t reserved;
+} vfs_read_result_t;
+/* Descriptors/options are copied before return. Destination buffers must stay
+ * valid and unmodified until terminal poll/wait or request_end returns.
+ * Each batch is one file, runs ranges in order, and stops on first failure.
+ * Overlapping destinations within that batch therefore follow range order;
+ * callers synchronize buffers shared between separate requests themselves.
+ * EOF is successful short IO. Submit failure sets out_request=0 and writes no
+ * destination. Queue/result capacity exhaustion returns VFS_BUSY.
+ * Cancellation is cooperative between pages; an active backend call/shared
+ * load may finish. On failure/cancel only reported prefixes are valid.
+ * Completed metadata survives file/volume close until request_end. */
+VFS_API int vfs_read_async(vfs_file_t file, uint64_t offset, void* dst, uint64_t size,
+                            const vfs_read_options_t* options, vfs_request_t* out_request);
+VFS_API int vfs_read_batch_async(vfs_file_t file, const vfs_read_range_t* ranges, uint32_t count,
+                                  const vfs_read_options_t* options, vfs_request_t* out_request);
+/* Populates the shared decoded cache, including on STREAMING file handles.
+ * Completion does not pin pages; normal eviction is always allowed. */
+VFS_API int vfs_prefetch_async(vfs_file_t file, uint64_t offset, uint64_t size,
+                                const vfs_read_options_t* options, vfs_request_t* out_request);
+VFS_API int vfs_request_poll(vfs_request_t request, vfs_request_progress_t* out_progress);
+VFS_API int vfs_request_result(vfs_request_t request, uint32_t index, vfs_read_result_t* out_result);
+/* VFS_BUSY on timeout; VFS_OK on any terminal state. Inspect recorded status. */
+VFS_API int vfs_request_wait(vfs_request_t request, uint32_t timeout_ms);
+VFS_API int vfs_request_cancel(vfs_request_t request);
+/* Cancels unfinished work, drains destination writes and consumes the handle.
+ * Returns VFS_OK when released; inspect the IO result before calling end. */
+VFS_API int vfs_request_end(vfs_request_t request);
+
+typedef struct vfs_stats {
+    uint32_t struct_size;
+    uint32_t flags;
+    uint64_t cache_hits, cache_misses, cache_coalesced, cache_evictions;
+    uint64_t cache_resident_bytes, cache_allocated_bytes, cache_peak_bytes;
+    uint64_t cache_inflight_bytes, cache_pinned_bytes, cache_evicted_pinned_bytes;
+    uint64_t requests_queued, requests_running, requests_retained;
+    uint64_t requests_completed, requests_failed, requests_cancelled, requests_rejected;
+    uint64_t bytes_read, bytes_prefetched;
+    uint64_t open_stores, cache_limit_bytes, scratch_limit_per_worker;
+    uint32_t worker_limit, request_limit, ranges_limit;
+    uint32_t backend; /* 0 = filesystem, 1 = custom (Zig-facing mount API). */
+    /* Scratch sampled at request boundaries; active allocations may be newer. */
+    uint64_t scratch_retained_bytes, scratch_peak_worker_bytes;
+} vfs_stats_t;
+/* Approximate concurrent sample. Request counters last for the volume;
+ * cache counters also survive admitted mounted cache invalidation.
+ * Bytes are logical decoded bytes, not physical disk/network throughput.
+ * Pinned bytes overlap resident/evicted fields. Allocation bytes cover page
+ * payloads, not cache metadata, caller buffers, OS mappings or backend storage. */
+VFS_API int vfs_get_stats(vfs_volume_t volume, vfs_stats_t* out_stats);
 
 /* ---- Patch (V1.5, polling; no callbacks) ---------------------------------- */
 

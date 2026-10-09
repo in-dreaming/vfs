@@ -1,3 +1,4 @@
+pub const data_file = @import("data/data_file.zig");
 pub const handle_registry = @import("handle_registry.zig");
 pub const kv_db = @import("kv_db.zig");
 pub const batch_snapshot = @import("batch_snapshot.zig");

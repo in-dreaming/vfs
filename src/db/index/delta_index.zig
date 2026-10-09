@@ -154,6 +154,7 @@ pub fn open(index: *idx.IndexFile) !DeltaIndex {
     const j = try journal_mod.openActive(index);
     var di = DeltaIndex{ .journal = j, .writable = true };
     try attachMapping(&di, true);
+    errdefer di.unmap();
     if (di.journal.header.clean == 0) {
         try recover(&di);
     } else {
@@ -168,6 +169,7 @@ pub fn openReadOnly(index: *idx.IndexFile) !DeltaIndex {
     var di = DeltaIndex{ .journal = j, .writable = false };
     if (di.journal.header.clean == 0) return error.Busy;
     try attachMapping(&di, false);
+    errdefer di.unmap();
     di.used_slots = try countUsedSlots(&di);
     return di;
 }
@@ -180,11 +182,18 @@ fn attachMapping(self: *DeltaIndex, writable: bool) !void {
         try pf.mmapReadonly(self.journal.index.file, 0, file_len);
     errdefer pf.munmap(&map);
 
-    const slot_abs = self.journal.region.offset + self.journal.header.slot_offset;
-    const slot_bytes = self.journal.header.slot_count * SLOT_SIZE;
-    const view_offset = std.math.cast(usize, slot_abs) orelse return error.InvalidArgument;
-    const view_len = std.math.cast(usize, slot_bytes) orelse return error.InvalidArgument;
-    if (view_offset + view_len > map.bytesConst().len) return error.Corruption;
+    const header = self.journal.header;
+    if (header.slot_count == 0 or !std.math.isPowerOfTwo(header.slot_count)) return error.Corruption;
+    if (header.slot_offset < journal_mod.DELTA_HEADER_SIZE) return error.Corruption;
+    const slot_abs = std.math.add(u64, self.journal.region.offset, header.slot_offset) catch return error.Corruption;
+    const slot_bytes = std.math.mul(u64, header.slot_count, SLOT_SIZE) catch return error.Corruption;
+    const slot_end = std.math.add(u64, header.slot_offset, slot_bytes) catch return error.Corruption;
+    if (slot_end > header.journal_offset) return error.Corruption;
+    const journal_end = std.math.add(u64, header.journal_offset, header.journal_size) catch return error.Corruption;
+    if (journal_end > self.journal.region.size) return error.Corruption;
+    const view_offset = std.math.cast(usize, slot_abs) orelse return error.Corruption;
+    const view_len = std.math.cast(usize, slot_bytes) orelse return error.Corruption;
+    if (view_offset > map.bytesConst().len or view_len > map.bytesConst().len - view_offset) return error.Corruption;
     self.mapping = map;
     self.slot_view_offset = view_offset;
     self.slot_view_len = view_len;
@@ -393,7 +402,7 @@ fn encodeSlot(s: Slot) [SLOT_SIZE]u8 {
 }
 
 fn decodeSlot(b: *const [SLOT_SIZE]u8) !Slot {
-    const state: DeltaSlotState = @enumFromInt(b[0]);
+    const state = std.enums.fromInt(DeltaSlotState, b[0]) orelse return error.Corruption;
     return .{ .state = state, .h = fmt.readU64Le(b[8..16]), .key = .{ .hi = fmt.readU64Le(b[16..24]), .lo = fmt.readU64Le(b[24..32]) }, .info = .{ .data_db_id = fmt.readU32Le(b[32..36]), .flags = fmt.readU32Le(b[36..40]), .offset = fmt.readU64Le(b[40..48]), .stored_size = fmt.readU32Le(b[48..52]), .raw_size = fmt.readU32Le(b[52..56]), .version = 0, .crc = fmt.readU32Le(b[56..60]), .codec = fmt.readU16Le(b[60..62]), .reserved = fmt.readU16Le(b[62..64]) } };
 }
 
@@ -453,4 +462,27 @@ test "delta index slot table is mmap backed and persists without heap mirror" {
     try testing.expect(reopened.mapping != null);
     try testing.expect(!reopened.slots_dirty);
     try testing.expectEqual(@as(u64, 1234), (try reopened.lookup(key)).found.offset);
+}
+
+test "delta readonly open rejects malformed slot state and bounds" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var index = try idx.createAt(tmp.dir, "index.db", [_]u8{2} ** 16);
+    defer index.close() catch {};
+    var delta = try create(&index, 8, 4096);
+    const header = delta.journal.header;
+    const region = delta.journal.region;
+    try delta.close();
+    try pf.pwriteAll(index.file, region.offset + header.slot_offset, &.{255});
+    try std.testing.expectError(error.Corruption, openReadOnly(&index));
+    try pf.pwriteAll(index.file, region.offset + header.slot_offset, &.{0});
+    var malformed = header;
+    malformed.clean = 1;
+    malformed.slot_count = @as(u64, 1) << 63;
+    try journal_mod.writeDeltaHeader(index.file, region.offset, malformed);
+    try std.testing.expectError(error.Corruption, openReadOnly(&index));
+    malformed.slot_count = 8;
+    malformed.slot_offset = region.size;
+    try journal_mod.writeDeltaHeader(index.file, region.offset, malformed);
+    try std.testing.expectError(error.Corruption, openReadOnly(&index));
 }

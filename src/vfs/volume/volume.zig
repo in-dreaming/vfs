@@ -17,11 +17,18 @@ const registry = @import("../compress/registry.zig");
 const fmt = @import("../format/common.zig");
 const sync = @import("db_internal").platform.sync;
 const admission = @import("pack_admission.zig");
+const read_requests = @import("../io/read_requests.zig");
 
 pub const DEFAULT_MAX_OPEN_STORES: u32 = 16;
 
 pub const OpenOptions = struct {
     flags: u32 = 0,
+    reads: read_requests.Options = .{},
+    /// Read-only provider. Context and root data must outlive this Volume.
+    file_ops: ?@import("db_internal").platform.file.CustomFileOps = null,
+    /// Nonzero, process-unique provider identity. Contexts sharing a backing
+    /// namespace must use the same token and identical root spelling.
+    provider_identity: u64 = 0,
     max_open_stores: u32 = DEFAULT_MAX_OPEN_STORES,
     /// Extra read-only OS handles per pack data file (see PackReader.OpenOptions).
     read_handles: u8 = pack_reader.DEFAULT_READ_HANDLES,
@@ -73,6 +80,8 @@ pub const Volume = struct {
         items: []*MountedPack,
     };
 
+    read_executor: ?*read_requests.Executor = null,
+    read_executor_lock: sync.Mutex = .{},
     root_path: []u8,
     options: OpenOptions,
     /// Write-side mount table, sorted by descending priority. Nodes are only
@@ -97,6 +106,8 @@ pub const Volume = struct {
 
     pub fn open(path: []const u8, options: OpenOptions) !Volume {
         if (path.len == 0) return error.InvalidArgument;
+        try options.reads.validate();
+        if ((options.file_ops != null) != (options.provider_identity != 0)) return error.InvalidArgument;
         const owned = try std.heap.smp_allocator.dupe(u8, path);
         var opts = options;
         if (opts.max_open_stores == 0) opts.max_open_stores = DEFAULT_MAX_OPEN_STORES;
@@ -104,7 +115,21 @@ pub const Volume = struct {
         return .{ .root_path = owned, .options = opts, .page_cache = .{ .budget_bytes = opts.page_cache_bytes } };
     }
 
+    pub fn readExecutor(self: *Volume) !*read_requests.Executor {
+        self.read_executor_lock.lock();
+        defer self.read_executor_lock.unlock();
+        if (self.read_executor == null) self.read_executor = try read_requests.Executor.create(self.options.reads);
+        return self.read_executor.?;
+    }
+
+    pub fn readStats(self: *Volume) read_requests.Stats {
+        self.read_executor_lock.lock();
+        defer self.read_executor_lock.unlock();
+        return if (self.read_executor) |pool| pool.snapshot() else .{};
+    }
+
     pub fn close(self: *Volume) void {
+        if (self.read_executor) |pool| pool.shutdown();
         for (self.mounts.items) |mounted| {
             mounted.reader.close(std.heap.smp_allocator);
             std.heap.smp_allocator.destroy(mounted.reader);
@@ -141,11 +166,11 @@ pub const Volume = struct {
         if (self.update_active.load(.acquire)) return error.Busy;
         if (pack_path.len == 0) return error.InvalidArgument;
         for (self.mounts.items) |mounted| if (mounted.meta.priority == priority) return error.InvalidArgument;
-        const owned_path = try admission.mount(pack_path);
+        const owned_path = if (self.options.file_ops != null) try admission.mountCustom(self.options.provider_identity, pack_path) else try admission.mount(pack_path);
         errdefer admission.unmount(owned_path);
         const reader = try std.heap.smp_allocator.create(pack_reader.PackReader);
         errdefer std.heap.smp_allocator.destroy(reader);
-        reader.* = try pack_reader.PackReader.openWithOptions(std.heap.smp_allocator, pack_path, .{ .read_handles = self.options.read_handles });
+        reader.* = try pack_reader.PackReader.openWithOptions(std.heap.smp_allocator, pack_path, .{ .read_handles = self.options.read_handles, .file_ops = self.options.file_ops });
         errdefer reader.close(std.heap.smp_allocator);
         try self.checkOverlayLayeringLocked(reader.manifest, priority);
 
@@ -162,7 +187,17 @@ pub const Volume = struct {
             .mount_order = .init(self.next_mount_order),
         };
         try self.mounts.append(std.heap.smp_allocator, node);
-        errdefer _ = self.mounts.pop();
+        errdefer {
+            // Sorting may move the inserted node away from the tail. Remove
+            // that exact node if publication allocation fails; pop() could
+            // drop an older live mount and leave this freed node reachable.
+            for (self.mounts.items, 0..) |candidate, i| {
+                if (candidate == node) {
+                    _ = self.mounts.orderedRemove(i);
+                    break;
+                }
+            }
+        }
         self.next_mount_order += 1;
         std.mem.sort(*MountedPack, self.mounts.items, {}, mountedHigherPriority);
         try self.publishMountsLocked();
@@ -242,6 +277,7 @@ pub const Volume = struct {
     };
 
     pub fn setWritablePack(self: *Volume, pack_path: []const u8) !void {
+        if (self.options.file_ops != null) return error.Unsupported;
         self.lock.lock();
         defer self.lock.unlock();
         if (self.update_active.load(.acquire)) return error.Busy;
@@ -587,6 +623,11 @@ pub const Volume = struct {
         }
     }
 
+    /// Caller must hold lock; intended for a consistent diagnostics sample.
+    pub fn readonlyReadyCountLockedForStats(self: *Volume) usize {
+        return self.readonlyReadyCountLocked();
+    }
+
     pub fn readonlyReadyCount(self: *Volume) usize {
         self.lock.lock();
         defer self.lock.unlock();
@@ -667,6 +708,7 @@ pub const Volume = struct {
     /// Never wait for readers under Volume.lock. A reader may itself need
     /// that lock to open a foreign page source. Admission returns Busy instead.
     fn beginExclusiveLocked(self: *Volume) !void {
+        if (self.options.file_ops != null) return error.Unsupported;
         if (self.update_active.load(.acquire) or self.open_file_count.load(.seq_cst) != 0) return error.Busy;
         self.update_active.store(true, .release);
         var held: usize = 0;
@@ -699,7 +741,7 @@ pub const Volume = struct {
         // Keep a valid parked reader on failed reopen; never leave undefined
         // reader storage reachable by close or a later recovery attempt.
         try mounted.reader.park();
-        var replacement = try pack_reader.PackReader.openWithOptions(std.heap.smp_allocator, mounted.path, .{ .read_handles = self.options.read_handles });
+        var replacement = try pack_reader.PackReader.openWithOptions(std.heap.smp_allocator, mounted.path, .{ .read_handles = self.options.read_handles, .file_ops = self.options.file_ops });
         errdefer replacement.close(std.heap.smp_allocator);
         if (replacement.manifest.pack_id != mounted.meta.pack_id) return error.PreconditionFailed;
         if (try readerHasIntent(&replacement)) return error.Busy;
@@ -811,6 +853,7 @@ pub const Volume = struct {
     };
 
     pub fn acquireUpdateLease(self: *Volume, pack_id: u64) !UpdateLease {
+        if (self.options.file_ops != null) return error.Unsupported;
         self.lock.lock();
         defer self.lock.unlock();
         const target = self.findMountedPackById(pack_id) orelse return error.NotFound;
@@ -1604,4 +1647,49 @@ test "direct mutation rejects active writable foreign-source reads without waiti
     file.close();
     try v.writeFileByEntry(93001, "changed", .{});
     try v.deleteEntry(93001);
+}
+
+test "readonly custom volume uses provider roots and parks without filesystem fallback" {
+    const builder = @import("../build/pack_builder.zig");
+    const Backend = @import("../pack/backend_test_support.zig").ReadOnlyBackend;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const pack_a = "zig-cache-vfs-custom-volume-a";
+    const pack_b = "zig-cache-vfs-custom-volume-b";
+    const source = "zig-cache-vfs-custom-volume.bin";
+    defer std.Io.Dir.cwd().deleteTree(io, pack_a) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, pack_b) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
+    try builder.writeSourceFileForTest(source, "first---");
+    try builder.createPack(pack_a, &.{.{ .source_path = source, .virtual_path = "/a", .file_entry = 61001, .page_size = 4 }}, .{ .pack_id = 61001 });
+    try builder.writeSourceFileForTest(source, "second--");
+    try builder.createPack(pack_b, &.{.{ .source_path = source, .virtual_path = "/b", .file_entry = 61002, .page_size = 4 }}, .{ .pack_id = 61002 });
+    var backend = Backend.init(std.testing.allocator);
+    defer backend.deinit();
+    try backend.importPack(pack_a, "opaque-volume-a");
+    try backend.importPack(pack_b, "opaque-volume-b");
+    var v = try Volume.open("custom", .{ .file_ops = backend.ops(), .provider_identity = 61001, .max_open_stores = 1 });
+    var open = true;
+    defer if (open) v.close();
+    try v.mountPackWithPriority("opaque-volume-a", 1, 0);
+    try v.mountPackWithPriority("opaque-volume-b", 2, 0);
+    for (0..3) |_| {
+        var first = try v.openPath(0, "/a");
+        var buf: [8]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 8), try first.readAt(0, &buf));
+        try std.testing.expectEqualStrings("first---", &buf);
+        first.close();
+        var second = try v.openPath(0, "/b");
+        try std.testing.expectEqual(@as(usize, 8), try second.readAt(0, &buf));
+        try std.testing.expectEqualStrings("second--", &buf);
+        second.close();
+        try std.testing.expect(v.readonlyReadyCount() <= 1);
+    }
+    try std.testing.expectError(error.Unsupported, v.acquireUpdateLease(61001));
+    try std.testing.expectError(error.Unsupported, v.setWritablePack("unrequested-native-output"));
+    v.close();
+    open = false;
+    try std.testing.expectEqual(@as(usize, 0), backend.live_handles);
+    try std.testing.expectEqual(@as(usize, 0), backend.live_mappings);
+    try std.testing.expectEqual(@as(usize, 0), backend.mutation_count);
+    try std.testing.expectError(error.InvalidArgument, Volume.open("bad", .{ .file_ops = backend.ops() }));
 }

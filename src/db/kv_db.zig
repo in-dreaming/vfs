@@ -98,12 +98,16 @@ pub const KvDb = struct {
 
     pub fn openIn(dir: pf.Directory, options: OpenOptions) !KvDb {
         if (options.data_file_count == 0 or options.data_file_count > MAX_DATA_FILES) return error.InvalidArgument;
-        var man = manifest_mod.openIn(dir, "manifest.db") catch |err| switch (err) {
+        const file_mode: pf.OpenMode = if (options.mode == .read_only) .read_only else .read_write;
+        var man = manifest_mod.openInMode(dir, "manifest.db", file_mode) catch |err| switch (err) {
             error.FileNotFound => if (options.mode == .read_only or !options.create_if_missing) return err else try manifest_mod.createIn(dir, "manifest.db", .{ .initial_data_files = options.data_file_count }),
             else => |e| return e,
         };
         errdefer man.close() catch {};
         const data_options: data_mod.OpenOptions = .{
+            // Read-only stores trust committed metadata and validate records on
+            // demand. Recovery scanning allocates outside bounded read scratch.
+            .repair_tail = options.mode != .read_only,
             .read_only = options.mode == .read_only,
             .read_handles = if (options.mode == .read_only) options.read_handles else 0,
         };
@@ -122,18 +126,16 @@ pub const KvDb = struct {
         }
         const index_ptr = try std.heap.smp_allocator.create(index_mod.IndexFile);
         errdefer std.heap.smp_allocator.destroy(index_ptr);
-        index_ptr.* = index_mod.openIn(dir, "index.db") catch |err| switch (err) {
+        index_ptr.* = index_mod.openInMode(dir, "index.db", file_mode) catch |err| switch (err) {
             error.FileNotFound => if (options.mode == .read_only or !options.create_if_missing) return err else try index_mod.createIn(dir, "index.db", [_]u8{0} ** 16),
             else => |e| return e,
         };
         errdefer index_ptr.close() catch {};
         const delta_entries = pow2AtLeast(options.max_delta_entries);
         var delta = if (options.mode == .read_only)
-            delta_mod.openReadOnly(index_ptr) catch |err| switch (err) {
-                error.Busy => try delta_mod.open(index_ptr),
-                error.NotFound => return err,
-                else => |e| return e,
-            }
+            // Recovery mutates the index. A read-only opener must never
+            // silently upgrade access to repair an unclean writer's journal.
+            try delta_mod.openReadOnly(index_ptr)
         else
             delta_mod.open(index_ptr) catch |err| switch (err) {
                 error.NotFound => try delta_mod.create(index_ptr, delta_entries, journalSizeForEntries(delta_entries)),
@@ -184,9 +186,9 @@ pub const KvDb = struct {
 
     fn openBaseIndex(index: *const index_mod.IndexFile) !?base_mod.BaseIndex {
         return base_mod.open(index) catch |err| switch (err) {
-            // Matches the historical lookup semantics: a missing or unreadable
-            // base region behaves like an empty base.
-            error.NotFound, error.Corruption => null,
+            // Only an absent base is empty. An active corrupt base must fail
+            // closed even when a usable delta happens to contain some keys.
+            error.NotFound => null,
             else => |e| return e,
         };
     }
@@ -202,10 +204,14 @@ pub const KvDb = struct {
     }
 
     pub fn open(path: []const u8, options: OpenOptions) !KvDb {
+        if (options.file_ops) |ops| return openCustom(path, ops, options);
         const io = std.Io.Threaded.global_single_threaded.io();
-        if (options.create_if_missing) _ = std.Io.Dir.cwd().createDirPath(io, path) catch {};
+        if (options.create_if_missing and options.mode != .read_only) _ = std.Io.Dir.cwd().createDirPath(io, path) catch {};
         const dir = try std.Io.Dir.openDir(std.Io.Dir.cwd(), io, path, .{});
-        var db = try openIn(.fromOs(dir), options);
+        var db = openIn(.fromOs(dir), options) catch |err| {
+            dir.close(io);
+            return err;
+        };
         errdefer db.close() catch {};
         db.owns_dir = true;
         db.reopen_path = try std.heap.smp_allocator.dupe(u8, path);
@@ -218,6 +224,8 @@ pub const KvDb = struct {
         errdefer std.heap.smp_allocator.free(root);
         var db = try openIn(.fromCustom(root, ops), options);
         db.owned_root = root;
+        db.reopen_options = options;
+        db.reopen_options.file_ops = ops;
         return db;
     }
 
@@ -248,7 +256,7 @@ pub const KvDb = struct {
         defer self.park_lock.unlock();
         if (self.isParked()) return;
         if (self.mode != .read_only) return error.PermissionDenied;
-        if (self.reopen_path.len == 0) return error.InvalidArgument;
+        if (self.reopen_options.file_ops == null and self.reopen_path.len == 0) return error.InvalidArgument;
         // Publish "parked" before the files go away so readers racing on the
         // fast path observe Busy instead of a closed handle. Callers (Volume)
         // additionally guarantee no reader is pinned while parking.
@@ -287,13 +295,17 @@ pub const KvDb = struct {
 
     fn reopenFiles(self: *KvDb) !void {
         const io = std.Io.Threaded.global_single_threaded.io();
-        const dir = try std.Io.Dir.openDir(std.Io.Dir.cwd(), io, self.reopen_path, .{});
-        const fresh = openIn(.fromOs(dir), self.reopen_options) catch |err| {
-            dir.close(io);
-            return err;
+        const fresh = if (self.reopen_options.file_ops) |ops|
+            try openIn(.fromCustom(self.owned_root, ops), self.reopen_options)
+        else blk: {
+            const dir = try std.Io.Dir.openDir(std.Io.Dir.cwd(), io, self.reopen_path, .{});
+            break :blk openIn(.fromOs(dir), self.reopen_options) catch |err| {
+                dir.close(io);
+                return err;
+            };
         };
         self.dir = fresh.dir;
-        self.owns_dir = true;
+        self.owns_dir = self.reopen_options.file_ops == null;
         self.manifest = fresh.manifest;
         self.data = fresh.data;
         self.extra_data = fresh.extra_data;
@@ -1899,4 +1911,45 @@ test "commit rolls over exhausted journal with few delta keys" {
     }
     try testing.expect(db.index.activeDeltaRegionId() != original_region);
     try testing.expectEqual(@as(u64, 6), try db.getSize(.{ .hi = 0, .lo = 1 }));
+}
+
+test "read-only custom open refuses dirty delta without recovering or upgrading access" {
+    var fs = inmemory_file_ops.FileSystem.init(std.testing.allocator, false);
+    defer fs.deinit();
+    const raw = fs.rawOps();
+    const ops = try pf.customOpsFromRaw(&raw);
+    const root = "memory-unclean-provider-root";
+    var writer = try KvDb.open(root, .{ .file_ops = ops });
+    defer writer.close() catch {};
+    try writer.putBytes("key", "unclosed", .{ .durability = .sync });
+    try writer.commitPending(.sync);
+    try std.testing.expectError(error.Busy, KvDb.open(root, .{ .file_ops = ops, .mode = .read_only, .create_if_missing = false }));
+    // The rejected opener has not repaired/marked clean the writer's delta.
+    const active = try journal_mod.openActive(writer.index);
+    try std.testing.expectEqual(@as(u32, 0), active.header.clean);
+    try std.testing.expectEqualStrings("unclosed", try writer.getBorrowedBytes("key"));
+}
+
+test "active corrupt base fails closed even when delta contains readable keys" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var writer = try KvDb.openAt(tmp.dir, .{});
+        defer writer.close() catch {};
+        try writer.putBytes("still-in-delta", "value", .{});
+        try writer.checkpoint();
+    }
+    {
+        var index = try index_mod.openAt(tmp.dir, "index.db");
+        defer index.close() catch {};
+        const region = try index.region(index.activeBaseRegionId());
+        var header: [base_mod.HEADER_SIZE]u8 = undefined;
+        try std.testing.expectEqual(header.len, try pf.preadAll(index.file, region.offset, &header));
+        fmt.writeU64Le(header[40..48], std.math.maxInt(u64));
+        fmt.writeU32Le(header[48..52], 0);
+        fmt.writeU32Le(header[48..52], fmt.crc32c(&header));
+        try pf.pwriteAll(index.file, region.offset, &header);
+    }
+    try std.testing.expectError(error.Corruption, KvDb.openAt(tmp.dir, .{ .mode = .read_only, .create_if_missing = false }));
+    try std.testing.expectError(error.Corruption, KvDb.openAt(tmp.dir, .{ .mode = .read_write, .create_if_missing = false }));
 }

@@ -100,11 +100,45 @@ int main(int argc, char** argv) {
     if (rc != VFS_OK || n != sizeof(k_payload) - 1) return 19;
     if (memcmp(bytes, k_payload, sizeof(k_payload) - 1) != 0) return 20;
 
+    /* Every additive read symbol is linked from C11/C++17 static/shared. */
+    vfs_request_t request = 0;
+    vfs_request_progress_t rp = {0};
+    vfs_read_result_t rr = {0};
+    vfs_stats_t stats = {0};
+    memset(bytes, 0, sizeof(bytes));
+    if (vfs_read_async(file, 0, bytes, sizeof(bytes), NULL, &request) != VFS_OK) return 80;
+    if (vfs_request_wait(request, 30000) != VFS_OK) return 81;
+    rp.struct_size = (uint32_t)sizeof(rp);
+    if (vfs_request_poll(request, &rp) != VFS_OK || rp.state != VFS_REQUEST_DONE || rp.bytes_read != sizeof(k_payload)-1) return 82;
+    rr.struct_size = (uint32_t)sizeof(rr);
+    if (vfs_request_result(request, 0, &rr) != VFS_OK || rr.last_status != VFS_OK) return 83;
+    if (memcmp(bytes, k_payload, sizeof(k_payload)-1) != 0) return 84;
+    if (vfs_request_end(request) != VFS_OK) return 85;
+    if (vfs_request_end(request) != VFS_INVALID_ARGUMENT) return 86;
+    vfs_read_range_t ranges[2] = {{0, bytes, 5}, {5, bytes+5, 8}};
+    if (vfs_read_batch_async(file, ranges, 2, NULL, &request) != VFS_OK) return 87;
+    if (vfs_request_wait(request, 30000) != VFS_OK) return 88;
+    if (vfs_request_poll(request, &rp) != VFS_OK || rp.ranges_done != 2) return 89;
+    if (vfs_request_end(request) != VFS_OK) return 90;
+    if (vfs_prefetch_async(file, 0, sizeof(bytes), NULL, &request) != VFS_OK) return 91;
+    if (vfs_request_wait(request, 30000) != VFS_OK) return 92;
+    if (vfs_request_cancel(request) != VFS_OK) return 93; /* terminal no-op */
+    stats.struct_size = (uint32_t)sizeof(stats);
+    if (vfs_get_stats(volume, &stats) != VFS_OK || stats.requests_completed != 3 || stats.requests_retained != 1) return 94;
+    memset(&prefix, 0xa5, sizeof(prefix));
+    prefix.struct_size = 8;
+    if (vfs_request_poll(request, (vfs_request_progress_t*)&prefix) != VFS_OK) return 95;
+    if (vfs_get_stats(volume, (vfs_stats_t*)&prefix) != VFS_OK) return 96;
+    for (unsigned i = 0; i < 5; ++i)
+        if (prefix.guard[i] != UINT64_C(0xa5a5a5a5a5a5a5a5)) return 97;
+
     if (vfs_close_volume(volume) != VFS_BUSY) return 21;
     if (vfs_close_file(file) != VFS_OK) return 22;
     if (vfs_close_file(file_by_entry) != VFS_OK) return 23;
     if (vfs_close_volume(volume) != VFS_OK) return 24;
     if (vfs_close_volume(volume) != VFS_INVALID_ARGUMENT) return 25;
+    if (vfs_request_poll(request, &rp) != VFS_OK || rp.state != VFS_REQUEST_DONE) return 98;
+    if (vfs_request_end(request) != VFS_OK) return 99;
 
     /* ---- patch: error paths ---- */
     vfs_patch_t patch = 0;

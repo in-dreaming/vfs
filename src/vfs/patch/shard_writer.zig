@@ -293,6 +293,8 @@ test "shard writer write rejection consumes once and remains sticky" {
     const value = try a.dupe(u8, "value");
     try std.testing.expectEqual(StageResult.staged, try w.stageAll(0, &.{.{ .key = 1000, .value = value }}));
     try std.testing.expectEqual(@as(u64, 0), w.total_staged.load(.acquire));
-    try std.testing.expectError(error.NotOpenForWriting, w.drain(.sync));
-    try std.testing.expectError(error.NotOpenForWriting, w.stageAll(0, &.{}));
+    // The platform adapter rejects writes before reaching either OS or custom
+    // callbacks, so all backends now report the same access error.
+    try std.testing.expectError(error.AccessDenied, w.drain(.sync));
+    try std.testing.expectError(error.AccessDenied, w.stageAll(0, &.{}));
 }

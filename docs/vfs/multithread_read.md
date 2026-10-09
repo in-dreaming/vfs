@@ -413,7 +413,7 @@ Zig std Windows 打开/读   std/Io/Threaded.zig:4999-5036, 9881-9930, 18007-180
 | 7.5 锁原语 | 新增 `platform/sync.zig`：基于 `std.Io.Mutex/RwLock/Condition` 的阻塞锁（短自旋后 futex 挂起）；替换 Volume/KvDb/PageCache/DataFile 的纯自旋锁 | `src/db/platform/sync.zig` 及各处 |
 | ABI | `vfs_open_options_t` 的两个 reserved 字段启用为 `page_cache_bytes`、`read_handles`；`vfs_open_*` 校验未知 flag | `abi.zig`, `include/vfs.h` |
 
-未做：Windows overlapped 打开（W1）、data 文件 mmap（W3）、`pf.advise` 落地、异步 API。W2 句柄池已达到 W1 的目标（见 11.3），W1 依赖 std 内部行为，留作后续。
+该次实施时未做：Windows overlapped 打开（W1）、data 文件 mmap（W3）、`pf.advise` 落地、异步 API。后续阶段 6 已补充 polling 异步/批量读取、显式预取、优先级/取消与运行时预算；当前契约见 [runtime_reads.md](runtime_reads.md)。W2 句柄池已达到 W1 的目标（见 11.3），W1 依赖 std 内部行为，留作后续。
 
 ### 11.2 验证
 

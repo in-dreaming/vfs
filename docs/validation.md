@@ -109,3 +109,13 @@ along with output. Shared CI runner throughput is informational; there is no
 machine-independent timing pass/fail threshold. The CLI also exposes
 `vfs bench-patch <base> <scratch> <diff...>` for an explicit scratch-copy patch
 experiment. Neither benchmark changes the correctness contract.
+
+## Runtime read coverage
+
+The ordinary suite also exercises polling async reads, ordered batches, prefetch,
+priority/cancellation, file-close draining, results surviving volume close,
+request allocation failures, decoded-payload and worker-scratch limits, and
+readonly custom-provider park/reopen. The C11/C++17 static/shared VFS hosts call
+every additive read symbol, check prefix canaries, and release completed results
+after volume close. See [runtime contracts](vfs/runtime_reads.md) for the precise
+cooperative cancellation, memory-budget and provider-identity limits.

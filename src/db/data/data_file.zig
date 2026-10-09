@@ -574,27 +574,68 @@ fn dataReadPayloadRawKeyMaybe(file: *DataFile, offset: u64, key: fmt.Key128, may
     return parsed.meta.raw_size;
 }
 
-/// Thread-local scratch for whole-record reads. It grows to the largest record
-/// read on this thread and is intentionally never shrunk; a thread that reads
-/// packs keeps at most one page-sized buffer alive.
+/// Thread-local whole-record scratch. Ordinary synchronous users retain the
+/// legacy growable buffer. Fixed read workers must configure a finite limit at
+/// startup and release it at teardown; the bound includes the complete record
+/// header/key/payload/footer, not only its payload. DB metadata and OS mappings
+/// are outside this per-worker bound.
 threadlocal var record_scratch: []u8 = &.{};
+threadlocal var record_scratch_limit: ?usize = null;
+threadlocal var record_scratch_high_water: usize = 0;
+
+/// Start a new calling-thread scratch scope. Invalidates previous borrowed
+/// slices, releases any legacy allocation and resets diagnostics. `null`
+/// restores the unbounded synchronous behavior; zero rejects nonempty reads.
+pub fn configureReadScratchLimit(limit: ?usize) void {
+    releaseReadScratch();
+    record_scratch_limit = limit;
+    record_scratch_high_water = 0;
+}
+
+/// Release calling-thread scratch. Invalidates outstanding borrowed slices.
+/// The configured limit and high-water measurement survive until reconfigured.
+pub fn releaseReadScratch() void {
+    if (record_scratch.len != 0) std.heap.smp_allocator.free(record_scratch);
+    record_scratch = &.{};
+}
+
+pub fn readScratchBytes() usize {
+    return record_scratch.len;
+}
+
+pub fn readScratchHighWaterBytes() usize {
+    return record_scratch_high_water;
+}
 
 fn recordScratch(len: usize) ![]u8 {
+    if (record_scratch_limit) |limit| {
+        // Check even when a previous buffer is already large enough.
+        if (len > limit) return error.ReadScratchLimitExceeded;
+    }
     if (record_scratch.len >= len) return record_scratch[0..len];
-    const grown = @max(len, @max(record_scratch.len * 2, 4096));
-    if (record_scratch.len != 0) {
+    var grown = @max(len, @max(record_scratch.len *| 2, 4096));
+    if (record_scratch_limit) |limit| {
+        grown = @min(grown, limit);
+        // realloc may allocate its replacement before releasing the old
+        // storage. Discard the invalidated borrow first so the true allocation
+        // peak, not just the final retained capacity, stays within the limit.
+        releaseReadScratch();
+        record_scratch = try std.heap.smp_allocator.alloc(u8, grown);
+    } else if (record_scratch.len != 0) {
         record_scratch = try std.heap.smp_allocator.realloc(record_scratch, grown);
     } else {
         record_scratch = try std.heap.smp_allocator.alloc(u8, grown);
     }
+    record_scratch_high_water = @max(record_scratch_high_water, grown);
     return record_scratch[0..len];
 }
 
 fn dataReadRecordBorrow(file: *DataFile, offset: u64, key: fmt.Key128, key_bytes: []const u8, expected_stored_size: u32) ![]const u8 {
-    const key_len: u64 = key_bytes.len;
-    const total: u64 = @as(u64, RECORD_HEADER_SIZE) + key_len + expected_stored_size + RECORD_FOOTER_SIZE;
-    const total_usize = std.math.cast(usize, total) orelse return error.InvalidArgument;
-    const buf = try recordScratch(total_usize);
+    const framing: usize = RECORD_HEADER_SIZE + RECORD_FOOTER_SIZE;
+    const keyed_size = std.math.add(usize, framing, key_bytes.len) catch return error.InvalidArgument;
+    const total = std.math.add(usize, keyed_size, expected_stored_size) catch return error.InvalidArgument;
+    _ = std.math.add(u64, offset, total) catch return error.InvalidArgument;
+    const buf = try recordScratch(total);
     try readExact(file.readHandle(), offset, buf);
 
     const header_buf: *const [RECORD_HEADER_SIZE]u8 = buf[0..RECORD_HEADER_SIZE];
@@ -616,7 +657,8 @@ fn dataReadRecordBorrow(file: *DataFile, offset: u64, key: fmt.Key128, key_bytes
 }
 
 fn dataReadMetaCheckKey(file: *DataFile, offset: u64, key: fmt.Key128, key_bytes: []const u8) !RecordMeta {
-    const total: usize = RECORD_HEADER_SIZE + key_bytes.len;
+    const total = std.math.add(usize, RECORD_HEADER_SIZE, key_bytes.len) catch return error.InvalidArgument;
+    _ = std.math.add(u64, offset, total) catch return error.InvalidArgument;
     const buf = try recordScratch(total);
     try readExact(file.readHandle(), offset, buf);
     const meta = try parseAndValidateHeader(buf[0..RECORD_HEADER_SIZE], offset);
@@ -985,4 +1027,49 @@ test "data db single-read record borrow validates key footer and crc, read handl
     const footer_offset = r.offset + RECORD_HEADER_SIZE + key_bytes.len + payload.len;
     try pf.pwriteAll(rw.file, footer_offset, "XXXX");
     try testing.expectError(error.Corruption, rw.readRecordBorrow(r.offset, key, key_bytes, r.stored_size));
+}
+
+test "read worker scratch scope bounds growth and releases retained memory" {
+    configureReadScratchLimit(6000);
+    defer configureReadScratchLimit(null);
+    try std.testing.expectEqual(@as(usize, 0), readScratchBytes());
+    _ = try recordScratch(1);
+    try std.testing.expectEqual(@as(usize, 4096), readScratchBytes());
+    _ = try recordScratch(5000);
+    try std.testing.expectEqual(@as(usize, 6000), readScratchBytes());
+    try std.testing.expectEqual(@as(usize, 6000), readScratchHighWaterBytes());
+    try std.testing.expectError(error.ReadScratchLimitExceeded, recordScratch(6001));
+    try std.testing.expectEqual(@as(usize, 6000), readScratchBytes());
+    releaseReadScratch();
+    try std.testing.expectEqual(@as(usize, 0), readScratchBytes());
+    try std.testing.expectEqual(@as(usize, 6000), readScratchHighWaterBytes());
+    configureReadScratchLimit(3);
+    _ = try recordScratch(3);
+    try std.testing.expectEqual(@as(usize, 3), readScratchBytes());
+    configureReadScratchLimit(0);
+    try std.testing.expectError(error.ReadScratchLimitExceeded, recordScratch(1));
+    try std.testing.expectEqual(@as(usize, 0), readScratchHighWaterBytes());
+}
+
+test "read worker record limit validates before allocation or IO" {
+    configureReadScratchLimit(128);
+    defer configureReadScratchLimit(null);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var df = try createAt(tmp.dir, "bounded-record.db", .{});
+    defer df.close() catch unreachable;
+    const key: fmt.Key128 = .{ .hi = 1, .lo = 7 };
+    const record = try df.appendRawKey(key, "key", "payload", .{ .version = 1 });
+    try std.testing.expectEqualStrings("payload", try df.readRecordBorrow(record.offset, key, "key", record.stored_size));
+    try std.testing.expectEqual(@as(usize, 128), readScratchBytes());
+    releaseReadScratch();
+    // The untrusted index can advertise a huge record; fail before allocation
+    // and before reading past the actual file, even for a nonexistent offset.
+    try std.testing.expectError(error.ReadScratchLimitExceeded, df.readRecordBorrow(1024 * 1024, key, "key", std.math.maxInt(u32)));
+    try std.testing.expectEqual(@as(usize, 0), readScratchBytes());
+    try std.testing.expectError(error.InvalidArgument, df.readRecordBorrow(std.math.maxInt(u64), key, "key", 1));
+    var long_key: [129]u8 = undefined;
+    @memset(&long_key, 'k');
+    try std.testing.expectError(error.ReadScratchLimitExceeded, df.readMetaCheckKey(record.offset, key, &long_key));
+    try std.testing.expectEqual(@as(usize, 0), readScratchBytes());
 }

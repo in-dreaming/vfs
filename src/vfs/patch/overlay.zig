@@ -60,6 +60,36 @@ pub fn openOrCreate(allocator: std.mem.Allocator, base_path: []const u8, overlay
     try validate(allocator, base_path, existing.manifest);
 }
 
+/// Patch-only entry point. The caller must own the overlay's advisory patch
+/// lock and update admission before calling. A crash-dirty native overlay may
+/// need explicit writable recovery; ordinary read-only opens never do this.
+pub fn openOrCreateForPatch(allocator: std.mem.Allocator, base_path: []const u8, overlay_path: []const u8, options: CreateOptions) !void {
+    var existing = pack_reader.PackReader.open(allocator, overlay_path) catch |e| switch (e) {
+        error.FileNotFound, error.NotFound => {
+            try create(allocator, base_path, overlay_path, options);
+            return;
+        },
+        error.Busy => blk: {
+            // Reject unreadable, dirty, or overlay bases before touching the
+            // output. In particular, never recover a dirty base through an
+            // alias passed as overlay_path.
+            var base = try pack_reader.PackReader.open(allocator, base_path);
+            defer base.close(allocator);
+            if (base.manifest.isOverlay()) return error.InvalidArgument;
+
+            // Only the explicitly authorized patch target is opened writable.
+            // Its overlay link can be validated once recovery has made its
+            // committed manifest readable again.
+            var recovery = try @import("db_internal").kv_db.KvDb.open(overlay_path, .{ .mode = .read_write, .create_if_missing = false });
+            try recovery.close();
+            break :blk try pack_reader.PackReader.open(allocator, overlay_path);
+        },
+        else => |err| return err,
+    };
+    defer existing.close(allocator);
+    try validate(allocator, base_path, existing.manifest);
+}
+
 pub fn validate(allocator: std.mem.Allocator, base_path: []const u8, overlay: pack_manifest_fmt.PackManifest) !void {
     if (!overlay.isOverlay()) return error.InvalidArgument;
     var base = try pack_reader.PackReader.open(allocator, base_path);
@@ -91,6 +121,13 @@ test "overlay create validate and volume layering with placeholder" {
     try create(allocator, base_path, overlay_path, .{});
     try openOrCreate(allocator, base_path, overlay_path, .{});
 
+    // Capture the published manifest before opening the writer. Read-only
+    // pack opens never recover a live writer's dirty delta as a side effect.
+    var m = blk: {
+        var r = try pack_reader.PackReader.open(allocator, overlay_path);
+        defer r.close(allocator);
+        break :blk r.manifest;
+    };
     // Overlay: replace page 1 ("BBBB" -> "bbbb"), placeholder page 2, bump version.
     {
         var w = try pack_writer.PackWriter.create(allocator, overlay_path);
@@ -101,9 +138,6 @@ test "overlay create validate and volume layering with placeholder" {
         try w.putPage(501, 0, 1, pv);
         const ph = page_placeholder_fmt.encode(.{ .file_entry = 501, .block_index = 0, .page_index = 2 });
         try w.putPagePlaceholder(501, 0, 2, &ph);
-        var r = try pack_reader.PackReader.open(allocator, overlay_path);
-        defer r.close(allocator);
-        var m = r.manifest;
         m.pack_version = 2;
         try w.putPackManifest(&pack_manifest_fmt.encodePackManifest(m));
         try w.close();
@@ -139,4 +173,81 @@ test "overlay create validate and volume layering with placeholder" {
     var ov = try pack_reader.PackReader.open(allocator, overlay_path);
     defer ov.close(allocator);
     try std.testing.expectError(error.OverlayBaseMismatch, validate(allocator, base2, ov.manifest));
+}
+
+test "patch preparation explicitly recovers only crash-dirty overlay" {
+    const db = @import("db_internal");
+    const pf = db.platform.file;
+    const builder = @import("../build/pack_builder.zig");
+    const TestFiles = struct {
+        fn markDirty(path: []const u8) !void {
+            var store = try db.kv_db.KvDb.open(path, .{ .create_if_missing = false });
+            const delta_offset = store.delta.journal.region.offset;
+            try store.close();
+            const index_path = try std.fs.path.join(std.testing.allocator, &.{ path, "index.db" });
+            defer std.testing.allocator.free(index_path);
+            var index = try pf.open(index_path, .{ .mode = .read_write });
+            defer pf.close(&index);
+            var header: [64]u8 = undefined;
+            try std.testing.expectEqual(header.len, try pf.preadAll(index, delta_offset, &header));
+            db.format.writeU32Le(header[48..52], 0);
+            db.format.writeU32Le(header[56..60], 0);
+            db.format.writeU32Le(header[56..60], db.format.crc32c(&header));
+            try pf.pwriteAll(index, delta_offset, &header);
+            try pf.flushMetadata(index);
+        }
+
+        fn fingerprint(path: []const u8) ![32]u8 {
+            var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+            for ([_][]const u8{ "manifest.db", "index.db", "data_000.db" }) |leaf| {
+                const file_path = try std.fs.path.join(std.testing.allocator, &.{ path, leaf });
+                defer std.testing.allocator.free(file_path);
+                var file = try pf.open(file_path, .{ .mode = .read_only });
+                defer pf.close(&file);
+                var bytes: [4096]u8 = undefined;
+                var offset: u64 = 0;
+                while (true) {
+                    const n = try pf.preadAll(file, offset, &bytes);
+                    hasher.update(bytes[0..n]);
+                    if (n < bytes.len) break;
+                    offset += n;
+                }
+            }
+            return hasher.finalResult();
+        }
+    };
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const base_path = try std.fs.path.join(allocator, &.{ root, "base" });
+    defer allocator.free(base_path);
+    const overlay_path = try std.fs.path.join(allocator, &.{ root, "overlay" });
+    defer allocator.free(overlay_path);
+    const source_path = try std.fs.path.join(allocator, &.{ root, "source" });
+    defer allocator.free(source_path);
+    try builder.writeSourceFileForTest(source_path, "unchanged-base");
+    try builder.createPack(base_path, &.{.{ .source_path = source_path, .virtual_path = "/base", .file_entry = 61003, .page_size = 4 }}, .{ .pack_id = 61003 });
+    try create(allocator, base_path, overlay_path, .{});
+    try TestFiles.markDirty(overlay_path);
+    const base_before = try TestFiles.fingerprint(base_path);
+    const overlay_before = try TestFiles.fingerprint(overlay_path);
+    try std.testing.expectError(error.Busy, pack_reader.PackReader.open(allocator, overlay_path));
+    try std.testing.expectError(error.Busy, openOrCreate(allocator, base_path, overlay_path, .{}));
+    try std.testing.expectEqual(overlay_before, try TestFiles.fingerprint(overlay_path));
+    try openOrCreateForPatch(allocator, base_path, overlay_path, .{});
+    try openOrCreate(allocator, base_path, overlay_path, .{});
+    try std.testing.expectEqual(base_before, try TestFiles.fingerprint(base_path));
+
+    // A dirty base is never silently recovered, even in patch preparation.
+    try TestFiles.markDirty(overlay_path);
+    try TestFiles.markDirty(base_path);
+    const dirty_base_before = try TestFiles.fingerprint(base_path);
+    const dirty_overlay_before = try TestFiles.fingerprint(overlay_path);
+    try std.testing.expectError(error.Busy, openOrCreateForPatch(allocator, base_path, overlay_path, .{}));
+    try std.testing.expectEqual(dirty_base_before, try TestFiles.fingerprint(base_path));
+    try std.testing.expectEqual(dirty_overlay_before, try TestFiles.fingerprint(overlay_path));
+    try std.testing.expectError(error.Busy, pack_reader.PackReader.open(allocator, base_path));
 }
